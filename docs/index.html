@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libart++ — the adaptive radix tree map for modern C++</title>
+<meta name="description" content="artpp::map — a header-only adaptive radix tree map for C++23. std::map's interface, O(key-length) operations, point lookups ~2× faster than absl::btree_map and ~3× faster than std::map.">
+<meta property="og:title" content="libart++ — the adaptive radix tree map for modern C++">
+<meta property="og:description" content="Header-only C++23. O(key length), no comparisons, no rebalancing. Point lookups ~2× faster than absl::btree_map.">
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <span class="brand"><img src="logo.svg" alt=""> libart++</span>
+    <nav class="links">
+      <a href="#why">Why</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#features">Features</a>
+      <a href="#start">Get&nbsp;started</a>
+      <a href="https://github.com/gofractally/libartpp">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ── hero ─────────────────────────────────────────────────────────────── -->
+<div class="hero">
+  <div>
+    <h1>libart<span class="pp">++</span></h1>
+    <p class="tag"><b>The adaptive radix tree map for modern C++.</b><br>
+    <code>std::map</code>'s interface. <b>O(key length)</b> operations — no comparisons,
+    no rebalancing, no node headers on the hot path.</p>
+    <div class="badges">
+      <span class="badge hl">header-only</span>
+      <span class="badge hl">C++23</span>
+      <span class="badge">zero dependencies</span>
+      <span class="badge">allocator-aware · PMR</span>
+      <span class="badge">fuzzed vs std::map</span>
+      <span class="badge">fault-injection tested</span>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="#start">Get started</a>
+      <a class="btn ghost" href="https://github.com/gofractally/libartpp">View on GitHub</a>
+    </div>
+  </div>
+  <div class="hero-logo"><img src="logo.svg" alt="libart++ logo — a radix tree with its hot path lit"></div>
+</div>
+
+<pre><code><span class="c">// the interface you already know — at radix speed</span>
+<span class="k">#include</span> <span class="s">&lt;artpp/map.hpp&gt;</span>
+
+<span class="t">artpp::map</span>&lt;<span class="t">std::string</span>, <span class="t">uint64_t</span>&gt; m;   <span class="c">// takes string_view args: no temp strings</span>
+m.<span class="f">insert</span>(<span class="s">"alpha"</span>, 1);
+m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);                <span class="c">// present → untouched, nothing constructed</span>
+
+<span class="k">if</span> (<span class="k">auto</span> it = m.<span class="f">find</span>(user_input); it != m.<span class="f">end</span>())
+    use(it-&gt;first, it-&gt;second);
+
+<span class="k">for</span> (<span class="k">const auto</span>&amp; [key, value] : m)       <span class="c">// ascending key order, always</span>
+    process(key, value);</code></pre>
+
+<!-- ── why ──────────────────────────────────────────────────────────────── -->
+<section id="why">
+  <h2>Built different where it counts</h2>
+  <p class="sub">Comparison trees pay <code>O(log n)</code> pointer chases and key comparisons,
+  and classic radix trees load a node header on every hop before they can route.
+  <b>libart++ does neither.</b></p>
+  <div class="grid">
+    <div class="card">
+      <h3><span class="dot"></span>Headerless dispatch</h3>
+      <p>The node's kind rides in the <b>tagged pointer itself</b> — descent decides how to
+      route before the node's cacheline even arrives. One load per hop, prefetched
+      perfectly, no dependent header read.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>O(key length), not O(log n)</h3>
+      <p>Lookup cost is bounded by your <b>key's bytes</b>, not your data's size. A billion
+      entries descend the same path depth as a million. No comparisons, no rebalancing,
+      ever.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Values live in the pointer</h3>
+      <p>Small trivially-copyable values (≤5 bytes) pack <b>inline in the handle bits</b> —
+      zero allocation, zero indirection. Bigger values sit in compact leaves allocated
+      through <i>your</i> allocator.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>No temporary keys</h3>
+      <p><code>map&lt;string,T&gt;</code> and <code>map&lt;string_view,T&gt;</code> share one
+      signature: <code>std::string_view</code>. Literals, <code>char*</code>, views,
+      strings — all pass <b>without constructing a temporary</b>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── benchmarks ───────────────────────────────────────────────────────── -->
+<section id="benchmarks">
+  <h2>Measured, not promised</h2>
+  <p class="sub">One <b>templated benchmark engine</b> drives every contestant through
+  identical code — same keys, same op sequence, same checksums — so there are no
+  per-library benchmark deviations. Upstream
+  <a href="https://github.com/armon/libart">libart</a> is vendored;
+  <code>absl::btree_map</code> and <code>std::map</code> use heterogeneous lookup.
+  Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
+
+  <div class="stats">
+    <div class="stat"><div class="n">1.8–1.9×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.6–3.6×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">2.6×</div><div class="l">faster dictionary lookups than std::map (bucket mode, 99 ns vs 260 ns)</div></div>
+    <div class="stat"><div class="n">0 B</div><div class="l">allocated for small values — they live inside the pointer</div></div>
+  </div>
+
+  <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 99ns, artpp 136ns, libart 134ns, absl::btree_map 181ns, std::map 260ns"></div>
+    <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 145ns fastest, std::map 422ns"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 42ns fastest, std::map 152ns"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64"></div>
+  </div>
+
+  <h3 style="margin:38px 0 14px">Inserts</h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/dict_insert.svg" alt="Insert latency, dictionary words"></div>
+    <div class="fig"><img src="charts/uniform_insert.svg" alt="Insert latency, uniform uint64"></div>
+  </div>
+
+  <h3 style="margin:38px 0 14px">Ordered scans <span style="color:var(--muted);font-weight:400">(honest numbers: B-trees are built for this)</span></h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/dict_scan.svg" alt="Ordered scan, dictionary words: absl::btree_map fastest, artpp bucket mode second"></div>
+    <div class="fig"><img src="charts/clustered_scan.svg" alt="Ordered scan, clustered strings: artpp bucket mode beats absl::btree_map"></div>
+  </div>
+  <p class="method">
+    <code>absl::btree_map</code>'s contiguous leaves win raw scans — that is what B-trees
+    are for. <b>Bucket mode</b> closes most of the gap on string keys (and wins clustered
+    scans outright) while keeping the point-lookup lead: choose the mode per workload.<br><br>
+    Methodology: Apple M5, clang -O3, quiet machine, one process. Workloads: 236k
+    dictionary words, 885k clustered strings, 1M uniform &amp; sequential
+    <code>uint64</code> (typed APIs; libart receives the identical big-endian bytes).
+    Full data: <a href="results.csv">results.csv</a> · engine:
+    <a href="https://github.com/gofractally/libartpp/blob/main/bench/engine.hpp">bench/engine.hpp</a>.
+    A separate machine-calibrated <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
+    guards artpp-vs-libart regressions in CI fashion.
+  </p>
+</section>
+
+<!-- ── features ─────────────────────────────────────────────────────────── -->
+<section id="features">
+  <h2>Engineered like a standard library component</h2>
+  <p class="sub">The goal is a container you could submit for review: exact contracts,
+  exhaustive tests, honest documentation.</p>
+  <div class="grid">
+    <div class="card">
+      <h3><span class="dot"></span>Any key type</h3>
+      <p>Strings, views, byte vectors, all integrals (numeric iteration order) built in.
+      With <a href="https://github.com/gofractally/psio">psio</a>: <b>doubles, reflected
+      structs, optionals, variants</b> — one macro per type.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Structural modes</h3>
+      <p><code>mode::buckets</code> packs sparse key tails into cacheline pages (best
+      dictionary numbers above); <code>dense_tiers</code> and <code>wide_stems</code>
+      trade footprint vs hop depth. Same semantics, tested identically.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Allocators, all the way down</h3>
+      <p>Every node <i>and value</i> goes through your allocator — PMR works. Index-based
+      pool handles shrink branches to 4 bytes, back the map with an
+      <b>mmap'd file</b>, and make cross-pool moves a single <code>memcpy</code>.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Whole-tree ops use structure</h3>
+      <p>Equality compares <b>node-by-node</b> (memcmp'd edges, no key materialization);
+      cross-allocator moves <b>clone node-by-node</b> — never key-by-key rebuilds.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Exception-safety, proven</h3>
+      <p>Every allocation point is <b>fault-swept</b> with throwing values and failing
+      allocators; leak, corruption, and double-destroy counters assert against a
+      <code>std::map</code> oracle.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Bidirectional, bounded, complete</h3>
+      <p><code>lower_bound</code> / <code>upper_bound</code> / <code>equal_range</code>,
+      reverse iteration, <code>--end()</code>, <code>erase(iterator)</code>, structural
+      <code>==</code>, <code>max_key_bytes</code> guarded with <code>length_error</code>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── code tour ────────────────────────────────────────────────────────── -->
+<section id="tour">
+  <h2>Thirty seconds of code</h2>
+  <p class="sub"></p>
+  <div class="tour">
+    <div class="cell">
+      <h3>Integral keys iterate in numeric order</h3>
+<pre><code><span class="t">artpp::map</span>&lt;<span class="t">int64_t</span>, <span class="t">std::string</span>&gt; m;
+m.<span class="f">insert</span>(-5, <span class="s">"negative"</span>);    <span class="c">// big-endian, sign-flipped</span>
+m.<span class="f">insert</span>( 7, <span class="s">"positive"</span>);    <span class="c">// encoding: byte order ==</span>
+                              <span class="c">// numeric order, free</span>
+<span class="k">for</span> (<span class="k">const auto</span>&amp; [k, v] : m)  <span class="c">// → -5, then 7</span>
+    log(k, v);</code></pre>
+    </div>
+    <div class="cell">
+      <h3>Structs as keys, via psio</h3>
+<pre><code><span class="k">struct</span> <span class="t">point</span> { <span class="t">double</span> x, y; };
+<span class="f">PSIO_REFLECT</span>(point, x, y)
+<span class="f">ARTPP_PSIO_KEY</span>(point)
+
+<span class="t">artpp::map</span>&lt;<span class="t">point</span>, <span class="t">std::string</span>&gt; m;
+m.<span class="f">insert</span>({1.5, -2.0}, <span class="s">"a"</span>);   <span class="c">// ordered by (x, y),</span>
+                              <span class="c">// numerically — doubles too</span></code></pre>
+    </div>
+    <div class="cell">
+      <h3>File-backed, 4-byte branches</h3>
+<pre><code><span class="t">artpp::line_pool</span> pool(<span class="s">"store.bin"</span>);  <span class="c">// mmap'd file</span>
+<span class="k">using</span> <span class="t">A</span> = <span class="t">artpp::pool_alloc</span>&lt;<span class="t">uint64_t</span>&gt;;
+<span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
+           <span class="t">artpp::mode</span>::none, <span class="t">A</span>&gt; t{<span class="t">A</span>{&amp;pool}};
+<span class="c">// branches cost 4 bytes; the whole store is one</span>
+<span class="c">// relocatable range — moves are a memcpy</span></code></pre>
+    </div>
+    <div class="cell">
+      <h3>Pick the structure per workload</h3>
+<pre><code><span class="c">// dictionary-shaped keys? pack the tails:</span>
+<span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
+           <span class="t">artpp::mode</span>::buckets&gt; dict;
+<span class="c">// 99 ns dictionary lookups (vs 260 std::map),</span>
+<span class="c">// and clustered scans faster than absl::btree</span></code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── getting started ──────────────────────────────────────────────────── -->
+<section id="start">
+  <h2>Get started in one minute</h2>
+  <p class="sub">Header-only. Copy <code>include/artpp</code>, or:</p>
+<pre><code><span class="c"># CMake ≥ 3.20</span>
+FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libartpp.git)
+FetchContent_MakeAvailable(artpp)
+target_link_libraries(your_target PRIVATE artpp::artpp)</code></pre>
+  <br>
+<pre><code><span class="c"># or hack on it directly</span>
+git clone https://github.com/gofractally/libartpp && cd libartpp
+cmake -B build && cmake --build build -j && ctest --test-dir build
+cmake -B build -DARTPP_BENCHMARKS=ON      <span class="c"># the compare suite from this page</span></code></pre>
+  <p style="color:var(--muted);font-size:14.5px">Requirements: a C++23 compiler, little-endian
+  target (ARM64/x86-64; NEON and SSE2 paths included). Nothing else.
+  Full API reference and contracts:
+  <a href="https://github.com/gofractally/libartpp#readme">the README</a>.</p>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap cols">
+    <div>
+      <b style="color:var(--text)">libart++</b> · <code>artpp::map</code><br>
+      a <a href="https://github.com/gofractally">gofractally</a> library
+    </div>
+    <div>
+      <a href="https://github.com/gofractally/libartpp">source</a> ·
+      <a href="https://github.com/gofractally/libartpp#readme">docs</a> ·
+      <a href="results.csv">benchmark data</a><br>
+      benchmarks vendor <a href="https://github.com/armon/libart">armon/libart</a> (BSD-3)
+      and use <a href="https://abseil.io">abseil</a>'s btree
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

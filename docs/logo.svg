@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="libart++ logo">
+  <!-- libart++ — a radix tree whose hot path lights up: the node kind rides the
+       pointer, so descent is a straight, header-free run to the leaf. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1726"/>
+      <stop offset="1" stop-color="#0a0f1a"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="none"
+        stroke="#1e3a5f" stroke-width="6"/>
+
+  <!-- cold branches (the rest of the trie) -->
+  <g stroke="#2e4f7a" stroke-width="14" stroke-linecap="round" fill="none">
+    <path d="M256 96 L150 208"/>
+    <path d="M150 208 L96 320"/>
+    <path d="M150 208 L196 320"/>
+    <path d="M353 208 L412 320"/>
+    <path d="M96 320 L120 408"/>
+  </g>
+  <!-- the hot path: root → leaf, one straight descent -->
+  <g stroke="url(#hot)" stroke-width="20" stroke-linecap="round" fill="none">
+    <path d="M256 96 L353 208"/>
+    <path d="M353 208 L312 320"/>
+    <path d="M312 320 L336 408"/>
+  </g>
+
+  <!-- nodes: tagged pointers — small, headerless -->
+  <g fill="#0a0f1a" stroke="#5e97d0" stroke-width="12">
+    <circle cx="256" cy="96"  r="34"/>
+    <circle cx="150" cy="208" r="26"/>
+    <circle cx="96"  cy="320" r="22"/>
+    <circle cx="196" cy="320" r="22"/>
+    <circle cx="120" cy="408" r="18"/>
+    <circle cx="412" cy="320" r="22"/>
+  </g>
+  <g fill="#0a0f1a" stroke="url(#hot)" stroke-width="12">
+    <circle cx="353" cy="208" r="26"/>
+    <circle cx="312" cy="320" r="22"/>
+  </g>
+  <!-- the leaf: the found value -->
+  <circle cx="336" cy="408" r="26" fill="url(#hot)"/>
+
+  <!-- ++ : the C++ mark, set as the tree's twin signature -->
+  <g stroke="#5e97d0" stroke-width="16" stroke-linecap="round">
+    <path d="M408 96 v56 M380 124 h56"/>
+    <path d="M462 150 v44 M440 172 h44"/>
+  </g>
+</svg>

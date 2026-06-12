@@ -1,4 +1,10 @@
+<p align="center"><img src="docs/logo.svg" width="140" alt="libart++"></p>
+
 # libart++ — `artpp::map`, a header-only adaptive radix tree map for C++23
+
+**[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
+point lookups ~1.8–1.9× faster than `absl::btree_map` and 2.6–3.6× faster than
+`std::map` across dictionary, clustered-string, and integer workloads.
 
 `artpp::map<Key, T>` is an ordered associative container backed by an adaptive
 radix tree (ART) with *headerless dispatch*: the node kind rides in the tagged
