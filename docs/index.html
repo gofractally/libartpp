@@ -110,7 +110,7 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <div class="stats">
     <div class="stat"><div class="n">1.8–1.9×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
     <div class="stat"><div class="n">2.6–3.6×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">2.6×</div><div class="l">faster dictionary lookups than std::map (bucket mode, 99 ns vs 260 ns)</div></div>
+    <div class="stat"><div class="n">−26%</div><div class="l">dictionary lookup latency vs the original libart (bucket mode, 99 ns vs 134 ns)</div></div>
     <div class="stat"><div class="n">0 B</div><div class="l">allocated for small values — they live inside the pointer</div></div>
   </div>
 
@@ -145,6 +145,43 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     A separate machine-calibrated <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
     guards artpp-vs-libart regressions in CI fashion.
   </p>
+</section>
+
+<!-- ── vs libart ────────────────────────────────────────────────────────── -->
+<section id="vs-libart">
+  <h2>The "++" is earned: vs the original libart</h2>
+  <p class="sub">libart++ is measured head-to-head against
+  <a href="https://github.com/armon/libart">armon/libart</a> — the canonical C ART —
+  in <b>every chart on this page</b>, and holds a dedicated, thermally-fair
+  <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
+  against it (contestants interleaved per rep, baseline-tracked). The structural edge:
+  libart loads each node's header before it can route; artpp routes from the tagged
+  pointer itself.</p>
+  <table>
+    <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
+    <tr><td>Point lookups</td><td>the bar to beat</td>
+        <td><b>0.92–0.94×</b> latency on uniform/clustered queries (gate ratios);
+        <b>−26%</b> on dictionary keys in bucket mode</td></tr>
+    <tr><td>Values</td><td><code>void*</code> — you own the lifetime, casts everywhere</td>
+        <td>real typed <code>T</code>: constructed in place, destroyed on erase,
+        moved on restructure; small ones live inline in the pointer</td></tr>
+    <tr><td>Keys</td><td>raw byte pointers + lengths</td>
+        <td><code>string</code>/<code>string_view</code>/integrals/byte vectors built in;
+        doubles &amp; reflected structs via psio — numeric ordering for free</td></tr>
+    <tr><td>Memory</td><td><code>malloc</code>/<code>free</code>, fixed</td>
+        <td>any standard allocator (PMR included); 4-byte indexed handles; mmap
+        file-backed pools; cross-pool moves as one <code>memcpy</code></td></tr>
+    <tr><td>Iteration</td><td>forward callback (<code>art_iter</code>)</td>
+        <td>bidirectional iterators, <code>lower_bound</code>/<code>upper_bound</code>,
+        reverse ranges, <code>erase(iterator)</code>, range-<code>for</code></td></tr>
+    <tr><td>Safety</td><td>C: no exceptions, manual cleanup</td>
+        <td>basic/strong guarantees, fault-injection tested at every allocation
+        point — zero leaks, no double-destroys</td></tr>
+    <tr><td>Structure</td><td>one fixed node ladder (4/16/48/256)</td>
+        <td>selectable modes per workload: <code>buckets</code> packs key tails into
+        cacheline pages (the 99 ns dictionary number), <code>dense_tiers</code> and
+        <code>wide_stems</code> trade footprint vs hop depth — same semantics, same tests</td></tr>
+  </table>
 </section>
 
 <!-- ── features ─────────────────────────────────────────────────────────── -->
