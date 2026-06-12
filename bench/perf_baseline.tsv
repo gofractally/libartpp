@@ -1,0 +1,5 @@
+# metric	hkv_ns	libart_ns	ratio
+uniform_insert	76.9463	78.7002	0.977713
+uniform_query	70.2185	73.1327	0.960152
+clustered_insert	210.089	205.48	1.02243
+clustered_query	191.521	208.214	0.919826
