@@ -1,0 +1,5 @@
+build*/
+results.csv
+.DS_Store
+compile_commands.json
+.cache/
