@@ -108,19 +108,30 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">1.8–1.9×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.6–3.6×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">−26%</div><div class="l">dictionary lookup latency vs the original libart (bucket mode, 99 ns vs 134 ns)</div></div>
+    <div class="stat"><div class="n">1.7–2.4×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.1–4×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">−14…−32%</div><div class="l">point-lookup latency vs the original libart (dict/clustered/uniform; parity on its best case, sequential ints)</div></div>
     <div class="stat"><div class="n">0 B</div><div class="l">allocated for small values — they live inside the pointer</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 99ns, artpp 136ns, libart 134ns, absl::btree_map 181ns, std::map 260ns"></div>
-    <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 145ns fastest, std::map 422ns"></div>
-    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 42ns fastest, std::map 152ns"></div>
-    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64"></div>
+    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 88ns, artpp 112ns, libart 130ns, absl::btree_map 190ns, std::map 230ns"></div>
+    <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 39ns fastest, std::map 159ns"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 45.1ns, libart 44.1ns — parity"></div>
   </div>
+  <p class="method">
+    <b>Sequential integers are libart's home game</b> — a shallow, cache-hot
+    <code>node256</code> ladder with the shared prefix folded into the node header it
+    reads anyway. Headerless dispatch makes the opposite trade: the prefix lives in a
+    dedicated node (one extra hop here, no header load on <i>any</i> other path), and
+    leaves are cacheline-granular (128 B) where libart's are ~32 B — a larger terminal
+    working set under shuffled access. The pool allocator's bump placement recovers it
+    to parity (45.1 vs 44.1 ns); on every other workload the same trades are why artpp
+    wins. Values that fit 5 bytes skip the leaf entirely — they live inline in the
+    handle.
+  </p>
 
   <h3 style="margin:38px 0 14px">Inserts</h3>
   <div class="figs">
@@ -135,9 +146,14 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   </div>
   <p class="method">
     <code>absl::btree_map</code>'s contiguous leaves win raw scans — that is what B-trees
-    are for. <b>Bucket mode</b> closes most of the gap on string keys (and wins clustered
-    scans outright) while keeping the point-lookup lead: choose the mode per workload.<br><br>
-    Methodology: Apple M5, clang -O3, quiet machine, one process. Workloads: 236k
+    are for. <b>Bucket mode</b> closes most of the gap on string keys (clustered scans:
+    7.4 vs 7.3 ns/element — parity) while keeping the point-lookup lead: choose the mode
+    per workload.<br><br>
+    Methodology: Apple M5, clang -O3, quiet machine, one process. The
+    <code>artpp::map</code> rows run the library's flagship allocator —
+    <code>line_pool</code> over an <b>anonymous mapping</b> (4-byte u32-index branch
+    handles, bump placement laying children near parents); the
+    <code>std::allocator</code> row shows zero-setup behavior. Workloads: 236k
     dictionary words, 885k clustered strings, 1M uniform &amp; sequential
     <code>uint64</code> (typed APIs; libart receives the identical big-endian bytes).
     Full data: <a href="results.csv">results.csv</a> · engine:
@@ -160,8 +176,9 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td><b>0.92–0.94×</b> latency on uniform/clustered queries (gate ratios);
-        <b>−26%</b> on dictionary keys in bucket mode</td></tr>
+        <td><b>−14% / −28% / −15%</b> latency on dictionary / clustered / uniform keys
+        (pool allocator; <b>−32%</b> dict in bucket mode); parity on sequential
+        integers, libart's best case</td></tr>
     <tr><td>Values</td><td><code>void*</code> — you own the lifetime, casts everywhere</td>
         <td>real typed <code>T</code>: constructed in place, destroyed on erase,
         moved on restructure; small ones live inline in the pointer</td></tr>
@@ -266,8 +283,8 @@ m.<span class="f">insert</span>({1.5, -2.0}, <span class="s">"a"</span>);   <spa
 <pre><code><span class="c">// dictionary-shaped keys? pack the tails:</span>
 <span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
            <span class="t">artpp::mode</span>::buckets&gt; dict;
-<span class="c">// 99 ns dictionary lookups (vs 260 std::map),</span>
-<span class="c">// and clustered scans faster than absl::btree</span></code></pre>
+<span class="c">// 88 ns dictionary lookups (vs 230 std::map),</span>
+<span class="c">// clustered scans at absl::btree parity</span></code></pre>
     </div>
   </div>
 </section>

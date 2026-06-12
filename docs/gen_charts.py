@@ -12,8 +12,20 @@ import sys
 from pathlib import Path
 
 ACCENT = {"artpp::map": "url(#hot)", "artpp::map<buckets>": "url(#hot2)"}
-GRAY = {"libart": "#5e97d0", "absl::btree_map": "#7587a3", "std::map": "#4a5a73"}
-ORDER = ["artpp::map", "artpp::map<buckets>", "libart", "absl::btree_map", "std::map"]
+GRAY = {
+    "artpp::map (std::allocator)": "#3f8f86",
+    "libart": "#5e97d0",
+    "absl::btree_map": "#7587a3",
+    "std::map": "#4a5a73",
+}
+ORDER = [
+    "artpp::map",
+    "artpp::map<buckets>",
+    "artpp::map (std::allocator)",
+    "libart",
+    "absl::btree_map",
+    "std::map",
+]
 TITLES = {
     ("dict", "hit"): "Point lookups — dictionary words (236k string keys)",
     ("clustered", "hit"): "Point lookups — clustered strings (885k keys)",

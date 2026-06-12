@@ -62,7 +62,7 @@ int main(int argc, char** argv)
       miss.reserve(words.size());
       for (const auto& w : words) miss.push_back(w + "\x01");  // disjoint by construction
       std::printf("dict: %zu words\n", words.size());
-      run_sv<artpp_sv, artpp_buckets_sv, libart_sv, absl_btree_sv, std_map_sv>(
+      run_sv<artpp_sv, artpp_buckets_sv, artpp_malloc_sv, libart_sv, absl_btree_sv, std_map_sv>(
           "dict", words, miss, scan_reps);
    }
    else
@@ -85,7 +85,7 @@ int main(int argc, char** argv)
       std::shuffle(keys.begin(), keys.end(), rng);
       for (const auto& k : keys) miss.push_back(k + "\x01");
       std::printf("clustered: %zu keys\n", keys.size());
-      run_sv<artpp_sv, artpp_buckets_sv, libart_sv, absl_btree_sv, std_map_sv>(
+      run_sv<artpp_sv, artpp_buckets_sv, artpp_malloc_sv, libart_sv, absl_btree_sv, std_map_sv>(
           "clustered", keys, miss, scan_reps);
    }
 
@@ -97,8 +97,8 @@ int main(int argc, char** argv)
       for (std::size_t i = 0; i < N; ++i) keys.push_back(rng() | 1);  // odd
       for (std::size_t i = 0; i < N; ++i) miss.push_back(rng() & ~1ull);  // even: disjoint
       std::printf("uniform: %zu keys\n", keys.size());
-      run_u64<artpp_u64, libart_u64, absl_btree_u64, std_map_u64>("uniform", keys, miss,
-                                                                  scan_reps);
+      run_u64<artpp_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
+          "uniform", keys, miss, scan_reps);
    }
 
    // sequential — dense ascending u64
@@ -109,8 +109,8 @@ int main(int argc, char** argv)
       for (std::size_t i = 0; i < N; ++i) keys.push_back(i * 2);      // even
       for (std::size_t i = 0; i < N; ++i) miss.push_back(i * 2 + 1);  // odd: disjoint
       std::printf("sequential: %zu keys\n", keys.size());
-      run_u64<artpp_u64, libart_u64, absl_btree_u64, std_map_u64>("sequential", keys, miss,
-                                                                  scan_reps);
+      run_u64<artpp_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
+          "sequential", keys, miss, scan_reps);
    }
 
    print_table();

@@ -4,6 +4,7 @@
 // big-endian-encoded — the identical bytes artpp's integral codec produces).
 #pragma once
 #include <artpp/map.hpp>
+#include <artpp/pool.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -20,11 +21,17 @@ extern "C" {
 namespace artpp_bench
 {
    // ── string_view-keyed family ──────────────────────────────────────────────
+   // The flagship configuration: artpp::map over its line_pool allocator —
+   // 4-byte indexed branch handles, bump placement laying children near their
+   // parents. This is the library's intended deployment; the std::allocator
+   // row below shows what you get with no allocator setup at all.
    struct artpp_sv
    {
       using key_type = std::string_view;
+      using A        = artpp::pool_alloc<uint64_t>;
       static const char* name() { return "artpp::map"; }
-      artpp::map<std::string_view, uint64_t> m;
+      artpp::line_pool pool;
+      artpp::map<std::string_view, uint64_t, artpp::mode::none, A> m{A{&pool}};
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
@@ -39,8 +46,26 @@ namespace artpp_bench
    struct artpp_buckets_sv
    {
       using key_type = std::string_view;
+      using A        = artpp::pool_alloc<uint64_t>;
       static const char* name() { return "artpp::map<buckets>"; }
-      artpp::map<std::string_view, uint64_t, artpp::mode::buckets> m;
+      artpp::line_pool pool;
+      artpp::map<std::string_view, uint64_t, artpp::mode::buckets, A> m{A{&pool}};
+      void     insert(key_type k, uint64_t v) { m.insert(k, v); }
+      bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
+      bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t scan_sum() const
+      {
+         uint64_t s = 0;
+         m.for_each_value([&](const uint64_t& v) { s += v; });
+         return s;
+      }
+   };
+
+   struct artpp_malloc_sv
+   {
+      using key_type = std::string_view;
+      static const char* name() { return "artpp::map (std::allocator)"; }
+      artpp::map<std::string_view, uint64_t> m;
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
@@ -150,7 +175,25 @@ namespace artpp_bench
    struct artpp_u64
    {
       using key_type = uint64_t;
+      using A        = artpp::pool_alloc<uint64_t>;
       static const char* name() { return "artpp::map"; }
+      artpp::line_pool pool;
+      artpp::map<uint64_t, uint64_t, artpp::mode::none, A> m{A{&pool}};
+      void     insert(key_type k, uint64_t v) { m.insert(k, v); }
+      bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
+      bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t scan_sum() const
+      {
+         uint64_t s = 0;
+         m.for_each_value([&](const uint64_t& v) { s += v; });
+         return s;
+      }
+   };
+
+   struct artpp_malloc_u64
+   {
+      using key_type = uint64_t;
+      static const char* name() { return "artpp::map (std::allocator)"; }
       artpp::map<uint64_t, uint64_t> m;
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
