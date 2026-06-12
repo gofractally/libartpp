@@ -598,15 +598,16 @@ static void test_equality()
       for (char c = 'a' + 14; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);
       const auto ds = s.debug_stats(), dw = w.debug_stats();
       CHECK(ds.setlist == 1 && ds.full == 0);  // prove the shapes really diverged
-      CHECK(dw.full == 1);                      // (otherwise this tests nothing)
+      CHECK(dw.fullp == 1);  // widened under the "k" prefix → fused-prefix full (pfxd)
       CHECK(s == w && w == s);
       w.update(key('c'), 999u);
       CHECK(s != w);
       w.update(key('c'), uint64_t('c'));
       CHECK(s == w);
-      // erase down to 12: the wide node de-widens; both setlists → the fast path again
+      // erase down to 12: the wide node de-widens (carrying its fused prefix into the
+      // setlist's inline slot); both setlists → the fast path again
       for (char c = 'a' + 12; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }
-      CHECK(w.debug_stats().full == 0);
+      CHECK(w.debug_stats().full == 0 && w.debug_stats().fullp == 0);
       CHECK(s == w);
    }
    // bucket entries compare by content, not storage (arrival) order
@@ -821,6 +822,83 @@ static void test_degenerate_shapes()
    }
 }
 
+// ── fused in-header prefixes: prefix_node is overflow, not the default ────────
+// A compressed run above a dense router lives in the router's OWN header
+// cacheline (handle hint K::pfxd, real kind + bytes in the header); a separate
+// prefix_node appears only when the prefix exceeds the header's capacity.
+static void test_fused_prefix()
+{
+   // sequential integers: the shared high-byte run must fuse — ZERO prefix nodes.
+   // (1M keys: the root's byte-5 fanout exceeds a setlist, forcing the widen-under-
+   // prefix path; smaller N leaves the root a setlist whose own inline slot suffices.)
+   {
+      artpp::map<uint64_t, uint64_t> t;
+      for (uint64_t i = 0; i < 1000000; ++i) t.insert(i * 2, i);
+      const auto d = t.debug_stats();
+      CHECK(d.prefix == 0);  // every compressed run lives in a header cacheline
+      CHECK(d.fullp >= 1);
+      uint64_t expect = 0;
+      for (auto it = t.begin(); it != t.end(); ++it, ++expect)
+         if (it->first != expect * 2 || it->second != expect) { CHECK(false); break; }
+      CHECK(expect == 1000000);
+      for (uint64_t i = 0; i < 1000000; i += 17)
+         if (!t.contains(i * 2) || t.contains(i * 2 + 1)) { CHECK(false); break; }
+      CHECK(t.lower_bound(uint64_t(3))->first == 4);  // bounds through the fused prefix
+      CHECK(std::prev(t.end())->first == 1999998);    // --end() through it
+      for (uint64_t i = 0; i < 1000000; i += 2)       // erase half: pfxd remove paths
+         if (t.erase(i * 2) != 1) { CHECK(false); break; }
+      CHECK(t.size() == 500000);
+      for (uint64_t i = 1; i < 1000000; i += 2)
+         if (!t.contains(i * 2)) { CHECK(false); break; }
+   }
+   // a >16-fanout cluster under a string prefix: widening fuses the lifted prefix,
+   // and a key diverging INSIDE the fused prefix splits it correctly
+   {
+      artpp::map<std::string_view, uint32_t> t;
+      std::map<std::string, uint32_t>        ref;
+      const std::string                      pre = "shared-prefix:";
+      for (int i = 0; i < 26; ++i)
+      {
+         std::string k = pre + char('a' + i);
+         t.insert(k, uint32_t(i));
+         ref[k] = uint32_t(i);
+      }
+      auto d = t.debug_stats();
+      CHECK(d.prefix == 0 && d.fullp == 1);  // 26 branches widened under the fused prefix
+      t.insert("shared-pifball", 99u);       // diverges inside the fused prefix → split
+      ref["shared-pifball"] = 99u;
+      d = t.debug_stats();
+      CHECK(d.fullp == 1);  // the full keeps the tail of the split prefix fused
+      auto mi = ref.begin();
+      for (auto it = t.begin(); it != t.end(); ++it, ++mi)
+         if (mi == ref.end() || std::string(it.key()) != mi->first || it.value() != mi->second)
+         {
+            CHECK(false);
+            break;
+         }
+      // term ending exactly AT the fused boundary
+      t.insert(pre, 1000u);
+      CHECK(t.find_opt(pre).value() == 1000 && t.erase(pre) == 1);
+      // erase below SHRINK_MAX: de-widen carries the fused prefix into the setlist
+      for (int i = 11; i < 26; ++i) CHECK(t.erase(pre + char('a' + i)) == 1);
+      d = t.debug_stats();
+      CHECK(d.fullp == 0 && d.full == 0);
+      for (int i = 0; i < 11; ++i)
+         if (!has(t, pre + char('a' + i), uint32_t(i))) { CHECK(false); break; }
+      CHECK(t.contains("shared-pifball"));
+   }
+   // overflow: a prefix beyond the header capacity stays a prefix_node above the full
+   {
+      artpp::map<std::string_view, uint32_t> t;
+      const std::string                      pre(80, 'P');  // > 63-byte header cap
+      for (int i = 0; i < 20; ++i) t.insert(pre + char('A' + i), uint32_t(i));
+      const auto d = t.debug_stats();
+      CHECK(d.prefix >= 1);  // the overflow form earns its node
+      for (int i = 0; i < 20; ++i)
+         if (!has(t, pre + char('A' + i), uint32_t(i))) { CHECK(false); break; }
+   }
+}
+
 // ── large trivially-copyable values ───────────────────────────────────────────
 static void test_large_value()
 {
@@ -1011,6 +1089,7 @@ int main()
    test_iterator_edges();
    test_erase_iterator();
    test_degenerate_shapes();
+   test_fused_prefix();
    test_large_value();
    test_const_usage();
    test_string_key_params();

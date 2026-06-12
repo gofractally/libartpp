@@ -3,18 +3,18 @@
 <text x="14" y="28" font-size="17" font-weight="600" fill="#e6edf6">Point lookups — sequential uint64 (1M keys)</text>
 <text x="14" y="46" font-size="12" fill="#8da3bf">ns / operation — lower is better</text>
 <text x="180" y="73.0" font-size="13" font-weight="600" fill="#e6edf6" text-anchor="end">artpp::map</text>
-<rect x="190" y="54" width="148.2" height="30" rx="6" fill="url(#hot)"/>
-<text x="346.17466893039045" y="73.0" font-size="13" fill="#e6edf6">45.1</text>
+<rect x="190" y="54" width="137.5" height="30" rx="6" fill="url(#hot)"/>
+<text x="335.52478026442134" y="73.0" font-size="13" fill="#e6edf6">38.5</text>
 <text x="180" y="117.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">artpp::map (std::allocator)</text>
-<rect x="190" y="98" width="159.6" height="30" rx="6" fill="#3f8f86"/>
-<text x="357.6131748726656" y="117.0" font-size="13" fill="#e6edf6">48.6</text>
+<rect x="190" y="98" width="143.9" height="30" rx="6" fill="#3f8f86"/>
+<text x="341.88802718073714" y="117.0" font-size="13" fill="#e6edf6">40.2</text>
 <text x="180" y="161.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">libart</text>
-<rect x="190" y="142" width="144.9" height="30" rx="6" fill="#5e97d0"/>
-<text x="342.88774193548386" y="161.0" font-size="13" fill="#e6edf6">44.1</text>
+<rect x="190" y="142" width="147.6" height="30" rx="6" fill="#5e97d0"/>
+<text x="345.6058793116183" y="161.0" font-size="13" fill="#e6edf6">41.3</text>
 <text x="180" y="205.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">absl::btree_map</text>
-<rect x="190" y="186" width="262.8" height="30" rx="6" fill="#7587a3"/>
-<text x="460.7898132427844" y="205.0" font-size="13" fill="#e6edf6">80.0</text>
+<rect x="190" y="186" width="251.3" height="30" rx="6" fill="#7587a3"/>
+<text x="449.34825319447526" y="205.0" font-size="13" fill="#e6edf6">70.3</text>
 <text x="180" y="249.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">std::map</text>
 <rect x="190" y="230" width="484.0" height="30" rx="6" fill="#4a5a73"/>
-<text x="682.0" y="249.0" font-size="13" fill="#e6edf6">147.2</text>
+<text x="682.0" y="249.0" font-size="13" fill="#e6edf6">135.4</text>
 </svg>

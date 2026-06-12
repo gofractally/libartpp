@@ -32,8 +32,9 @@
   <div>
     <h1>libart<span class="pp">++</span></h1>
     <p class="tag"><b>The adaptive radix tree map for modern C++.</b><br>
-    <code>std::map</code>'s interface. <b>O(key length)</b> operations — no comparisons,
-    no rebalancing, no node headers on the hot path.</p>
+    <code>std::map</code>'s interface, with cost counted in the unit that actually
+    matters: <b>at most one cold cacheline per level</b>, and levels bounded by your
+    key's bytes — never by your data's size.</p>
     <div class="badges">
       <span class="badge hl">header-only</span>
       <span class="badge hl">C++23</span>
@@ -65,34 +66,37 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
 
 <!-- ── why ──────────────────────────────────────────────────────────────── -->
 <section id="why">
-  <h2>Built different where it counts</h2>
-  <p class="sub">Comparison trees pay <code>O(log n)</code> pointer chases and key comparisons,
-  and classic radix trees load a node header on every hop before they can route.
-  <b>libart++ does neither.</b></p>
+  <h2>Count cachelines, not comparisons</h2>
+  <p class="sub">A lookup's real cost is its <b>cold cacheline loads</b> — every other
+  instruction hides behind them. Big-O in comparisons flatters comparison trees;
+  measured in cachelines, a B-tree lookup is <code>O(log n)</code> dependent misses.
+  <b>libart++ is engineered so each level of descent costs at most ONE cold line</b> —
+  and the level count is bounded by your key's bytes, not your data's size.</p>
   <div class="grid">
     <div class="card">
       <h3><span class="dot"></span>Headerless dispatch</h3>
-      <p>The node's kind rides in the <b>tagged pointer itself</b> — descent decides how to
-      route before the node's cacheline even arrives. One load per hop, prefetched
-      perfectly, no dependent header read.</p>
+      <p>The node's kind rides in the <b>tagged pointer</b>, so descent knows how to route
+      before the node arrives: no header line load before the child slot load. One line
+      per hop is the contract, not the goal.</p>
     </div>
     <div class="card">
-      <h3><span class="dot"></span>O(key length), not O(log n)</h3>
-      <p>Lookup cost is bounded by your <b>key's bytes</b>, not your data's size. A billion
-      entries descend the same path depth as a million. No comparisons, no rebalancing,
-      ever.</p>
+      <h3><span class="dot"></span>Prefixes live in the header line</h3>
+      <p>A compressed run is stored <b>inside the cacheline the node already owns</b>; the
+      pointer tag hints when it must be read, and a prefix-free node never touches it. A
+      separate prefix node exists only past 63 bytes — overflow, not the default. Path
+      compression at <b>zero extra lines</b>.</p>
     </div>
     <div class="card">
-      <h3><span class="dot"></span>Values live in the pointer</h3>
+      <h3><span class="dot"></span>Values can cost zero lines</h3>
       <p>Small trivially-copyable values (≤5 bytes) pack <b>inline in the handle bits</b> —
-      zero allocation, zero indirection. Bigger values sit in compact leaves allocated
-      through <i>your</i> allocator.</p>
+      no allocation, no line. Bigger values sit one line away in compact leaves allocated
+      through <i>your</i> allocator, which bump-places them next to their parents.</p>
     </div>
     <div class="card">
-      <h3><span class="dot"></span>No temporary keys</h3>
-      <p><code>map&lt;string,T&gt;</code> and <code>map&lt;string_view,T&gt;</code> share one
-      signature: <code>std::string_view</code>. Literals, <code>char*</code>, views,
-      strings — all pass <b>without constructing a temporary</b>.</p>
+      <h3><span class="dot"></span>Levels collapse adaptively</h3>
+      <p>Sparse byte levels fuse: wide stems consume two key bytes per line, buckets pack
+      whole key tails into one 4-line page, dense spans direct-index. The tree spends
+      lines where your data's entropy actually is.</p>
     </div>
   </div>
 </section>
@@ -108,29 +112,28 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">1.7–2.4×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.1–4×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">−14…−32%</div><div class="l">point-lookup latency vs the original libart (dict/clustered/uniform; parity on its best case, sequential ints)</div></div>
-    <div class="stat"><div class="n">0 B</div><div class="l">allocated for small values — they live inside the pointer</div></div>
+    <div class="stat"><div class="n">1.6–2.4×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2–4×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">3 of 4</div><div class="l">workloads won outright vs the original libart (−13% dict, −38% clustered, −7% sequential); parity on uniform</div></div>
+    <div class="stat"><div class="n">≤ 1</div><div class="l">cold cacheline per level of descent — the invariant everything above falls out of</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
   <div class="figs">
     <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 88ns, artpp 112ns, libart 130ns, absl::btree_map 190ns, std::map 230ns"></div>
     <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
-    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 39ns fastest, std::map 159ns"></div>
-    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 45.1ns, libart 44.1ns — parity"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 45ns, libart 43ns — parity"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 38.5ns beats libart 41.3ns"></div>
   </div>
   <p class="method">
-    <b>Sequential integers are libart's home game</b> — a shallow, cache-hot
-    <code>node256</code> ladder with the shared prefix folded into the node header it
-    reads anyway. Headerless dispatch makes the opposite trade: the prefix lives in a
-    dedicated node (one extra hop here, no header load on <i>any</i> other path), and
-    leaves are cacheline-granular (128 B) where libart's are ~32 B — a larger terminal
-    working set under shuffled access. The pool allocator's bump placement recovers it
-    to parity (45.1 vs 44.1 ns); on every other workload the same trades are why artpp
-    wins. Values that fit 5 bytes skip the leaf entirely — they live inline in the
-    handle.
+    <b>Sequential integers were libart's home game</b> — its per-node prefix rides the
+    header it loads anyway, while our compressed run used to cost a dedicated
+    prefix-node hop. The in-header prefix closed that: a compressed run now lives in
+    the node's <i>own</i> header cacheline, the pointer tag hints when it must be read,
+    and prefix-free nodes never touch it — so this workload flipped to artpp too
+    (38.5 vs 41.3 ns). Uniform random integers — pure 8-byte dispersion, nothing to
+    compress, an identical dense ladder in both libraries — are the one workload at
+    parity. Values that fit 5 bytes skip the leaf line entirely (inline in the handle).
   </p>
 
   <h3 style="margin:38px 0 14px">Inserts</h3>
@@ -176,9 +179,13 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td><b>−14% / −28% / −15%</b> latency on dictionary / clustered / uniform keys
-        (pool allocator; <b>−32%</b> dict in bucket mode); parity on sequential
-        integers, libart's best case</td></tr>
+        <td><b>−13% / −38% / −7%</b> latency on dictionary / clustered / sequential keys
+        (pool allocator; <b>−29%</b> dict in bucket mode); parity on uniform random —
+        the one workload with nothing to compress</td></tr>
+    <tr><td>Path compression</td><td>per-node prefix read with the header on
+        <i>every</i> hop</td>
+        <td>prefix fused into the header line, read <b>only when the pointer tag says
+        one exists</b>; prefix-free nodes route without touching CL0 at all</td></tr>
     <tr><td>Values</td><td><code>void*</code> — you own the lifetime, casts everywhere</td>
         <td>real typed <code>T</code>: constructed in place, destroyed on erase,
         moved on restructure; small ones live inline in the pointer</td></tr>
@@ -283,7 +290,7 @@ m.<span class="f">insert</span>({1.5, -2.0}, <span class="s">"a"</span>);   <spa
 <pre><code><span class="c">// dictionary-shaped keys? pack the tails:</span>
 <span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
            <span class="t">artpp::mode</span>::buckets&gt; dict;
-<span class="c">// 88 ns dictionary lookups (vs 230 std::map),</span>
+<span class="c">// ~100 ns dictionary lookups (vs 244 std::map),</span>
 <span class="c">// clustered scans at absl::btree parity</span></code></pre>
     </div>
   </div>

@@ -21,14 +21,22 @@ namespace artpp::detail
    {
       value_ptr    = 0,  // -> leaf<T> (suffix + value), the terminal
       value_inline = 1,  // value packed in the handle's bytes (trivially-copyable T <= width-1)
-      prefix_node  = 2,  // long shared prefix + one next pointer (R1)
-      setlist_u8   = 3,  // sparse byte router, 1 cacheline (R1)
+      prefix_node  = 2,  // long shared prefix + one next pointer — the OVERFLOW form (R1)
+      setlist_u8   = 3,  // sparse byte router, 1 cacheline, inline prefix <= 8 (R1)
       node_full    = 4,  // dense direct-index router (full_lines_v lines, skip CL0)
-      c2           = 5,  // 2x128 segmented bitset router (skip CL0, rank)
-      c4           = 6,  // 4x64  segmented bitset router (skip CL0, rank)
-      c8           = 7,  // 8x32  segmented bitset router (skip CL0, rank)
-      setlist_u16  = 8,  // wide sparse router: 2-byte stems, 1 cacheline (R1)
-      bucket       = 9,  // sorted (suffix,value) collector — the "last mile" terminal
+      pfxd         = 5,  // HINT, not a type: "this node's header cacheline carries a
+                         // prefix you must consume" — the real kind is recorded IN the
+                         // header (kind byte after router_hdr, then the prefix bytes).
+                         // The tag deliberately need not match the node's type: it says
+                         // whether the header holds anything the descent needs. With an
+                         // empty prefix nothing does, the node keeps its plain type tag,
+                         // and (e.g.) node_full direct-indexes without touching CL0 —
+                         // still headerless, the tag is the hint.
+      c2           = 6,  // 2x128 segmented bitset router (skip CL0, rank)
+      c4           = 7,  // 4x64  segmented bitset router (skip CL0, rank)
+      c8           = 8,  // 8x32  segmented bitset router (skip CL0, rank)
+      setlist_u16  = 9,  // wide sparse router: 2-byte stems, 1 cacheline (R1)
+      bucket       = 10, // sorted (suffix,value) collector — the "last mile" terminal
       null         = 0xF,
    };
    // 4-bit tag contract: null is the all-ones nibble (an all-0xFF handle reads as null),
@@ -42,7 +50,8 @@ namespace artpp::detail
    inline constexpr unsigned K_max = unsigned(K::bucket);
 
    constexpr bool is_terminal(K k) noexcept { return k == K::value_ptr || k == K::value_inline; }
-   static_assert(uint8_t(K::setlist_u16) == uint8_t(K::c8) + 1,
+   static_assert(uint8_t(K::setlist_u16) == uint8_t(K::c8) + 1 &&
+                     uint8_t(K::pfxd) == uint8_t(K::node_full) + 1,
                  "router tags are contiguous: setlist_u8..setlist_u16 is one range check");
    constexpr bool is_router(K k) noexcept { return k >= K::setlist_u8 && k <= K::setlist_u16; }
 

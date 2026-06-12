@@ -291,8 +291,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
    struct node_full_t
    {
       static_assert(sizeof(cline_direct_t<Ptr>) == cacheline_bytes, "direct line tiles one cacheline");
+      // CL0's spare capacity carries the node's inline prefix when one exists: the
+      // node is then HANDLE-TAGGED K::pfxd (a hint: "the header holds something you
+      // need"), hdr[0] records the node's REAL kind, hdr[1..] the prefix bytes, and
+      // rh.hdr.prefix_len the count (6-bit field bounds the cap). The prefix lives in
+      // the header cacheline whenever it fits — prefix_node is the OVERFLOW form, not
+      // the default. With no prefix the node is tagged K::node_full and descent
+      // direct-indexes without ever touching CL0 (the skip-CL0 fast path, unchanged).
+      static constexpr unsigned PFX_CAP =
+          std::min(63u, cacheline_bytes - unsigned(sizeof(router_hdr_t<Ptr>)) - 1);
       router_hdr_t<Ptr>   rh;
-      uint8_t             pad[cacheline_bytes - sizeof(router_hdr_t<Ptr>)];  // CL0 = header (no inline prefix)
+      uint8_t             hdr[cacheline_bytes - sizeof(router_hdr_t<Ptr>)];  // [kind][prefix...]
       cline_direct_t<Ptr> ranges[full_lines_v<Ptr>];  // bytes 0..255, branchfree reciprocal index
    };
    using node_full = node_full_t<packed_ptr>;
@@ -751,6 +760,43 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             switch (k)
             {
+               case K::pfxd:  // consume the in-header prefix, then route as the full hoist
+               {
+                  char*          f  = static_cast<char*>(deref_(cur));
+                  const unsigned pl = reinterpret_cast<router_hdr*>(f)->hdr.prefix_len;
+                  const size_t   c  = lcp(
+                      std::string_view(reinterpret_cast<const char*>(pfxd_pfx(f)), pl),
+                      key.substr(depth));
+                  if (c < pl)  // fused prefix diverges → split it
+                  {
+                     *slot = split_pfxd_prefix(cur, key, depth, c, std::forward<VF>(v), [&](auto&& x) {
+                        return make_value_at(key, depth + c + 1, std::forward<decltype(x)>(x));
+                     });
+                     ++count_;
+                     return true;
+                  }
+                  depth += pl;
+                  if (depth == key.size())
+                  {
+                     const bool ins = set_or_update_term<Assign>(reinterpret_cast<router_hdr*>(f),
+                                                                 std::forward<VF>(v));
+                     count_ += ins;
+                     return ins;
+                  }
+                  const uint8_t byte = uint8_t(key[depth]);
+                  packed_ptr*   cs   = reinterpret_cast<packed_ptr*>(f + full_offtab_v<Ptr>[byte]);
+                  if (!cs->is_null())  // existing child -> descend
+                  {
+                     if constexpr (WideStems) pslot = slot;
+                     slot = cs;
+                     ++depth;
+                     continue;
+                  }
+                  full_set(reinterpret_cast<node_full*>(f), byte,
+                           make_value_at(key, depth + 1, std::forward<VF>(v)));
+                  ++count_;
+                  return true;
+               }
                case K::value_ptr:
                case K::value_inline:
                {
@@ -775,8 +821,23 @@ namespace detail  // implementation types & node helpers — not part of the pub
                }
                case K::prefix_node:
                {
-                  char*            P = static_cast<char*>(deref_(cur));
-                  std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pn_plen(P));
+                  char*          P  = static_cast<char*>(deref_(cur));
+                  const uint16_t pl = pn_plen(P);
+                  // Lazy fusion: a prefix node sitting directly above a node_full migrates
+                  // into the full's header cacheline on the first write that touches it —
+                  // the dedicated node was only ever the overflow form. Alloc-free (the
+                  // make_prefix fusion branch memcpys + retags), then re-dispatch.
+                  if (const packed_ptr nx = pn_next<Ptr>(P);
+                      (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
+                      (nx.tag() == K::pfxd &&
+                       pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
+                  {
+                     *slot = make_prefix(
+                         std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
+                     node_free_(P, pn_size<Ptr>(pl));
+                     continue;  // *slot is now the fused node; the pfxd arm consumes
+                  }
+                  std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
                   const size_t     c = lcp(PP, key.substr(depth));
                   if (c == PP.size())  // whole prefix matched -> descend into next
                   {
@@ -934,6 +995,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
    const char* p = ARTPP_PTR(raw); \
    if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
    std::memcpy(&raw, p + full_offtab_v<Ptr>[uint8_t(kp[depth])], sizeof(Ptr)); ARTPP_NEXT(depth + 1); }
+/* pfxd: the handle says "consume the in-header prefix first"; the node's real kind is
+   hdr[0] (node_full is the only header-capacity kind today, so the body IS the full
+   body — offtab offsets are identical). One CL0 load serves prefix + term, and the
+   slot line is the NEXT line of the same node (no pointer chase between them). */
+#define ARTPP_BODY_PFXD { \
+   const char* p = ARTPP_PTR(raw); \
+   const unsigned pl = reinterpret_cast<const router_hdr*>(p)->hdr.prefix_len; \
+   if (klen - depth < pl || std::memcmp(p + sizeof(router_hdr) + 1, kp + depth, pl) != 0) \
+      return op.miss(); \
+   depth += pl; \
+   if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
+   std::memcpy(&raw, p + full_offtab_v<Ptr>[uint8_t(kp[depth])], sizeof(Ptr)); ARTPP_NEXT(depth + 1); }
 #define ARTPP_BODY_CN(N) { \
    const char* p = ARTPP_PTR(raw); \
    if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
@@ -961,6 +1034,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::prefix_node:  ARTPP_BODY_PREFIX
                case K::setlist_u8:   ARTPP_BODY_SETLIST
                case K::node_full:    ARTPP_BODY_FULL
+               case K::pfxd:         ARTPP_BODY_PFXD
                case K::c2:           ARTPP_BODY_CN(2)
                case K::c4:           ARTPP_BODY_CN(4)
                case K::c8:           ARTPP_BODY_CN(8)
@@ -979,6 +1053,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
 #undef ARTPP_BODY_SETLIST
 #undef ARTPP_BODY_SETLIST16
 #undef ARTPP_BODY_FULL
+#undef ARTPP_BODY_PFXD
 #undef ARTPP_BODY_CN
 #undef ARTPP_BODY_BUCKET
 
@@ -1105,15 +1180,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   parent = cur; pstem = q; slot = cs; depth += 2; continue;
                }
                case K::setlist_u8: case K::c2: case K::c4: case K::c8: case K::node_full:
+               case K::pfxd:
                {
                   router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
-                  if (cur.tag() == K::setlist_u8)
+                  const K     ck = cur.tag();
+                  if (ck == K::setlist_u8 || ck == K::pfxd)  // kinds with an inline prefix
                   {
                      const unsigned pl = rh->hdr.prefix_len;
                      if (pl)
                      {
-                        const setlist* s = static_cast<const setlist*>(deref_(cur));
-                        if (key.size() - depth < pl || std::memcmp(s->prefix, key.data() + depth, pl) != 0)
+                        const uint8_t* pb = ck == K::pfxd
+                                                ? pfxd_pfx(rh)
+                                                : static_cast<const setlist*>(deref_(cur))->prefix;
+                        if (key.size() - depth < pl || std::memcmp(pb, key.data() + depth, pl) != 0)
                            return op.miss();
                         depth += pl;
                      }
@@ -1451,6 +1530,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      key_.len = base;
                      if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
                         key_.append(static_cast<const setlist*>(deref_(child))->prefix, rh->hdr.prefix_len);
+                     else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
+                        key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
                      cb = uint32_t(key_.len);
                   }
                   stk_.push_back(Frame{child, -1, uint32_t(base), cb});
@@ -1621,12 +1702,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                stk_.push_back(Frame{cur, lb, 0, 0});  // seek_ yields stems from the lower-bound index
                return false;
             }
-            // routers (setlist / c2 / c4 / c8 / node_full)
+            // routers (setlist / c2 / c4 / c8 / node_full / pfxd)
             const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-            if (k == K::setlist_u8 && rh->hdr.prefix_len)
+            if ((k == K::setlist_u8 || k == K::pfxd) && rh->hdr.prefix_len)
             {
-               const setlist*   s = static_cast<const setlist*>(deref_(cur));
-               std::string_view PP(reinterpret_cast<const char*>(s->prefix), rh->hdr.prefix_len);
+               const uint8_t* pb = k == K::pfxd ? pfxd_pfx(rh)
+                                                : static_cast<const setlist*>(deref_(cur))->prefix;
+               std::string_view PP(reinterpret_cast<const char*>(pb), rh->hdr.prefix_len);
                std::string_view R = key.substr(depth);
                const size_t     c = lcp(PP, R);
                if (c < PP.size())
@@ -1744,6 +1826,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                         if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
                            key_.append(static_cast<const setlist*>(deref_(child))->prefix,
                                        rh->hdr.prefix_len);
+                        else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
+                           key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
                         cb = uint32_t(key_.len);
                      }
                      uint8_t    bb;
@@ -1969,6 +2053,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   const setlist* s = static_cast<const setlist*>(deref_(fr.node));
                   if (s->rh.hdr.prefix_len) key_.append(s->prefix, s->rh.hdr.prefix_len);
+                  fr.cbase = uint32_t(key_.len);
+                  if (fr.cur >= 1) key_.push(uint8_t(fr.cur - 1));
+               }
+               else if (k == K::pfxd)  // fused prefix, then the edge byte like a full
+               {
+                  const router_hdr* rh = static_cast<const router_hdr*>(deref_(fr.node));
+                  if (rh->hdr.prefix_len) key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
                   fr.cbase = uint32_t(key_.len);
                   if (fr.cur >= 1) key_.push(uint8_t(fr.cur - 1));
                }
@@ -2415,8 +2506,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return split_leaf<Assign>(node, key, depth, std::forward<VF>(val), ins);
             case K::prefix_node:
             {
-               char*            P = static_cast<char*>(deref_(node));
-               std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pn_plen(P));
+               char*          P  = static_cast<char*>(deref_(node));
+               const uint16_t pl = pn_plen(P);
+               if (const packed_ptr nx = pn_next<Ptr>(P);  // lazy fusion, as in insert_
+                   (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
+                   (nx.tag() == K::pfxd && pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
+               {
+                  packed_ptr fused = make_prefix(
+                      std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
+                  node_free_(P, pn_size<Ptr>(pl));
+                  return bkt_put<Assign>(fused, key, depth, std::forward<VF>(val), ins);
+               }
+               std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
                const size_t     c = lcp(PP, key.substr(depth));
                if (c == PP.size())
                {
@@ -2466,6 +2567,23 @@ namespace detail  // implementation types & node helpers — not part of the pub
                while (!router_try_set(w, byte, child));
                gc.release();
                return pl ? make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), w) : w;
+            }
+            case K::pfxd:  // consume the fused prefix, then route as the dense default
+            {
+               void*          n  = deref_(node);
+               const unsigned pl = pfxd_plen(n);
+               const size_t   c  = lcp(
+                   std::string_view(reinterpret_cast<const char*>(pfxd_pfx(n)), pl),
+                   key.substr(depth));
+               if (c < pl)
+               {
+                  ins = true;
+                  return split_pfxd_prefix(node, key, depth, c, std::forward<VF>(val), [&](auto&& x) {
+                     return make_bucket_branch(key, depth + c + 1, std::forward<decltype(x)>(x));
+                  });
+               }
+               depth += pl;
+               [[fallthrough]];
             }
             default:  // c2 / c4 / c8 / node_full — no inline prefix
             {
@@ -2555,17 +2673,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return true;  // empty shell: cascade
                }
                // Only payload is a key ending HERE: the term handle (an empty-suffix leaf /
-               // inline value) replaces the router. A setlist's inline prefix is part of that
-               // key's path — it must survive as a prefix node above the term.
-               if (k == K::setlist_u8)
+               // inline value) replaces the router. An inline prefix (setlist or fused) is
+               // part of that key's path — it must survive as a prefix node above the term.
+               if (k == K::setlist_u8 || k == K::pfxd)
                {
-                  setlist* s = static_cast<setlist*>(deref_(nd));
-                  if (const unsigned pl = s->rh.hdr.prefix_len)
+                  if (const unsigned pl = rh->hdr.prefix_len)
                   {
+                     const uint8_t* pb = k == K::pfxd
+                                             ? pfxd_pfx(rh)
+                                             : static_cast<const setlist*>(deref_(nd))->prefix;
                      try
                      {
                         *slot = make_prefix(
-                            std::string_view(reinterpret_cast<char*>(s->prefix), pl), rh->term);
+                            std::string_view(reinterpret_cast<const char*>(pb), pl), rh->term);
                         rm_free_(nd);
                      }
                      catch (...)
@@ -2580,7 +2700,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             if (nb == 1 && !tm)
             {
-               uint8_t  pfx[setlist::PREFIX_CAP + 2];
+               uint8_t  pfx[node_full::PFX_CAP + 2];  // largest inline prefix + edge byte(s)
                unsigned pl = 0;
                if (k == K::setlist_u8)
                {
@@ -2597,19 +2717,25 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   pfx[pl++]    = uint8_t(s->stems[0] & 0xFF);
                   rm_collapse_(slot, nd, pfx, pl, s->branch[0]);
                }
-               else  // cN/full: fetch the lone child, absorb its byte
+               else  // cN/full/pfxd: fused prefix (if any) ++ the lone child's byte
                {
+                  if (k == K::pfxd)
+                  {
+                     pl = rh->hdr.prefix_len;
+                     std::memcpy(pfx, pfxd_pfx(rh), pl);
+                  }
                   packed_ptr child = packed_ptr::null();
                   router_for_each(nd, [&](uint8_t bb, packed_ptr br) {
-                     pfx[0] = bb;
-                     child  = br;
+                     pfx[pl] = bb;
+                     child   = br;
                   });
-                  pl = 1;
+                  ++pl;
                   rm_collapse_(slot, nd, pfx, pl, child);
                }
                return false;
             }
-            if (nb <= unsigned(SHRINK_MAX) && k != K::setlist_u8 && k != K::setlist_u16)
+            if (nb <= unsigned(SHRINK_MAX) && k != K::setlist_u8 && k != K::setlist_u16 &&
+                !(k == K::pfxd && rh->hdr.prefix_len > setlist::PREFIX_CAP))  // prefix must ride
             {
                try  // sparse dense node: de-widen back to one cacheline (best-effort)
                {
@@ -2621,6 +2747,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      assert(ok && "SHRINK_MAX <= setlist CAP");
                      (void)ok;
                   });
+                  if (k == K::pfxd)  // the fused prefix rides into the setlist's inline slot
+                  {
+                     const unsigned pl = rh->hdr.prefix_len;
+                     std::memcpy(s2->prefix, pfxd_pfx(rh), pl);
+                     s2->rh.hdr.prefix_len = pl;
+                  }
                   *slot = pack_(s2, K::setlist_u8);
                   rm_free_(nd);
                   continue;  // re-evaluate as a setlist (may now be 1-branch -> collapse)
@@ -2785,15 +2917,20 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::c4:
                case K::c8:
                case K::node_full:
+               case K::pfxd:
                {
-                  if (cur.tag() == K::setlist_u8)
+                  const K ck = cur.tag();
+                  if (ck == K::setlist_u8 || ck == K::pfxd)  // kinds with an inline prefix
                   {
-                     const setlist* s  = static_cast<const setlist*>(deref_(cur));
-                     const unsigned pl = s->rh.hdr.prefix_len;
+                     const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
+                     const unsigned    pl = rh->hdr.prefix_len;
                      if (pl)
                      {
+                        const uint8_t* pb = ck == K::pfxd
+                                                ? pfxd_pfx(rh)
+                                                : static_cast<const setlist*>(deref_(cur))->prefix;
                         if (key.size() - depth < pl ||
-                            std::memcmp(s->prefix, key.data() + depth, pl) != 0)
+                            std::memcmp(pb, key.data() + depth, pl) != 0)
                            return false;
                         depth += pl;
                      }
@@ -2989,6 +3126,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (const int r = eq_walk_(A->branch[i], tb, B->branch[i]); r != 1) return r;
                return 1;
             }
+            case K::pfxd:  // fused prefixes must agree, then compare as the dense router
+            {
+               const router_hdr* RA = static_cast<const router_hdr*>(deref_(a));
+               const router_hdr* RB = static_cast<const router_hdr*>(tb.deref_(b));
+               const unsigned    pa = RA->hdr.prefix_len, pb = RB->hdr.prefix_len;
+               const unsigned    m  = pa < pb ? pa : pb;
+               if (m && std::memcmp(pfxd_pfx(RA), pfxd_pfx(RB), m) != 0) return 0;
+               if (pa != pb) return -1;  // same bytes, different carving → undecided
+               [[fallthrough]];
+            }
             case K::c2:
             case K::c4:
             case K::c8:
@@ -3042,6 +3189,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // key beneath. collapse_saved weights that by the terminals under each fused edge:
          // the predicted total router-hops removed if every eligible pair were fused.
          uint64_t router_hops = 0, collapsible = 0, collapse_saved = 0;
+         uint64_t fullp = 0;  // node_full routers whose prefix is fused in-header (K::pfxd)
       };
       // Returns the number of terminals in cur's subtree (used to weight collapse_saved).
       // routers_above = routers already on the path; parent_noterm_router = the parent is a
@@ -3076,6 +3224,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c4:           ++d.c4; break;
             case K::c8:           ++d.c8; break;
             case K::node_full:    ++d.full; break;
+            case K::pfxd:         ++d.fullp; break;  // full router with a fused in-header prefix
             case K::bucket:       return 0;  // census doesn't descend buckets
             case K::null:         return 0;  // exhaustive (no default)
          }
@@ -3266,6 +3415,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                const size_t      base = key.len;
                if (k == K::setlist_u8 && rh->hdr.prefix_len)
                   key.append(static_cast<const setlist*>(deref_(cur))->prefix, rh->hdr.prefix_len);
+               else if (k == K::pfxd && rh->hdr.prefix_len)
+                  key.append(pfxd_pfx(rh), rh->hdr.prefix_len);
                const size_t cb = key.len;
                if (!rh->term.is_null())
                   call_val_(key.view(), rh->term, f);  // key ends here (path + prefix)
@@ -3487,10 +3638,68 @@ namespace detail  // implementation types & node helpers — not part of the pub
             return make_leaf_full(pfx, suf, std::forward<VF>(val));
          return make_leaf(suf, std::forward<VF>(val));
       }
+      // ── pfxd: the in-header prefix (the tag is a hint, not a type) ──────────────
+      // A K::pfxd handle says only "the header cacheline carries a prefix you must
+      // consume"; the node's REAL kind is recorded in the header itself. Today the
+      // node_full is the kind with header capacity (its CL0 was pure padding); cN and
+      // wide setlists keep prefix_node as their overflow. Layout behind a pfxd handle:
+      //   CL0: router_hdr | kind (u8) | prefix bytes (rh.hdr.prefix_len of them)
+      //   CL1+: the kind's normal body at its normal offsets (offtab unchanged).
+      static K pfxd_kind(const void* n) noexcept
+      {
+         return K(static_cast<const uint8_t*>(n)[sizeof(router_hdr)]);
+      }
+      static uint8_t* pfxd_pfx(void* n) noexcept
+      {
+         return static_cast<uint8_t*>(n) + sizeof(router_hdr) + 1;
+      }
+      static const uint8_t* pfxd_pfx(const void* n) noexcept
+      {
+         return static_cast<const uint8_t*>(n) + sizeof(router_hdr) + 1;
+      }
+      static unsigned pfxd_plen(const void* n) noexcept
+      {
+         return static_cast<const router_hdr*>(n)->hdr.prefix_len;
+      }
+      // Drop a consumed/shortened fused prefix in place; returns the handle to use
+      // (retags back to the real kind when the prefix empties — header no longer needed).
+      packed_ptr pfxd_set_prefix(void* n, const uint8_t* bytes, unsigned pl)
+      {
+         router_hdr* rh = static_cast<router_hdr*>(n);
+         if (pl == 0)
+         {
+            rh->hdr.prefix_len = 0;
+            return pack_(n, pfxd_kind(n));
+         }
+         std::memmove(pfxd_pfx(n), bytes, pl);  // bytes may alias the tail of the old prefix
+         rh->hdr.prefix_len = pl & 0x3F;
+         return pack_(n, K::pfxd);
+      }
+
+      // Attach a shared prefix above `next`. The prefix lives in the TARGET's header
+      // cacheline whenever there is capacity (node_full today; an existing fused prefix
+      // is prepended to) and only overflows into a dedicated prefix_node when it can't
+      // fit. setlists take their (smaller) inline prefix via apply_prefix at their own
+      // call sites.
       packed_ptr make_prefix(std::string_view pfx, packed_ptr next)
       {
          if (pfx.empty())
             return next;
+         const K nk = next.tag();
+         if (nk == K::node_full || (nk == K::pfxd && pfxd_kind(deref_(next)) == K::node_full))
+         {
+            node_full*     f  = static_cast<node_full*>(deref_(next));
+            const unsigned pl = f->rh.hdr.prefix_len;  // 0 for plain node_full
+            if (pfx.size() + pl <= node_full::PFX_CAP)
+            {
+               uint8_t* pb = f->hdr + 1;
+               std::memmove(pb + pfx.size(), pb, pl);  // prepend before any existing
+               std::memcpy(pb, pfx.data(), pfx.size());
+               f->hdr[0]            = uint8_t(K::node_full);
+               f->rh.hdr.prefix_len = uint16_t(pfx.size() + pl) & 0x3F;
+               return pack_(f, K::pfxd);
+            }
+         }
          char*    p  = static_cast<char*>(node_alloc_(pn_size<Ptr>(pfx.size())));
          uint16_t pl = uint16_t(pfx.size());
          std::memcpy(p, &pl, 2);
@@ -3546,8 +3755,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const router_hdr* crh = static_cast<const router_hdr*>(deref_(c));
             if (!crh->term.is_null())                    // a key ends 1 byte in → not representable
                return;
-            if (ck == K::setlist_u8 && crh->hdr.prefix_len != 0)
-               return;
+            if ((ck == K::setlist_u8 || ck == K::pfxd) && crh->hdr.prefix_len != 0)
+               return;  // an inline (or fused) prefix is not representable in the wide node
             total += crh->hdr.nbranch;
             if (total > FUSE_THRESH)
                return;
@@ -3637,6 +3846,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          switch (k)
          {
+            case K::pfxd:        return sizeof(node_full);  // only header-capacity kind today
             case K::setlist_u8:  return sizeof(setlist);
             case K::setlist_u16: return sizeof(setlist16);
             case K::c2:          return sizeof(cnode<2>);
@@ -3663,6 +3873,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          switch (cur.tag())
          {
+            case K::pfxd:  // hint tag: real kind in the header — node_full today, and the
+                           // body offsets are identical, so the typed view is the full's
+               return f(static_cast<node_full*>(deref_(cur)));
             case K::setlist_u8: return f(static_cast<setlist*>(deref_(cur)));
             case K::c2:         return f(static_cast<cnode<2>*>(deref_(cur)));
             case K::c4:         return f(static_cast<cnode<4>*>(deref_(cur)));
@@ -3959,6 +4172,22 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (pn) pn_set_next(pn, node);
             else    *slot = node;
          }
+         // The ladder is done: if the lifted prefix now sits above a node_full, fuse it
+         // back into the full's header cacheline and free the prefix node — prefix_node
+         // is the overflow form, not the home (a setlist prefix is <= 8, always fits).
+         if (pn && node.tag() == K::node_full)
+         {
+            const uint16_t pl = pn_plen(pn);
+            node_full*     f  = static_cast<node_full*>(deref_(node));
+            if (pl <= node_full::PFX_CAP)
+            {
+               std::memcpy(f->hdr + 1, pn_pfx<Ptr>(pn), pl);
+               f->hdr[0]            = uint8_t(K::node_full);
+               f->rh.hdr.prefix_len = pl & 0x3F;
+               *slot                = pack_(f, K::pfxd);
+               node_free_(pn, pn_size<Ptr>(pl));
+            }
+         }
       }
 
       template <bool Assign, class VF>
@@ -4106,6 +4335,37 @@ namespace detail  // implementation types & node helpers — not part of the pub
          return partial;
       }
 
+      // Split a FUSED in-header prefix (K::pfxd) diverging from the key at c (< plen):
+      // same shape as split_setlist_prefix — a new parent setlist takes the shared part
+      // [0..c), routes the new value's branch, and routes the old continuation byte back
+      // to the node, whose fused prefix shortens in place to [c+1..) (the handle retags
+      // to the real kind when the prefix empties — the header is no longer needed).
+      template <class MakeBranch, class VF>
+      packed_ptr split_pfxd_prefix(packed_ptr cur, std::string_view key, size_t depth,
+                                   size_t c, VF&& val, MakeBranch&& make_branch)
+      {
+         void*          n  = deref_(cur);
+         uint8_t*       pb = pfxd_pfx(n);
+         const unsigned pl = pfxd_plen(n);
+         uint8_t        common[node_full::PFX_CAP];
+         std::memcpy(common, pb, c);          // shared part [0..c) (read, no mutation)
+         const uint8_t  oldbyte = pb[c];      // byte leading back to this node
+         const unsigned newpl   = pl - unsigned(c) - 1;
+         setlist*       r       = new_setlist();
+         packed_ptr     partial = pack_(r, K::setlist_u8);
+         build_guard    g{this, &partial};
+         std::string_view R = key.substr(depth);
+         if (c == R.size())
+            set_term(&r->rh, std::forward<VF>(val));  // the new key ends inside the prefix
+         else
+            setlist_set(r, uint8_t(R[c]), make_branch(std::forward<VF>(val)));
+         partial = apply_prefix(r, std::string_view(reinterpret_cast<char*>(common), c));
+         // commit (non-throwing): shorten the fused prefix in place, then graft
+         setlist_set(r, oldbyte, pfxd_set_prefix(n, pb + c + 1, newpl));
+         g.release();
+         return partial;
+      }
+
       // ── structural clone: node-by-node move transport ────────────────────────────
       // Move-assignment fallback for unequal, non-propagating allocators: clone the
       // source tree's STRUCTURE into our allocator — allocate a same-size node, memcpy
@@ -4197,6 +4457,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             case K::setlist_u8:
                return clone_router_(src, static_cast<const setlist*>(src.deref_(s)), K::setlist_u8);
+            case K::pfxd:  // full body + in-header prefix; the memcpy carries both
+               return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
             case K::c2:
                return clone_router_(src, static_cast<const cnode<2>*>(src.deref_(s)), K::c2);
             case K::c4:
@@ -4263,6 +4525,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c4:
             case K::c8:
             case K::node_full:
+            case K::pfxd:
             {
                router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
                free_all_(rh->term);
