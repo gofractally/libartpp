@@ -110,6 +110,12 @@ if(ARTPP_BENCHMARKS)
    target_compile_options(artpp_bench PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
    set_target_properties(artpp_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+   # memory footprint probe: bytes/key per contestant per distribution (run alone)
+   add_executable(artpp_mem_probe bench/mem_probe.cpp)
+   target_link_libraries(artpp_mem_probe PRIVATE artpp artpp_vendor_libart absl::btree)
+   target_compile_options(artpp_mem_probe PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_mem_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
    # the artpp/libart ratio regression gate (machine-calibrated baseline; run alone)
    add_executable(artpp_perf_gate bench/perf_gate.cpp)
    target_link_libraries(artpp_perf_gate PRIVATE artpp artpp_vendor_libart)

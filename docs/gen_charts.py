@@ -50,7 +50,19 @@ def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def chart(title: str, rows: list[tuple[str, float | None]], out: Path) -> None:
+# Per-op subtitle: the title names the stored-key DISTRIBUTION; this names the
+# QUERY set and order, so "sequential" (the data) is never confused with the
+# query pattern (always randomized; never sequential probing).
+SUBS = {
+    "hit": "ns / op, lower is better · queries: the stored keys, in random order",
+    "miss": "ns / op, lower is better · queries: absent keys, in random order",
+    "lbound": "ns / op, lower is better · queries: absent keys → position at next-greater stored key",
+    "insert": "ns / op, lower is better · bulk build (sequential = ascending; others arbitrary order)",
+    "scan": "ns / element, lower is better · one full in-order traversal",
+}
+
+
+def chart(title: str, sub: str, rows: list[tuple[str, float | None]], out: Path) -> None:
     # rows: (name, ns) — ns None means the contestant has no API for this op
     # (rendered as "unsupported", no bar) so the gap is visible, not hidden.
     pad_l, pad_r, bar_h, gap, top = 190, 86, 30, 14, 54
@@ -68,7 +80,7 @@ def chart(title: str, rows: list[tuple[str, float | None]], out: Path) -> None:
         '<stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#a3e635"/></linearGradient>'
         "</defs>",
         f'<text x="14" y="28" font-size="17" font-weight="600" fill="#e6edf6">{esc(title)}</text>',
-        f'<text x="14" y="46" font-size="12" fill="#8da3bf">ns / operation — lower is better</text>',
+        f'<text x="14" y="46" font-size="11.5" fill="#8da3bf">{esc(sub)}</text>',
     ]
     for i, (name, v) in enumerate(rows):
         y = top + i * (bar_h + gap)
@@ -115,7 +127,7 @@ def main() -> None:
         # (libart has no ordered-positioning API). Other ops only show contestants present.
         names = ORDER if key[1] == "lbound" else [c for c in ORDER if c in present]
         rows = [(c, present.get(c)) for c in names]
-        chart(title, rows, outdir / f"{key[0]}_{key[1]}.svg")
+        chart(title, SUBS.get(key[1], "ns / op, lower is better"), rows, outdir / f"{key[0]}_{key[1]}.svg")
         made += 1
     print(f"wrote {made} charts to {outdir}")
 
