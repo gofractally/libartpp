@@ -119,6 +119,12 @@ if(ARTPP_BENCHMARKS)
       set_target_properties(artpp_bench_double PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
    endif()
 
+   # 32-byte buffer keys (hashes/UUIDs/composite) — art_map can't represent these
+   add_executable(artpp_bench_buffer bench/bench_buffer.cpp)
+   target_link_libraries(artpp_bench_buffer PRIVATE artpp absl::btree artpp_vendor_libart)
+   target_compile_options(artpp_bench_buffer PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_bench_buffer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
    # memory footprint probe: bytes/key per contestant per distribution (run alone)
    add_executable(artpp_mem_probe bench/mem_probe.cpp)
    target_link_libraries(artpp_mem_probe PRIVATE artpp artpp_vendor_libart absl::btree)

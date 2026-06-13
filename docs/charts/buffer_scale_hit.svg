@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 470" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="32-byte-key point-lookup latency from 1M to 100M">
+<defs><linearGradient id="hot" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs>
+<text x="14" y="28" font-size="17" font-weight="600" fill="#e6edf6">32-byte keys: point-lookup latency as the map grows 100×</text>
+<text x="14" y="46" font-size="11.5" fill="#8da3bf">ns per lookup, lower is better · the comparison trees explode; the radix tree stays flat (art_map can&#39;t key 32 B)</text>
+<rect x="14" y="58" width="12" height="12" rx="2" fill="#34d399"/>
+<text x="31" y="68" font-size="11" fill="#8da3bf">artpp::map</text>
+<rect x="130.0" y="58" width="12" height="12" rx="2" fill="#a78bfa"/>
+<text x="147.0" y="68" font-size="11" fill="#8da3bf">std::unordered_map</text>
+<rect x="310.0" y="58" width="12" height="12" rx="2" fill="#5e97d0"/>
+<text x="327.0" y="68" font-size="11" fill="#8da3bf">libart</text>
+<rect x="394.0" y="58" width="12" height="12" rx="2" fill="#7587a3"/>
+<text x="411.0" y="68" font-size="11" fill="#8da3bf">absl::btree_map</text>
+<rect x="550.0" y="58" width="12" height="12" rx="2" fill="#4a5a73"/>
+<text x="567.0" y="68" font-size="11" fill="#8da3bf">std::map</text>
+<line x1="184" y1="426.0" x2="668" y2="426.0" stroke="#22304a" stroke-width="1"/>
+<text x="176" y="430.0" font-size="10.5" fill="#8da3bf" text-anchor="end">0</text>
+<line x1="184" y1="343.1" x2="668" y2="343.1" stroke="#22304a" stroke-width="1"/>
+<text x="176" y="347.1" font-size="10.5" fill="#8da3bf" text-anchor="end">500</text>
+<line x1="184" y1="260.3" x2="668" y2="260.3" stroke="#22304a" stroke-width="1"/>
+<text x="176" y="264.3" font-size="10.5" fill="#8da3bf" text-anchor="end">1000</text>
+<line x1="184" y1="177.4" x2="668" y2="177.4" stroke="#22304a" stroke-width="1"/>
+<text x="176" y="181.4" font-size="10.5" fill="#8da3bf" text-anchor="end">1500</text>
+<line x1="184" y1="94.6" x2="668" y2="94.6" stroke="#22304a" stroke-width="1"/>
+<text x="176" y="98.6" font-size="10.5" fill="#8da3bf" text-anchor="end">2000</text>
+<text x="184" y="448" font-size="12.5" fill="#8da3bf" text-anchor="middle">1M keys</text>
+<text x="668" y="448" font-size="12.5" fill="#8da3bf" text-anchor="middle">100M keys</text>
+<line x1="184" y1="292.3" x2="668" y2="100.2" stroke="#4a5a73" stroke-width="2.2"/>
+<circle cx="184" cy="292.3" r="3.6" fill="#4a5a73"/>
+<circle cx="668" cy="100.2" r="4.5" fill="#4a5a73"/>
+<line x1="184" y1="342.3" x2="668" y2="182.3" stroke="#7587a3" stroke-width="2.2"/>
+<circle cx="184" cy="342.3" r="3.6" fill="#7587a3"/>
+<circle cx="668" cy="182.3" r="4.5" fill="#7587a3"/>
+<line x1="184" y1="415.1" x2="668" y2="406.5" stroke="#5e97d0" stroke-width="2.2"/>
+<circle cx="184" cy="415.1" r="3.6" fill="#5e97d0"/>
+<circle cx="668" cy="406.5" r="4.5" fill="#5e97d0"/>
+<line x1="184" y1="415.3" x2="668" y2="409.4" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="184" cy="415.3" r="3.6" fill="#a78bfa"/>
+<circle cx="668" cy="409.4" r="4.5" fill="#a78bfa"/>
+<line x1="184" y1="417.4" x2="668" y2="411.2" stroke="#34d399" stroke-width="3.4"/>
+<circle cx="184" cy="417.4" r="3.6" fill="#34d399"/>
+<circle cx="668" cy="411.2" r="4.5" fill="#34d399"/>
+<text x="678" y="104.2" font-size="12" fill="#4a5a73">1966 ns</text>
+<text x="678" y="186.3" font-size="12" fill="#7587a3">1471 ns</text>
+<text x="678" y="410.5" font-size="12" fill="#5e97d0">118 ns</text>
+<text x="678" y="425.5" font-size="12" fill="#a78bfa">100 ns</text>
+<text x="678" y="440.5" font-size="12" fill="#34d399" font-weight="600">90 ns</text>
+</svg>
