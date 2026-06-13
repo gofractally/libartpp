@@ -115,6 +115,14 @@ def bars(title: str, sub: str, rows, out: Path) -> None:
     out.write_text("\n".join(p))
 
 
+# fixed-size std::array<u8,32> keys at 100M (inline; no per-key std::string heap alloc).
+# unodb not re-run here (key_view over the same bytes ≈ its std::string tier); omitted.
+ARR_HIT_100 = {"std::unordered_map": 55.3, "artpp::map": 67.4, "libart": 101.9,
+               "absl::btree_map": 1057.4, "std::map": 1421.7}
+ARR_LB_100 = {"artpp::map": 165.3, "absl::btree_map": 947.1, "std::map": 1078.1,
+              "libart": None, "std::unordered_map": None}
+
+
 def main() -> None:
     outdir = Path(sys.argv[1] if len(sys.argv) > 1 else "docs/charts")
     outdir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +137,18 @@ def main() -> None:
          "ns / op · artpp 4× over unodb (the canonical C++ ART), far over the trees; hash/libart have none",
          [(n, {**LB_100, "art_map": None}.get(n)) for n in lb_order],
          outdir / "buffer_lbound_100M.svg")
-    print(f"wrote 3 buffer charts to {outdir}")
+    # fixed-size std::array variant (inline keys): hash wins point lookups; artpp leads ordered
+    ahit = ["std::unordered_map", "artpp::map", "libart", "absl::btree_map", "std::map", "art_map"]
+    bars("Point lookups at 100M — fixed-size std::array<32> keys",
+         "ns / lookup · inline keys: the hash map wins point lookups; artpp leads every ordered map 16–21×",
+         [(n, {**ARR_HIT_100, "art_map": None}.get(n)) for n in ahit],
+         outdir / "array_hit_100M.svg")
+    albo = ["artpp::map", "absl::btree_map", "std::map", "std::unordered_map", "libart", "art_map"]
+    bars("lower_bound at 100M — fixed-size std::array<32> keys",
+         "ns / op · artpp ~6× over the trees; the hash map and libart have no ordered query",
+         [(n, {**ARR_LB_100, "art_map": None}.get(n)) for n in albo],
+         outdir / "array_lbound_100M.svg")
+    print(f"wrote 5 buffer/array charts to {outdir}")
 
 
 if __name__ == "__main__":

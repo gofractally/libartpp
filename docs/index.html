@@ -215,38 +215,49 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <div class="fig"><img src="charts/buffer_scale_hit.svg" alt="32-byte-key point-lookup latency from 1M to 100M: artpp 52 to 90 ns, std::unordered_map 64 to 100, libart 66 to 118, unodb 210 to 352, absl::btree_map 505 to 1471, std::map 807 to 1966"></div>
   </div>
   <p class="method">
-    Grow the map 100× and artpp's lookup moves only <b>~52 → 90 ns</b>, while
-    <code>absl::btree_map</code> climbs 505 → 1,471 and <code>std::map</code> 807 → 1,966 — each
-    level is a full-string compare over cold cache lines, and there are O(log n) of them. At
-    100M keys artpp is <b>16× faster than <code>absl::btree_map</code></b> and
-    <b>22× faster than <code>std::map</code></b> on point lookups, and it scales best of the
-    field (1.75× across the 100× growth, versus 2.4–2.9× for the trees).
+    Grow the map 100× and artpp's lookup barely moves — <b>~52 → 90 ns</b> on these
+    <code>std::string</code> keys — while <code>absl::btree_map</code> climbs 505 → 1,471 and
+    <code>std::map</code> 807 → 1,966: each level is a full-key compare over cold cache lines,
+    O(log n) of them. The radix reads only the bytes that distinguish a key, so it scales best of
+    the field (1.75× across the growth vs 2.4–2.9× for the trees) and at 100M is <b>16× over
+    <code>absl::btree_map</code></b> and <b>22× over <code>std::map</code></b>.
   </p>
 
-  <h3 style="margin:38px 0 14px">Faster than the hash map — and still ordered</h3>
+  <h3 style="margin:38px 0 14px">Variable-length (string) keys — fastest, ordered or not</h3>
   <div class="figs">
-    <div class="fig"><img src="charts/buffer_hit_100M.svg" alt="Point lookups at 100M 32-byte keys: artpp 90 ns, std::unordered_map 100, libart 118, unodb 352, absl::btree_map 1471, std::map 1966; art_map does not compile"></div>
-    <div class="fig"><img src="charts/buffer_lbound_100M.svg" alt="lower_bound at 100M 32-byte keys: artpp 159 ns, unodb 638, absl::btree_map 1489, std::map 2169; libart, unordered_map and art_map have no ordered query"></div>
+    <div class="fig"><img src="charts/buffer_hit_100M.svg" alt="Point lookups at 100M 32-byte string keys: artpp 90 ns, std::unordered_map 100, libart 118, unodb 352, absl::btree_map 1471, std::map 1966; art_map does not compile"></div>
+    <div class="fig"><img src="charts/buffer_lbound_100M.svg" alt="lower_bound at 100M 32-byte string keys: artpp 159 ns, unodb 638, absl::btree_map 1489, std::map 2169; libart, unordered_map and art_map have no ordered query"></div>
   </div>
   <p class="method">
-    On a 32-byte key the descent diverges after the first few random bytes, so a lookup reads
-    only that distinguishing prefix — fewer bytes than a hash function even touches. At 100M
-    keys artpp (<b>90 ns</b>) is <i>faster than <code>std::unordered_map</code></i> (100 ns)
-    <b>while staying fully ordered</b>: it answers <code>lower_bound</code> in <b>159 ns</b> —
-    versus 1,489 for <code>absl::btree_map</code> and 2,169 for <code>std::map</code> — where
-    the hash map and libart have no ordered query at all.
-    <br><br>
-    The other C++ ARTs, kept honest: <b>unodb</b> — the canonical one
-    (<a href="https://github.com/justinasvd/art_map">art_map</a> derives from it) — <i>does</i>
-    handle these keys through its <code>key_view</code> path, but at <b>352 ns</b> it trails artpp
-    ~4× (its iterator reconstructs the key; it's tuned for register-width keys). art_map is faster
-    still on <code>int</code>/<code>double</code> keys, yet its key <i>must</i> be ≤ 16 bytes — a
-    32-byte buffer <b>doesn't compile</b>. The specialized ARTs own the small-fixed-key niche;
-    artpp owns everything else, and is the only one header-only, dependency-free, and portable:
+    Variable-length keys (names, paths, the dictionary words <a href="#benchmarks">above</a>, or
+    the 32-byte strings here) are the radix's home turf: a hash must consume the <i>whole</i> key,
+    so at 100M artpp (<b>90 ns</b>) edges even <code>std::unordered_map</code> (100 ns) <b>while
+    staying fully ordered</b> — <code>lower_bound</code> in <b>159 ns</b> vs 1,489
+    (<code>btree</code>) and 2,169 (<code>std::map</code>), where the hash map and libart answer no
+    ordered query at all. unodb — the canonical C++ ART
+    (<a href="https://github.com/justinasvd/art_map">art_map</a> derives from it) — handles these
+    via <code>key_view</code> but trails ~4× (352 ns; its iterator reconstructs the key).
   </p>
 
+  <h3 style="margin:38px 0 14px">Fixed-size inline keys — the fastest <i>ordered</i> map</h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/array_hit_100M.svg" alt="Point lookups at 100M fixed std::array 32-byte keys: std::unordered_map 55 ns, artpp 67, libart 102, absl::btree_map 1057, std::map 1422; art_map does not compile"></div>
+    <div class="fig"><img src="charts/array_lbound_100M.svg" alt="lower_bound at 100M fixed std::array 32-byte keys: artpp 165 ns, absl::btree_map 947, std::map 1078; unordered_map, libart, art_map have no ordered query"></div>
+  </div>
+  <p class="method">
+    Store the same 32 bytes as a fixed <code>std::array</code> (a hash, UUID, or POD id — inline,
+    no per-key allocation) and it's honest in the other direction: hashing a cheap inline key is
+    hard to beat, so <code>std::unordered_map</code> wins <i>pure point lookups</i> (<b>55 ns</b> vs
+    artpp 67) — but it answers nothing else. artpp is the <b>fastest ordered map</b> by a wide
+    margin: hit 67 ns vs <code>btree</code> 1,057 and <code>std::map</code> 1,422 (<b>16–21×</b>),
+    <code>lower_bound</code> 165 ns vs 947 / 1,078, and at 100M it even passes the B-tree on ordered
+    scan. art_map would be faster still on a key this size — but its key must be ≤ 16 bytes, so a
+    32-byte key <b>doesn't compile</b>.
+  </p>
+
+  <h3 style="margin:38px 0 14px">The C++ ART field, by capability</h3>
   <table>
-    <tr><th>C++ ART</th><th>keys it handles</th><th><code>lower_bound</code></th><th>build</th><th>32-byte hit @ 100M</th></tr>
+    <tr><th>C++ ART</th><th>keys it handles</th><th><code>lower_bound</code></th><th>build</th><th>32-byte string hit @ 100M</th></tr>
     <tr><td><b>artpp::map</b></td><td><b>any</b> — strings, hashes, doubles, composites (via codec)</td><td>✓</td><td>header-only, no deps, ARM&nbsp;+&nbsp;x86</td><td><b>90 ns</b></td></tr>
     <tr><td>unodb</td><td>fixed-width or <code>key_view</code></td><td>✓ (scan / seek)</td><td>needs Boost; ARM&nbsp;+&nbsp;x86</td><td>352 ns</td></tr>
     <tr><td>art_map</td><td>≤ 16-byte fixed-width only</td><td>✓</td><td>needs Boost; x86-only (<a href="https://github.com/justinasvd/art_map/pull/5">our PR</a> adds ARM)</td><td>— won't compile</td></tr>
@@ -254,13 +265,22 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   </table>
 
   <p class="method">
-    Methodology: Apple M5 (128 GB), clang -O3, idle machine, one process; each container built
-    and measured in isolation. Random insertion; point ops are the fastest of repeated passes.
-    The <code>artpp</code> rows use the flagship <code>line_pool</code> (4-byte handles, ~1.3×
-    faster inserts) up to ~50M 32-byte keys, then <code>std::allocator</code> — no 4 GB
-    terminal-region cap — to 100M; lookups are within noise between them. unodb (its
-    <code>scan</code> reconstructs the key per element, so it isn't compared on scan) and libart
-    use their own allocators. <code>absl::btree_map</code> keeps the scan crown (contiguous leaves).
+    Bottom line, stated straight: a hash map is faster for <i>pure point lookups on fixed-size
+    keys</i>, and a register-specialized ART (art_map) faster still on ≤16-byte integers — but the
+    moment keys are variable-length, or you need <code>lower_bound</code> / ordered scans / ranges,
+    artpp is the fastest option, and the only one that's header-only, dependency-free, portable, and
+    keys anything.
+    <br><br>
+    Methodology: Apple M5 (128 GB), clang -O3, idle machine, one process; each container built and
+    measured in isolation. Random insertion; point ops are the fastest of repeated passes. The two
+    regimes differ only in key storage — <code>std::map</code>/<code>btree</code>/<code>unordered_map</code>
+    hold <code>std::string</code> (heap) vs <code>std::array&lt;unsigned char,32&gt;</code> (inline,
+    unsigned ⇒ same byte order); artpp/libart/unodb key on the identical bytes either way.
+    <code>artpp</code> uses <code>line_pool</code> to ~50M 32-byte keys then <code>std::allocator</code>
+    (no 4 GB terminal cap) to 100M — lookups within noise between them. unodb's <code>scan</code>
+    reconstructs the key (not compared on scan). Source:
+    <a href="https://github.com/gofractally/libartpp/blob/main/bench/bench_buffer.cpp">bench_buffer.cpp</a>
+    + <code>bench_buffer_array.cpp</code> / <code>bench_buffer_unodb.cpp</code>.
   </p>
 </section>
 

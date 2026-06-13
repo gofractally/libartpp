@@ -125,6 +125,13 @@ if(ARTPP_BENCHMARKS)
    target_compile_options(artpp_bench_buffer PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
    set_target_properties(artpp_bench_buffer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+   # same keys as std::array<u8,32> VALUE-type (inline, no per-key std::string heap alloc):
+   # isolates the data-structure cost from std::string's allocation for the comparison maps
+   add_executable(artpp_bench_buffer_array bench/bench_buffer_array.cpp)
+   target_link_libraries(artpp_bench_buffer_array PRIVATE artpp absl::btree artpp_vendor_libart)
+   target_compile_options(artpp_bench_buffer_array PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_bench_buffer_array PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
    # memory footprint probe: bytes/key per contestant per distribution (run alone)
    add_executable(artpp_mem_probe bench/mem_probe.cpp)
    target_link_libraries(artpp_mem_probe PRIVATE artpp artpp_vendor_libart absl::btree)
