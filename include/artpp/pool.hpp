@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "artpp/tagged_ptr.hpp"
@@ -48,13 +49,26 @@ namespace artpp
             std::memset(p.b, 0xFF, 4);  // tag nibble becomes 0xF == K::null
             return p;
          }
-         // Encode a byte offset from the pool base (line-aligned, < 32 GB).
+         // Encode a byte offset from the pool's NODE base (line-aligned, < 32 GB).
          static line_ptr from_off(size_t byte_off, K k) noexcept
          {
             assert((byte_off & 0x7f) == 0 && "artpp: pool offsets are line-aligned");
             assert(byte_off >> 35 == 0 && "artpp: offset exceeds the 28-bit line index");
             line_ptr       p;
             const uint32_t raw = uint32_t(byte_off >> 3) | uint8_t(k);  // (off>>7)<<4 == off>>3
+            std::memcpy(p.b, &raw, 4);
+            return p;
+         }
+         // Encode a byte offset from the pool's TERMINAL base (16-byte units, < 4 GB).
+         // The tag disambiguates the two index spaces, so terminals get their own full
+         // 28-bit range; 16-byte alignment leaves the low nibble free for the tag, so
+         // the stored u32 IS the byte offset (no shift on deref).
+         static line_ptr from_toff(size_t byte_off, K k) noexcept
+         {
+            assert((byte_off & 0xF) == 0 && "artpp: terminal offsets are 16-byte aligned");
+            assert(byte_off >> 32 == 0 && "artpp: offset exceeds the terminal region");
+            line_ptr       p;
+            const uint32_t raw = uint32_t(byte_off) | uint8_t(k);
             std::memcpy(p.b, &raw, 4);
             return p;
          }
@@ -90,9 +104,28 @@ namespace artpp
          if (fd_ >= 0) ::close(fd_);
       }
 
+      // Terminal region: 16-byte-granular storage for leaves (tag K::value_ptr). A
+      // terminal is pure payload — suffix bytes + value — with no branch slots, so it
+      // needs only the 4 tag bits of alignment, not a full line. Splitting the store
+      // into a node region (128 B lines) and a terminal region (16 B units) cuts the
+      // terminal working set up to 8x; the handle's TAG selects the decode, so every
+      // deref site picks its region statically (descent is already tag-dispatched).
+      static constexpr size_t term_unit      = 16;
+      static constexpr size_t max_term_bytes = size_t(1) << 32;  // 4 GB — u32 offsets
+
       std::byte* base() const noexcept { return base_; }
+      std::byte* term_base() const noexcept { return tbase_; }
       size_t     committed() const noexcept { return committed_; }
+      size_t     term_committed() const noexcept { return tcommitted_; }
       size_t     used_lines() const noexcept { return frontier_; }
+      size_t     used_term_units() const noexcept { return tfrontier_; }
+      // Logical size of a file-backed pool: the terminal region lives at the fixed
+      // offset ncap_, so any terminal commit makes the file SPARSE — logical size spans
+      // the gap, but only written blocks occupy disk (APFS/ext4 et al).
+      size_t file_extent() const noexcept
+      {
+         return tcommitted_ ? ncap_ + tcommitted_ : committed_;
+      }
 
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
       // free lists — the intrusive links live inside freed lines, so they ride the byte
@@ -104,12 +137,18 @@ namespace artpp
       // copyable payloads only (a bitwise value copy must be a valid value copy).
       void adopt(const line_pool& s)
       {
-         const size_t used = s.frontier_ * line_bytes;
-         if (used > committed_) commit_(used);  // throws bad_alloc past our cap
+         const size_t used  = s.frontier_ * line_bytes;
+         const size_t tused = s.tfrontier_ * term_unit;
+         if (used > committed_) commit_(used);     // throws bad_alloc past our cap
+         if (tused > tcommitted_) tcommit_(tused);
          std::memcpy(base_, s.base_, used);
-         frontier_ = s.frontier_;
-         huge_     = s.huge_;
+         std::memcpy(term_base(), s.term_base(), tused);
+         frontier_  = s.frontier_;
+         tfrontier_ = s.tfrontier_;
+         huge_      = s.huge_;
+         thuge_     = s.thuge_;
          std::memcpy(free_, s.free_, sizeof(free_));
+         std::memcpy(tfree_, s.tfree_, sizeof(tfree_));
       }
 
       // Allocate n contiguous lines: exact-size free list first, else bump the frontier
@@ -142,7 +181,7 @@ namespace artpp
             std::memcpy(p, &free_[n], 4);
             free_[n] = idx;
          }
-         else  // rare giant node (long-key leaf): one list, {next, nlines} kept in the block
+         else  // rare giant node: one list, {next, nlines} kept in the block
          {
             const uint32_t hdr[2] = {huge_, uint32_t(n)};
             std::memcpy(p, hdr, 8);
@@ -150,13 +189,54 @@ namespace artpp
          }
       }
 
+      // Terminal-region twins of alloc_lines/free_lines, in 16-byte units.
+      void* alloc_term(size_t n)
+      {
+         if (n <= TFREE_MAX)
+         {
+            if (const uint32_t head = tfree_[n]; head != NIL)
+            {
+               std::byte* p = tbase_ + size_t(head) * term_unit;
+               std::memcpy(&tfree_[n], p, 4);
+               return p;
+            }
+         }
+         else if (void* p = pop_thuge_(n))
+            return p;
+         const size_t need = (tfrontier_ + n) * term_unit;
+         if (need > tcommitted_) tcommit_(need);
+         std::byte* p = tbase_ + tfrontier_ * term_unit;
+         tfrontier_ += n;
+         return p;
+      }
+      void free_term(void* p, size_t n) noexcept
+      {
+         const uint32_t idx = uint32_t((static_cast<std::byte*>(p) - tbase_) / term_unit);
+         if (n <= TFREE_MAX)
+         {
+            std::memcpy(p, &tfree_[n], 4);
+            tfree_[n] = idx;
+         }
+         else  // giant terminal (very long key suffix): {next, nunits} in the block
+         {
+            const uint32_t hdr[2] = {thuge_, uint32_t(n)};
+            std::memcpy(p, hdr, 8);
+            thuge_ = idx;
+         }
+      }
+
      private:
-      static constexpr uint32_t NIL      = 0xFFFFFFFFu;
-      static constexpr size_t   FREE_MAX = 1024;  // exact-size lists cover nodes up to 128 KB
+      static constexpr uint32_t NIL       = 0xFFFFFFFFu;
+      static constexpr size_t   FREE_MAX  = 1024;  // node lists cover up to 128 KB
+      static constexpr size_t   TFREE_MAX = 4096;  // terminal lists cover up to 64 KB
 
       void init_(const char* path, size_t cap)
       {
-         cap_ = std::min((cap + chunk_bytes - 1) / chunk_bytes * chunk_bytes, max_bytes);
+         ncap_ = std::min((cap + chunk_bytes - 1) / chunk_bytes * chunk_bytes, max_bytes);
+         // terminal region rides the same reservation/file, after the node region;
+         // sized at 1/8th of it (the 16/128 unit ratio), capped by its u32 offsets
+         tcap_ = std::min(std::max(ncap_ / 8, chunk_bytes), max_term_bytes);
+         cap_  = ncap_ + tcap_;
          if (path)
          {
             fd_ = ::open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -168,24 +248,36 @@ namespace artpp
             if (fd_ >= 0) ::close(fd_);
             throw std::bad_alloc();
          }
-         base_ = static_cast<std::byte*>(r);
-         std::memset(free_, 0xFF, sizeof(free_));  // every head = NIL (all-ones)
+         base_  = static_cast<std::byte*>(r);
+         tbase_ = base_ + ncap_;
+         std::memset(free_, 0xFF, sizeof(free_));   // every head = NIL (all-ones)
+         std::memset(tfree_, 0xFF, sizeof(tfree_));
       }
-      void commit_(size_t need)
+      // Commit [start, start+committed..target) of the reservation; file regions live at
+      // the same offsets in the file (ftruncate grows it monotonically).
+      void commit_region_(size_t start, size_t& committed, size_t regcap, size_t need)
       {
          const size_t target = (need + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
-         if (target > cap_) throw std::bad_alloc();
+         if (target > regcap) throw std::bad_alloc();
          if (fd_ >= 0)  // file: extend it, then map the new chunks over the reservation
          {
-            if (::ftruncate(fd_, off_t(target)) != 0) throw std::bad_alloc();
-            void* r = ::mmap(base_ + committed_, target - committed_, PROT_READ | PROT_WRITE,
-                             MAP_SHARED | MAP_FIXED, fd_, off_t(committed_));
+            const off_t fend = off_t(start + target);
+            struct stat st;
+            if (::fstat(fd_, &st) != 0) throw std::bad_alloc();
+            if (st.st_size < fend && ::ftruncate(fd_, fend) != 0) throw std::bad_alloc();
+            void* r = ::mmap(base_ + start + committed, target - committed,
+                             PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd_,
+                             off_t(start + committed));
             if (r == MAP_FAILED) throw std::bad_alloc();
          }
-         else if (::mprotect(base_ + committed_, target - committed_, PROT_READ | PROT_WRITE) != 0)
+         else if (::mprotect(base_ + start + committed, target - committed,
+                             PROT_READ | PROT_WRITE) != 0)
             throw std::bad_alloc();
-         committed_ = target;
+         committed = target;
       }
+      void commit_(size_t need) { commit_region_(0, committed_, ncap_, need); }
+      void tcommit_(size_t need) { commit_region_(ncap_, tcommitted_, tcap_, need); }
+
       void* pop_huge_(size_t n) noexcept  // exact-size scan of the rare >FREE_MAX list
       {
          uint32_t prev = NIL;
@@ -207,14 +299,42 @@ namespace artpp
          }
          return nullptr;
       }
+      void* pop_thuge_(size_t n) noexcept  // terminal twin of pop_huge_
+      {
+         uint32_t prev = NIL;
+         for (uint32_t idx = thuge_; idx != NIL;)
+         {
+            std::byte* p = tbase_ + size_t(idx) * term_unit;
+            uint32_t   hdr[2];  // {next, nunits}
+            std::memcpy(hdr, p, 8);
+            if (hdr[1] == n)
+            {
+               if (prev == NIL)
+                  thuge_ = hdr[0];
+               else
+                  std::memcpy(tbase_ + size_t(prev) * term_unit, &hdr[0], 4);
+               return p;
+            }
+            prev = idx;
+            idx  = hdr[0];
+         }
+         return nullptr;
+      }
 
-      std::byte* base_      = nullptr;
-      size_t     cap_       = 0;
-      size_t     committed_ = 0;
-      size_t     frontier_  = 0;  // bump position, in lines
-      int        fd_        = -1;
-      uint32_t   huge_      = NIL;
+      std::byte* base_       = nullptr;
+      std::byte* tbase_      = nullptr;  // = base_ + ncap_, cached (Dan: don't recompute per use)
+      size_t     cap_        = 0;  // total reservation = ncap_ + tcap_
+      size_t     ncap_       = 0;
+      size_t     tcap_       = 0;
+      size_t     committed_  = 0;
+      size_t     tcommitted_ = 0;
+      size_t     frontier_   = 0;  // node bump position, in lines
+      size_t     tfrontier_  = 0;  // terminal bump position, in 16 B units
+      int        fd_         = -1;
+      uint32_t   huge_       = NIL;
+      uint32_t   thuge_      = NIL;
       uint32_t   free_[FREE_MAX + 1];
+      uint32_t   tfree_[TFREE_MAX + 1];
    };
 
    // The tree-facing allocator. Rebinds share the pool; the tree picks the 4-byte indexed
@@ -236,6 +356,22 @@ namespace artpp
       pool_alloc(const pool_alloc<U>& o) noexcept : pool(o.pool) {}
 
       const std::byte* artpp_base() const noexcept { return pool ? pool->base() : nullptr; }
+      const std::byte* artpp_term_base() const noexcept
+      {
+         return pool ? pool->term_base() : nullptr;
+      }
+
+      // Terminal-region hooks: leaves (tag K::value_ptr) are 16-byte-granular payloads
+      // in their own region — see line_pool. Detected by the tree; allocators without
+      // them store terminals through the normal (line/block) path.
+      void* artpp_alloc_term(size_t bytes)
+      {
+         return pool->alloc_term((bytes + line_pool::term_unit - 1) / line_pool::term_unit);
+      }
+      void artpp_free_term(void* p, size_t bytes) noexcept
+      {
+         pool->free_term(p, (bytes + line_pool::term_unit - 1) / line_pool::term_unit);
+      }
 
       // Opt-in bulk transport for map's cross-pool move assignment: adopt the source
       // pool's whole image (see line_pool::adopt). By providing this member the allocator

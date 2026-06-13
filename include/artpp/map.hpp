@@ -431,6 +431,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
        : std::true_type
    {
    };
+   // Optional allocator hook: a dedicated 16-byte-granular TERMINAL region (see
+   // line_pool). Detected, never required — without it terminals share the node path.
+   template <class A, class = void>
+   struct has_term_region_ : std::false_type
+   {
+   };
+   template <class A>
+   struct has_term_region_<A, std::void_t<decltype(std::declval<A&>().artpp_alloc_term(std::size_t{}))>>
+       : std::true_type
+   {
+   };
 
    template <class A, class = void>
    struct handle_of { using type = packed_ptr; };
@@ -552,6 +563,39 @@ namespace detail  // implementation types & node helpers — not part of the pub
          node_at::deallocate(na, static_cast<node_block*>(p), nblocks_(n));
       }
 
+      // Terminal (leaf) storage: 16-byte-granular. A leaf is pure payload — suffix
+      // bytes + value, no branch slots — so it needs only the tag's 4 alignment bits,
+      // not a whole line. Allocators with a terminal region (line_pool) get it routed
+      // there; others serve 16-byte blocks from their normal path. Either way the
+      // terminal working set shrinks up to 8x vs one-line-per-leaf.
+      struct alignas(16) term_block
+      {
+         std::byte raw[16];
+      };
+      using term_alloc_t = typename std::allocator_traits<Allocator>::template rebind_alloc<term_block>;
+      using term_at      = std::allocator_traits<term_alloc_t>;
+      static constexpr size_t tunits_(size_t n) noexcept { return (n + 15) / 16; }
+      void* term_alloc_(size_t n)  // throws bad_alloc — same fault point as node_alloc_
+      {
+         if constexpr (has_term_region_<Allocator>::value)
+            return alloc_.artpp_alloc_term(n);
+         else
+         {
+            term_alloc_t ta(alloc_);
+            return term_at::allocate(ta, tunits_(n));
+         }
+      }
+      void term_free_(void* p, size_t n) noexcept
+      {
+         if constexpr (has_term_region_<Allocator>::value)
+            alloc_.artpp_free_term(p, n);
+         else
+         {
+            term_alloc_t ta(alloc_);
+            term_at::deallocate(ta, static_cast<term_block*>(p), tunits_(n));
+         }
+      }
+
       // Address-resolution chokepoint. Direct handles compile to exactly the old static code
       // (base_ is an empty member and `this` folds away under inlining — asm-gated). Indexed
       // handles resolve base_ + (28-bit line index << 7); base_ is cached from the allocator
@@ -562,6 +606,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       };
       void* deref_(packed_ptr p) const noexcept
       {
+         assert(p.tag() != K::value_ptr && "artpp: terminals deref via deref_term_");
          if constexpr (indexed)
             return const_cast<std::byte*>(base_) + ((p.raw() & ~uint64_t(0xF)) << 3);
          else
@@ -570,6 +615,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Same resolution for a raw handle value already in a register (the descend hot path).
       const char* deref_raw_(uint64_t raw) const noexcept
       {
+         assert(K(raw & 0xF) != K::value_ptr && "artpp: terminals deref via deref_term_raw_");
          if constexpr (indexed)
             return reinterpret_cast<const char*>(base_) + ((raw & ~uint64_t(0xF)) << 3);
          else
@@ -582,10 +628,38 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             return packed_ptr::from(node, k);
       }
-      // Cache the allocator's mapping base (indexed handles only; a no-op for direct).
+      // Terminal twins: tag-selected at compile time — every call site sits inside a
+      // value_ptr-dispatched arm, so the region choice costs no hot-path branch.
+      void* deref_term_(packed_ptr p) const noexcept
+      {
+         assert(p.tag() == K::value_ptr && "artpp: only leaves live in the terminal region");
+         if constexpr (indexed)
+            return const_cast<std::byte*>(tbase_) + (p.raw() & ~uint64_t(0xF));
+         else
+            return p.tptr();
+      }
+      const char* deref_term_raw_(uint64_t raw) const noexcept
+      {
+         if constexpr (indexed)
+            return reinterpret_cast<const char*>(tbase_) + (raw & ~uint64_t(0xF));
+         else
+            return reinterpret_cast<const char*>(raw & ~uint64_t(0xF));
+      }
+      packed_ptr pack_term_(const void* t, K k) const noexcept
+      {
+         if constexpr (indexed)
+            return packed_ptr::from_toff(size_t(static_cast<const std::byte*>(t) - tbase_), k);
+         else
+            return packed_ptr::from_term(t, k);
+      }
+      // Cache the allocator's mapping bases (indexed handles only; a no-op for direct).
       void rebase_() noexcept
       {
-         if constexpr (indexed) base_ = alloc_.artpp_base();
+         if constexpr (indexed)
+         {
+            base_  = alloc_.artpp_base();
+            tbase_ = alloc_.artpp_term_base();
+         }
       }
 
      public:
@@ -805,7 +879,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      if (lowfan >= 2 &&  // deep-narrow leaf collision → bucket (both
                          bkt_fits(key.size() - depth) &&  // suffixes must fit a page)
                          (cur.tag() == K::value_inline ||
-                          bkt_fits(leaf_slen(static_cast<const char*>(deref_(cur))))))
+                          bkt_fits(leaf_slen(static_cast<const char*>(deref_term_(cur))))))
                      {
                         *slot = collapse_to_bucket<Assign>(cur, key, depth, std::forward<VF>(v), inserted);
                         count_ += inserted;
@@ -973,8 +1047,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // thin Ops over ONE loop — compile-time (template) dispatch, fully inlined, no vtable.
       // Op interface: leaf(p,rem,rlen) inl(raw,at_end) bkt(b,rem,rlen) term(rh) miss().
 #define ARTPP_PTR(R)  deref_raw_(R)
+#define ARTPP_TPTR(R) deref_term_raw_(R)  /* terminal (16B-region) resolution */
 #define ARTPP_NEXT(ND) { depth = (ND); continue; }
-#define ARTPP_BODY_VALUE_PTR    return op.leaf(ARTPP_PTR(raw), kp + depth, klen - depth);
+#define ARTPP_BODY_VALUE_PTR    return op.leaf(ARTPP_TPTR(raw), kp + depth, klen - depth);
 #define ARTPP_BODY_VALUE_INLINE return op.inl(raw, depth == klen);
 #define ARTPP_BODY_BUCKET       return op.bkt(reinterpret_cast<const bucket*>(ARTPP_PTR(raw)), kp + depth, klen - depth);
 #define ARTPP_BODY_PREFIX { \
@@ -1047,6 +1122,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
 #undef ARTPP_NEXT
 #undef ARTPP_PTR
+#undef ARTPP_TPTR
 #undef ARTPP_BODY_VALUE_PTR
 #undef ARTPP_BODY_VALUE_INLINE
 #undef ARTPP_BODY_PREFIX
@@ -1159,7 +1235,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                case K::null:         return op.miss();
                case K::value_ptr:
-                  return op.leaf(slot, static_cast<char*>(deref_(cur)), key.substr(depth), parent, pbyte, pstem);
+                  return op.leaf(slot, static_cast<char*>(deref_term_(cur)), key.substr(depth), parent, pbyte, pstem);
                case K::value_inline: return op.inl(slot, depth == key.size(), parent, pbyte, pstem);
                case K::bucket:       return op.bkt(slot, cur, key.substr(depth));
                case K::prefix_node:
@@ -1237,7 +1313,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (rh->term.is_null()) return false;
                if constexpr (inlineable)
                   if (rh->term.tag() == K::value_inline) { rh->term = pack_inline(*v); return true; }
-               return assign(leaf_val(static_cast<char*>(self->deref_(rh->term))));
+               return assign(leaf_val(static_cast<char*>(self->deref_term_(rh->term))));
             }
             bool bkt(packed_ptr*, packed_ptr cur, std::string_view rem) const
             {
@@ -1444,6 +1520,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          mutable frame_stack  stk_;  // mutable: first key() primes plen/cbase
          // Shadows the tree's deref_ so every handle resolution below routes through t_.
          void* deref_(packed_ptr p) const noexcept { return t_->deref_(p); }
+         void* deref_term_(packed_ptr p) const noexcept { return t_->deref_term_(p); }
          mutable key_buf            key_;     // current key (maintained once read) / scratch
          mutable bool               maintain_ = false;  // false → ++ skips key work; flips on first key()
          const uint8_t*             sfx_    = nullptr;   // current terminal suffix; null/0 = none
@@ -1466,7 +1543,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          {
             if constexpr (inlineable)
                if (p.tag() == K::value_inline) { unpack_inline(p, val_); return; }
-            set_ptr_(leaf_val(static_cast<const char*>(deref_(p))));
+            set_ptr_(leaf_val(static_cast<const char*>(deref_term_(p))));
          }
          // Byte-routers only — u16 (2-byte) and non-routers must be handled by the caller
          // BEFORE this (with_router asserts on them; a silent default here is exactly what
@@ -1491,7 +1568,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                case K::value_ptr:
                {
-                  const char* L = static_cast<const char*>(deref_(child));
+                  const char* L = static_cast<const char*>(deref_term_(child));
                   sfx_          = leaf_suf(L);
                   sfxlen_       = leaf_slen(L);
                   if (leaf_has_full(L)) { full_str_ = leaf_str(L); full_len_ = leaf_strlen(L); }
@@ -1633,7 +1710,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const K k = cur.tag();
             if (k == K::value_ptr)
             {
-               const char*      L = static_cast<const char*>(deref_(cur));
+               const char*      L = static_cast<const char*>(deref_term_(cur));
                std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
                const int        cmp = S.compare(key.substr(depth));
                if (upper ? cmp > 0 : cmp >= 0) return descend_(cur, 0);  // qualifies → position
@@ -1756,7 +1833,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   case K::value_ptr:
                   {
-                     const char* L = static_cast<const char*>(deref_(child));
+                     const char* L = static_cast<const char*>(deref_term_(child));
                      sfx_          = leaf_suf(L);
                      sfxlen_       = leaf_slen(L);
                      if (leaf_has_full(L)) { full_str_ = leaf_str(L); full_len_ = leaf_strlen(L); }
@@ -2304,13 +2381,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
          else
          {
-            char*            L = static_cast<char*>(deref_(cur));
+            char*            L = static_cast<char*>(deref_term_(cur));
             std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
             T                ov(std::move(*leaf_val(L)));  // move out, then destruct the leaf's T
             v_destroy(alloc_, leaf_val(L));
             [[maybe_unused]] const int r0 = bkt_insert_entry(b, S, std::move(ov));
             assert(r0 == 1);
-            node_free_(L, leaf_alloc_size(L));
+            term_free_(L, leaf_alloc_size(L));
          }
          const int r1 = bkt_insert_entry<Assign>(b, key.substr(depth), std::forward<VF>(val));
          assert(r1 >= 0 && "artpp: collapse_to_bucket pre-checked sizes; overflow is impossible");
@@ -2830,7 +2907,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          path[n++ % RM_LVN]     = {&root_, 0};
          auto free_leaf         = [&](char* L) {
             v_destroy(alloc_, leaf_val(L));
-            node_free_(L, leaf_alloc_size(L));
+            term_free_(L, leaf_alloc_size(L));
          };
          for (;;)
          {
@@ -2841,7 +2918,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return false;
                case K::value_ptr:
                {
-                  char* L = static_cast<char*>(deref_(cur));
+                  char* L = static_cast<char*>(deref_term_(cur));
                   if (std::string_view(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L)) !=
                       key.substr(depth))
                      return false;
@@ -2956,7 +3033,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (rh->term.is_null())
                return false;
             if (rh->term.tag() == K::value_ptr)  // leaf("",v); an inline term has nothing to free
-               free_leaf(static_cast<char*>(deref_(rh->term)));
+               free_leaf(static_cast<char*>(deref_term_(rh->term)));
             rh->term         = packed_ptr::null();
             rh->hdr.has_term = 0;
             --count_;
@@ -3031,14 +3108,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (ia) unpack_inline(a, x);
             else
             {
-               const char* L = static_cast<const char*>(deref_(a));
+               const char* L = static_cast<const char*>(deref_term_(a));
                if (leaf_slen(L)) return 0;  // a non-empty suffix is not a terminal-at-end
                copy_value(x, leaf_val(L));
             }
             if (ib) unpack_inline(b, y);
             else
             {
-               const char* L = static_cast<const char*>(tb.deref_(b));
+               const char* L = static_cast<const char*>(tb.deref_term_(b));
                if (leaf_slen(L)) return 0;
                copy_value(y, leaf_val(L));
             }
@@ -3047,8 +3124,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
          {
             (void)ia; (void)ib;  // !inlineable: both are leaves by construction
-            const char* A = static_cast<const char*>(deref_(a));
-            const char* B = static_cast<const char*>(tb.deref_(b));
+            const char* A = static_cast<const char*>(deref_term_(a));
+            const char* B = static_cast<const char*>(tb.deref_term_(b));
             if (leaf_slen(A) != leaf_slen(B) ||
                 (leaf_slen(A) && std::memcmp(leaf_suf(A), leaf_suf(B), leaf_slen(A)) != 0))
                return 0;
@@ -3078,8 +3155,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return eq_value_(a, tb, b);
             case K::value_ptr:
             {
-               const char* A = static_cast<const char*>(deref_(a));
-               const char* B = static_cast<const char*>(tb.deref_(b));
+               const char* A = static_cast<const char*>(deref_term_(a));
+               const char* B = static_cast<const char*>(tb.deref_term_(b));
                if (leaf_slen(A) != leaf_slen(B) ||
                    (leaf_slen(A) && std::memcmp(leaf_suf(A), leaf_suf(B), leaf_slen(A)) != 0))
                   return 0;  // suffixes are the semantic content; full-key form is derived
@@ -3292,7 +3369,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                f(key, static_cast<const T&>(tmp));
                return;
             }
-         f(key, static_cast<const T&>(*leaf_val(static_cast<char*>(deref_(p)))));
+         f(key, static_cast<const T&>(*leaf_val(static_cast<char*>(deref_term_(p)))));
       }
 
       // Value of a terminal pointer (value_ptr leaf or value_inline), into tmp if inline.
@@ -3300,7 +3377,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          if constexpr (inlineable)
             if (p.tag() == K::value_inline) { unpack_inline(p, tmp); return &tmp; }
-         return leaf_val(static_cast<char*>(deref_(p)));
+         return leaf_val(static_cast<char*>(deref_term_(p)));
       }
       // Value-only DFS (no key assembly) backing for_each_value.
       template <class F>
@@ -3310,7 +3387,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          switch (k)
          {
             case K::value_ptr:
-               f(static_cast<const T&>(*leaf_val(static_cast<char*>(deref_(cur)))));
+               f(static_cast<const T&>(*leaf_val(static_cast<char*>(deref_term_(cur)))));
                return;
             case K::value_inline:
                if constexpr (inlineable) { T tmp; unpack_inline(cur, tmp); f(static_cast<const T&>(tmp)); }
@@ -3371,7 +3448,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          {
             case K::value_ptr:
             {
-               char* L = static_cast<char*>(deref_(cur));
+               char* L = static_cast<char*>(deref_term_(cur));
                if (leaf_has_full(L))  // whole key contiguous in the leaf → zero-copy, no append
                {
                   f(leaf_fullview(L), static_cast<const T&>(*leaf_val(L)));
@@ -3468,7 +3545,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                return (t.is_null() || t.tag() == K::value_inline)
                           ? nullptr
-                          : leaf_val(static_cast<char*>(self->deref_(t)));
+                          : leaf_val(static_cast<char*>(self->deref_term_(t)));
             }
             T* leaf(const char* p, const char* rem, size_t rl) const
             {
@@ -3577,7 +3654,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (v.tag() == K::value_inline)
             unpack_inline(v, out);
          else
-            copy_value(out, leaf_val(static_cast<const char*>(deref_(v))));
+            copy_value(out, leaf_val(static_cast<const char*>(deref_term_(v))));
       }
       bool read_term(const router_hdr* rh, T& out) const
       {
@@ -3595,21 +3672,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <class VF>
       packed_ptr make_leaf(std::string_view suf, VF&& val)  // suffix-only (compressed) leaf
       {
-         char* p = static_cast<char*>(node_alloc_(leaf_size(suf.size())));
+         char* p = static_cast<char*>(term_alloc_(leaf_size(suf.size())));
          leaf_set_hdr(p, uint16_t(suf.size()), 0);
          std::memcpy(leaf_str(p), suf.data(), suf.size());
          vf_construct(std::forward<VF>(val), leaf_val(p));
-         return pack_(p, K::value_ptr);
+         return pack_term_(p, K::value_ptr);
       }
       template <class VF>
       packed_ptr make_leaf_full(std::string_view pfx, std::string_view suf, VF&& val)  // whole key
       {
-         char* p = static_cast<char*>(node_alloc_(leaf_size(pfx.size() + suf.size())));
+         char* p = static_cast<char*>(term_alloc_(leaf_size(pfx.size() + suf.size())));
          leaf_set_hdr(p, uint16_t(suf.size()), uint16_t(LEAF_FULL | pfx.size()));
          std::memcpy(leaf_str(p), pfx.data(), pfx.size());
          std::memcpy(leaf_str(p) + pfx.size(), suf.data(), suf.size());
          vf_construct(std::forward<VF>(val), leaf_val(p));
-         return pack_(p, K::value_ptr);
+         return pack_term_(p, K::value_ptr);
       }
       // A terminal value with key suffix `suf`: inline in the pointer when the suffix
       // is empty and T fits (no allocation), else a suffix-only leaf.
@@ -3634,7 +3711,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return pack_inline(vf_make(std::forward<VF>(val)));
          const std::string_view pfx = key.substr(0, depth);
          if (depth < 0x8000 &&
-             nblocks_(leaf_size(pfx.size() + suf.size())) == nblocks_(leaf_size(suf.size())))
+             tunits_(leaf_size(pfx.size() + suf.size())) == tunits_(leaf_size(suf.size())))
             return make_leaf_full(pfx, suf, std::forward<VF>(val));
          return make_leaf(suf, std::forward<VF>(val));
       }
@@ -4200,7 +4277,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (rh->term.tag() == K::value_inline)
                   rh->term = pack_inline(vf_make(std::forward<VF>(val)));
                else
-                  vf_assign(std::forward<VF>(val), leaf_val(static_cast<char*>(deref_(rh->term))));
+                  vf_assign(std::forward<VF>(val), leaf_val(static_cast<char*>(deref_term_(rh->term))));
             }
             return false;
          }
@@ -4232,7 +4309,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
             return pack_(r, K::setlist_u8);  // c == 0, no prefix node needed
          }
-         char*            L = static_cast<char*>(deref_(cur));
+         char*            L = static_cast<char*>(deref_term_(cur));
          std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
          std::string_view R = key.substr(depth);
          if (S == R)  // exact key
@@ -4265,7 +4342,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             setlist_set(r, uint8_t(S[c]), make_value(S.substr(c + 1), std::move(*leaf_val(L))));
          v_destroy(alloc_, leaf_val(L));  // old value moved out → destroy moved-from + free
-         node_free_(L, Lsize);
+         term_free_(L, Lsize);
          g.release();  // committed: the caller adopts `partial`
          inserted = true;
          return partial;
@@ -4416,16 +4493,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return s;  // the handle IS the value (handle widths match: same tree type)
             case K::value_ptr:
             {
-               char*        L  = static_cast<char*>(src.deref_(s));
+               char*        L  = static_cast<char*>(src.deref_term_(s));
                const size_t sz = leaf_alloc_size(L);
-               char*        D  = static_cast<char*>(node_alloc_(sz));
+               char*        D  = static_cast<char*>(term_alloc_(sz));
                std::memcpy(D, L, sz);  // header + suffix/full-key bytes (+ value if trivial)
                if constexpr (!std::is_trivially_copyable_v<T>)
                {
                   try { v_construct(alloc_, leaf_val(D), std::move(*leaf_val(L))); }
-                  catch (...) { node_free_(D, sz); throw; }
+                  catch (...) { term_free_(D, sz); throw; }
                }
-               return pack_(D, K::value_ptr);
+               return pack_term_(D, K::value_ptr);
             }
             case K::prefix_node:
             {
@@ -4505,9 +4582,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
          {
             case K::value_ptr:
             {
-               char* L = static_cast<char*>(deref_(cur));
+               char* L = static_cast<char*>(deref_term_(cur));
                if constexpr (!std::is_trivially_destructible_v<T>) v_destroy(alloc_, leaf_val(L));
-               node_free_(L, leaf_alloc_size(L));
+               term_free_(L, leaf_alloc_size(L));
                return;
             }
             case K::value_inline:
@@ -4588,6 +4665,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
 
       [[no_unique_address]] Allocator alloc_{};  // element (T) allocator; rebound per-node for bytes
       [[no_unique_address]] std::conditional_t<indexed, const std::byte*, no_base_t> base_{};
+      [[no_unique_address]] std::conditional_t<indexed, const std::byte*, no_base_t> tbase_{};
       packed_ptr                      root_  = packed_ptr::null();
       size_t                          count_ = 0;
    };

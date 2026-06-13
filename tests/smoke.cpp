@@ -762,10 +762,17 @@ static void test_remove_shrink()
       }
       for (size_t i = 0; i < keys.size(); ++i) t.insert(keys[i], i);
       const size_t lines1 = pool.used_lines();
+      const size_t terms1 = pool.used_term_units();
       for (auto& k : keys) CHECK(t.erase(k) == 1);
       CHECK(t.empty());
+      // erase-time best-effort collapses may allocate a transient node before any
+      // same-size free exists (a one-time, bounded frontier nudge); the REBUILD and
+      // the terminal region must recycle exactly.
+      const size_t lines_e = pool.used_lines();
+      CHECK(lines_e <= lines1 + 2);
       for (size_t i = 0; i < keys.size(); ++i) t.insert(keys[i], i);
-      CHECK(pool.used_lines() == lines1);  // every node recycled through the free lists
+      CHECK(pool.used_lines() == lines_e);          // every node recycled
+      CHECK(pool.used_term_units() == terms1);      // every terminal recycled, exactly
       for (size_t i = 0; i < keys.size(); ++i) CHECK(has(t, keys[i], uint64_t(i)));
    }
 }
@@ -865,8 +872,10 @@ static void test_line_pool()
          map<std::string_view, uint64_t, mode::none, PA> t{PA(&pool)};
          handle_xcheck_body(t, 777);
          struct stat st{};
-         CHECK(::stat(path, &st) == 0 && size_t(st.st_size) == pool.committed());
-         CHECK(pool.committed() > 0);
+         // two regions, fixed file offsets: terminals commit past the node cap, so the
+         // file is sparse and its logical size is the pool's file_extent()
+         CHECK(::stat(path, &st) == 0 && size_t(st.st_size) == pool.file_extent());
+         CHECK(pool.committed() > 0 && pool.term_committed() > 0);
       }
       ::unlink(path);
    }

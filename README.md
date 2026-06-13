@@ -3,14 +3,16 @@
 # libart++ — `artpp::map`, a header-only adaptive radix tree map for C++23
 
 **[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
-with the flagship `line_pool` allocator (anonymous mapping, 4-byte u32-index
-handles): point lookups 2–2.5× faster than `absl::btree_map`, 2.5–4.5× faster
-than `std::map`, and faster than upstream libart on **all four workloads** with
-the right mode — dictionary −28%, clustered strings −25%, uniform integers
-−16%, sequential integers −12%. The invariant behind the numbers: **at most one
-cold cacheline per level of descent** (headerless tagged-pointer dispatch;
-prefixes fused into the node's own header line; small values inline in the
-handle; bucket pages where terminals dominate).
+with the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
+two regions): point lookups 1.8–3.1× faster than `absl::btree_map`, 2.2–5.1×
+faster than `std::map`, and faster than upstream libart on **all four
+workloads** — sequential integers −42%, uniform integers −22%, clustered
+strings −17%, dictionary par (−22% in bucket mode). The invariant behind the
+numbers: **at most one cold cacheline per level of descent** — headerless
+tagged-pointer dispatch, prefixes fused into the node's own header line, small
+values inline in the handle, and leaves in a dedicated **16-byte-aligned
+terminal region** (a terminal is pure payload; the tag needs only 4 alignment
+bits, so it doesn't pay for a line).
 
 `artpp::map<Key, T>` is an ordered associative container backed by an adaptive
 radix tree (ART) with *headerless dispatch*: the node kind rides in the tagged

@@ -90,7 +90,7 @@ namespace artpp::detail
       static packed_ptr_t from(const void* addr, K k) noexcept
       {
          const uint64_t a = reinterpret_cast<uint64_t>(addr);
-         // Two invariants every tagged allocation guarantees — asserted in debug builds:
+         // Two invariants every tagged NODE allocation guarantees — asserted in debug:
          //   * the allocation is 128-byte aligned (low 7 bits free for the tag), and
          //   * the address fits in the N-byte field (no >8N-bit VA: e.g. for N=6, >48-bit VA from
          //     5-level paging / ARM LVA is opt-in via mmap hints, never returned by default malloc).
@@ -99,6 +99,21 @@ namespace artpp::detail
             assert((a >> (8u * N)) == 0 && "artpp: address exceeds the packed_ptr width");
          packed_ptr_t p;
          uint64_t     raw = (a & ~uint64_t(0x7f)) | uint8_t(k);
+         std::memcpy(p.b, &raw, N);
+         return p;
+      }
+      // TERMINAL handle: the tag needs only the low nibble, so a terminal allocation
+      // (a leaf — pure payload, no branch slots) is 16-byte aligned, 8x denser than a
+      // line. The tag itself says which decode applies, and every deref site is already
+      // tag-dispatched, so the choice is static — no hot-path select.
+      static packed_ptr_t from_term(const void* addr, K k) noexcept
+      {
+         const uint64_t a = reinterpret_cast<uint64_t>(addr);
+         assert((a & 0xF) == 0 && "artpp: terminal allocation must be 16-byte aligned");
+         if constexpr (N < 8)
+            assert((a >> (8u * N)) == 0 && "artpp: address exceeds the packed_ptr width");
+         packed_ptr_t p;
+         uint64_t     raw = a | uint8_t(k);
          std::memcpy(p.b, &raw, N);
          return p;
       }
@@ -111,6 +126,7 @@ namespace artpp::detail
       }
       K     tag() const noexcept { return K(b[0] & 0xF); }
       void* ptr() const noexcept { return reinterpret_cast<void*>(raw() & ~uint64_t(0x7f)); }
+      void* tptr() const noexcept { return reinterpret_cast<void*>(raw() & ~uint64_t(0xF)); }
       bool  is_null() const noexcept { return tag() == K::null; }
    };
 

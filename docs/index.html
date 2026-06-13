@@ -87,10 +87,11 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
       compression at <b>zero extra lines</b>.</p>
     </div>
     <div class="card">
-      <h3><span class="dot"></span>Values can cost zero lines</h3>
-      <p>Small trivially-copyable values (≤5 bytes) pack <b>inline in the handle bits</b> —
-      no allocation, no line. Bigger values sit one line away in compact leaves allocated
-      through <i>your</i> allocator, which bump-places them next to their parents.</p>
+      <h3><span class="dot"></span>Terminals are 16-byte dense</h3>
+      <p>Values ≤5 bytes pack <b>inline in the handle bits</b> — zero lines. Larger ones
+      live in a dedicated <b>16-byte-aligned terminal region</b>: a leaf is pure payload,
+      so it doesn't get a 128-byte line, it gets exactly what it needs — an 8× smaller
+      terminal working set than one-line-per-leaf.</p>
     </div>
     <div class="card">
       <h3><span class="dot"></span>Levels collapse adaptively</h3>
@@ -112,9 +113,9 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart with the right mode: −28% dict, −25% clustered, −16% uniform, −12% sequential</div></div>
-    <div class="stat"><div class="n">2–2.5×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.5–4.5×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart: −42% sequential, −22% uniform, −17% clustered, −22% dict (bucket mode; plain radix is par)</div></div>
+    <div class="stat"><div class="n">1.8–3.1×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.2–5.1×</div><div class="l">faster point lookups than std::map</div></div>
     <div class="stat"><div class="n">≤ 1</div><div class="l">cold cacheline per level of descent — the invariant the numbers fall out of</div></div>
   </div>
 
@@ -122,20 +123,22 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <div class="figs">
     <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 88ns, artpp 112ns, libart 130ns, absl::btree_map 190ns, std::map 230ns"></div>
     <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
-    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp buckets 38.2ns beats libart 45.4ns"></div>
-    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 38.8ns beats libart 44.3ns"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 34.8ns beats libart 44.7ns"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 25.9ns beats libart 44.3ns"></div>
   </div>
   <p class="method">
-    Two case studies in counting cachelines. <b>Sequential integers</b> were libart's
-    home game until the in-header prefix landed: a compressed run now lives in the
-    node's <i>own</i> header cacheline (the pointer tag hints when it must be read;
-    prefix-free nodes never touch it), deleting the one extra hop — 38.8 vs 44.3 ns.
-    <b>Uniform random integers</b> were at parity for a different reason: the routers
-    were already perfect (headerless, one line each), but a million single-value leaves
-    on their own 128-byte lines made a 122 MB terminal working set vs libart's ~40 MB —
-    the routers' win, refunded at the last load. Bucket mode packs those terminals
-    ~30 to a page (a few MB total): 38.2 vs 45.4 ns, and the ordered scan drops from
-    18.3 to 3.1 ns/element. Same invariant both times: spend lines where the entropy is.
+    Two case studies in counting cachelines, both ending the same way. <b>Sequential
+    integers</b> were libart's home game until the in-header prefix deleted our one
+    extra hop; the <b>two-region allocator</b> then finished the job — 25.9 vs 44.3 ns
+    (−42%). <b>Uniform random integers</b> were at parity because the routers were
+    already perfect (headerless, one line each) while a million single-value leaves
+    each occupied a full 128-byte line: a 122 MB terminal working set vs libart's
+    ~40 MB — the routers' win, refunded at the last load. The fix is the allocator's
+    second region: a terminal is pure payload and the tag needs only 4 alignment bits,
+    so leaves live <b>16-byte-aligned in their own region</b> (the tag selects the
+    decode — statically, since descent is already tag-dispatched). Terminal working
+    set: ~16 MB, SLC-resident — 34.8 vs 44.7 ns (−22%). Same invariant throughout:
+    spend lines where the entropy is.
   </p>
 
   <h3 style="margin:38px 0 14px">Inserts</h3>
@@ -181,9 +184,13 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td>won on <b>all four workloads</b> with the right mode: <b>−28%</b> dictionary,
-        <b>−25%</b> clustered, <b>−16%</b> uniform, <b>−12%</b> sequential (pool
-        allocator; bucket mode where terminals dominate)</td></tr>
+        <td>won on <b>all four workloads</b>, plain radix: <b>−42%</b> sequential,
+        <b>−22%</b> uniform, <b>−17%</b> clustered integers/strings, par-to-<b>−22%</b>
+        dictionary (bucket mode)</td></tr>
+    <tr><td>Leaf storage</td><td>~32 B mallocs, header read per probe</td>
+        <td>a dedicated <b>16-byte-aligned terminal region</b> — the tag carries the
+        4 bits a terminal pointer needs, so leaves pay no line-alignment tax and the
+        terminal working set stays cache-resident</td></tr>
     <tr><td>Path compression</td><td>per-node prefix read with the header on
         <i>every</i> hop</td>
         <td>prefix fused into the header line, read <b>only when the pointer tag says
