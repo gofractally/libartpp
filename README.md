@@ -4,10 +4,10 @@
 
 **[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
 with the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
-two regions): point lookups 1.8–2.6× faster than `absl::btree_map`, 2.2–6.7×
-faster than `std::map`, and faster than upstream libart on **all four
-workloads** (plain radix) — sequential integers −50%, clustered strings −24%,
-uniform integers −18%, dictionary −14%. The invariant behind the numbers: **at
+two regions): point lookups **1.2–2.0× faster than upstream libart on all four
+workloads** (plain radix — 2.0× sequential, 1.37× uniform, 1.32× clustered,
+1.18× dictionary), 1.9–4.3× faster than `absl::btree_map`, and 2.1–7.6× faster
+than `std::map`. The invariant behind the numbers: **at
 most one cold cacheline per level of descent** — headerless tagged-pointer
 dispatch; prefixes fused into the node's own header line; small values inline
 in the handle; a small leaf living **inside the routing node's cacheline** (the
@@ -134,7 +134,7 @@ class map;
 | Flag | Effect |
 |---|---|
 | `mode::none` | Pure radix: leaves, prefix nodes, and routers that widen `setlist → node_full`. The fastest default for point lookups. |
-| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary it beats pure radix on point queries (~−24%), inserts (~−5%), *and* ordered scans (~−13% — contiguous pages out-scan pointer-chased leaves). Buckets cost nothing when off: the engine dead-strips from other modes. |
+| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary it runs point lookups ~1.16× faster than the default radix (77 vs 89 ns) and ordered scans ~2.9× faster (2.6 vs 7.4 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
 | `mode::adaptive` | Pure radix that watches its own descent: when leaf splits keep landing under deep, narrow paths, those split points collapse to buckets. A middle ground that keeps uniform data bucket-free. |
 | `mode::dense_tiers` | Enables the segmented-bitset `c2/c4/c8` routers between `setlist` and `node_full`: roughly half the bytes on moderate-fanout nodes in exchange for costlier inserts on those tiers. |
 | `mode::wide_stems` | Sparse routers consume **two** key bytes per hop (`setlist_u16`), halving router-hop depth on deep sparse trees; nodes re-stride back to one-byte routers when they densify. |
@@ -378,23 +378,24 @@ layers built on this design downstream, out of scope for artpp itself.
 
 ## Performance
 
-Measured on Apple M5, clang -O3, 5M keys, against
-[libart](https://github.com/armon/libart) (the per-process regression gate in
-`bench/perf_gate.cpp`; ratios < 1 mean artpp is faster):
+Measured on Apple M5, clang -O3, 1M keys, flagship `line_pool` allocator,
+point-lookup latency (fastest of five reps). How many times **faster** than
+each baseline (higher is better):
 
-| workload | artpp / libart |
-|---|---|
-| uniform `u64` insert | ~0.93–0.98 |
-| uniform `u64` query | ~0.92–0.96 |
-| clustered string insert | ~1.00–1.04 |
-| clustered string query | ~0.92–0.96 |
+| workload | vs libart | vs `absl::btree_map` | vs `std::map` |
+|---|---|---|---|
+| dictionary words | **1.18×** | 1.93× | 2.14× |
+| clustered strings | **1.32×** | 2.36× | 3.72× |
+| uniform `u64` | **1.37×** | 2.89× | 5.47× |
+| sequential `u64` | **2.02×** | 4.32× | 7.63× |
 
-The headerless tagged-pointer dispatch is the structural reason reads win:
-libart loads a node header on every hop before it can route; artpp routes from
-the pointer itself. With the `line_pool` allocator (4-byte indexed handles),
-inserts additionally beat the `std::allocator` configuration (bump placement
-lays children near parents) at a small, neutral-to-positive query cost — see
-`artpp/pool.hpp` for the measured A/B and `bench/` for the harnesses.
+Bucket mode is faster still on the dictionary (1.16× over the default radix)
+and its scans rival `absl::btree_map`. The headerless tagged-pointer dispatch
+is the structural reason reads win: libart loads a node header on every hop
+before it can route; artpp routes from the pointer itself, and a small leaf
+often rides in the routing node's own cacheline. Reproduce with
+`-DARTPP_BENCHMARKS=ON` (`bench/`); the per-process regression gate lives in
+`bench/perf_gate.cpp`.
 
 `for_each` scans are ~3× iterator scans when cache-resident; value-only
 iteration (`for_each_value` or an un-keyed iterator walk) is cheaper still.

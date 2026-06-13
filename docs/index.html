@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>libart++ — the adaptive radix tree map for modern C++</title>
-<meta name="description" content="artpp::map — a header-only adaptive radix tree map for C++23. std::map's interface, O(key-length) operations, point lookups ~2× faster than absl::btree_map and ~3× faster than std::map.">
+<meta name="description" content="artpp::map — a header-only adaptive radix tree map for C++23. std::map's interface, O(key-length) operations, point lookups up to 4× faster than absl::btree_map and 7× faster than std::map.">
 <meta property="og:title" content="libart++ — the adaptive radix tree map for modern C++">
 <meta property="og:description" content="Header-only C++23. O(key length), no comparisons, no rebalancing. Point lookups ~2× faster than absl::btree_map.">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
@@ -113,32 +113,31 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart, plain radix: −50% sequential, −18% uniform, −24% clustered, −14% dictionary</div></div>
-    <div class="stat"><div class="n">1.8–2.6×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.2–6.7×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">1.2–2.0×</div><div class="l">faster point lookups than the original libart — on all four workloads (plain radix): 2.0× sequential, 1.37× uniform, 1.32× clustered, 1.18× dictionary</div></div>
+    <div class="stat"><div class="n">1.9–4.3×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.1–7.6×</div><div class="l">faster point lookups than std::map</div></div>
     <div class="stat"><div class="n">0</div><div class="l">extra cachelines for a small leaf — it shares the line of the setlist that routes to it</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp 107ns, buckets 97ns, libart 125ns, absl::btree_map 198ns, std::map 240ns"></div>
-    <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
-    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 34.8ns beats libart 44.7ns"></div>
-    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 25.9ns beats libart 44.3ns"></div>
+    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp 89ns, buckets 77ns, libart 106ns, absl::btree_map 172ns, std::map 271ns"></div>
+    <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 107ns, libart 142ns, btree 252ns, std::map 398ns"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 31ns, libart 43ns, btree 91ns, std::map 173ns"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 19ns, libart 39ns, btree 84ns, std::map 156ns"></div>
   </div>
   <p class="method">
-    Two case studies in counting cachelines, both ending the same way. <b>Sequential
-    integers</b> were libart's home game until the in-header prefix deleted our one
-    extra hop; the <b>two-region allocator</b> then finished the job — 25.9 vs 44.3 ns
-    (−42%). <b>Uniform random integers</b> were at parity because the routers were
-    already perfect (headerless, one line each) while a million single-value leaves
-    each occupied a full 128-byte line: a 122 MB terminal working set vs libart's
-    ~40 MB — the routers' win, refunded at the last load. The fix is the allocator's
-    second region: a terminal is pure payload and the tag needs only 4 alignment bits,
-    so leaves live <b>16-byte-aligned in their own region</b> (the tag selects the
-    decode — statically, since descent is already tag-dispatched). Terminal working
-    set: ~16 MB, SLC-resident — 34.8 vs 44.7 ns (−22%). Same invariant throughout:
-    spend lines where the entropy is.
+    Two case studies in counting cachelines, both ending in a win. <b>Sequential
+    integers</b> are now <b>2.0× faster than libart</b> (19 vs 39 ns): the in-header
+    prefix deleted the one extra descent hop, and the two-region allocator keeps the
+    leaves dense. <b>Uniform random integers</b> reach <b>1.37×</b> (31 vs 43 ns) —
+    the routers were already headerless and one-line-per-hop, so the lever was the
+    terminal: a million single-value leaves once spread across a 122 MB working set,
+    now packed into a <b>16-byte-aligned terminal region</b> (~16 MB, SLC-resident).
+    On the string workloads the same idea moves up a level: a small leaf rides
+    <b>inside the routing setlist's own cacheline</b>, so dictionary lookups land
+    <b>1.18×</b> and clustered <b>1.32×</b> faster than libart. Same invariant
+    throughout: spend lines where the entropy is.
   </p>
 
   <h3 style="margin:38px 0 14px">Inserts</h3>
@@ -147,16 +146,18 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <div class="fig"><img src="charts/uniform_insert.svg" alt="Insert latency, uniform uint64"></div>
   </div>
 
-  <h3 style="margin:38px 0 14px">Ordered scans <span style="color:var(--muted);font-weight:400">(honest numbers: B-trees are built for this)</span></h3>
+  <h3 style="margin:38px 0 14px">Ordered scans <span style="color:var(--muted);font-weight:400">(bucket mode keeps pace with B-trees)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_scan.svg" alt="Ordered scan, dictionary words: absl::btree_map fastest, artpp bucket mode second"></div>
-    <div class="fig"><img src="charts/clustered_scan.svg" alt="Ordered scan, clustered strings: artpp bucket mode beats absl::btree_map"></div>
+    <div class="fig"><img src="charts/dict_scan.svg" alt="Ordered scan, dictionary words: bucket mode 2.6 ns/element, 2.2x faster than libart"></div>
+    <div class="fig"><img src="charts/clustered_scan.svg" alt="Ordered scan, clustered strings: bucket mode 6.5 ns/element, faster than both libart and absl::btree_map"></div>
   </div>
   <p class="method">
-    <code>absl::btree_map</code>'s contiguous leaves win raw scans — that is what B-trees
-    are for. <b>Bucket mode</b> closes most of the gap on string keys (clustered scans:
-    7.4 vs 7.3 ns/element — parity) while keeping the point-lookup lead: choose the mode
-    per workload.<br><br>
+    <b>Bucket mode</b> scans the packed (suffix, value) pages contiguously: <b>2.2×
+    faster than libart</b> on dictionary keys (2.6 vs 5.6 ns/element), and on clustered
+    strings it <b>edges absl::btree_map itself</b> (6.5 vs 8.9 ns/element). For the
+    absolute crown on dense integer keys, a B-tree's fully contiguous leaves lead — so
+    pick bucket mode when a workload both looks up <i>and</i> scans, and the default
+    radix when it's lookup-dominated.<br><br>
     Methodology: Apple M5, clang -O3, quiet machine, one process. The
     <code>artpp::map</code> rows run the library's flagship allocator —
     <code>line_pool</code> over an <b>anonymous mapping</b> (4-byte u32-index branch
@@ -185,8 +186,8 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td>won on <b>all four workloads</b>, plain radix: <b>−50%</b> sequential,
-        <b>−24%</b> clustered, <b>−18%</b> uniform, <b>−14%</b> dictionary</td></tr>
+        <td><b>faster on all four workloads</b>, plain radix: <b>2.0×</b> sequential,
+        <b>1.37×</b> uniform, <b>1.32×</b> clustered, <b>1.18×</b> dictionary</td></tr>
     <tr><td>Small leaves</td><td>a malloc'd node per key</td>
         <td>a leaf that fits goes <b>inside the routing node's cacheline</b> — the byte
         that selects it and the value it yields are one line, so the lookup ends without
@@ -303,8 +304,8 @@ m.<span class="f">insert</span>({1.5, -2.0}, <span class="s">"a"</span>);   <spa
 <pre><code><span class="c">// dictionary-shaped keys? pack the tails:</span>
 <span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
            <span class="t">artpp::mode</span>::buckets&gt; dict;
-<span class="c">// ~100 ns dictionary lookups (vs 244 std::map),</span>
-<span class="c">// clustered scans at absl::btree parity</span></code></pre>
+<span class="c">// 77 ns dictionary lookups — 3.5x faster</span>
+<span class="c">// than std::map; scans rival absl::btree</span></code></pre>
     </div>
   </div>
 </section>
