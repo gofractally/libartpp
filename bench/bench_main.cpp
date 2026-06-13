@@ -97,7 +97,7 @@ int main(int argc, char** argv)
       for (std::size_t i = 0; i < N; ++i) keys.push_back(rng() | 1);  // odd
       for (std::size_t i = 0; i < N; ++i) miss.push_back(rng() & ~1ull);  // even: disjoint
       std::printf("uniform: %zu keys\n", keys.size());
-      run_u64<artpp_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
+      run_u64<artpp_u64, artpp_buckets_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
           "uniform", keys, miss, scan_reps);
    }
 
@@ -109,7 +109,7 @@ int main(int argc, char** argv)
       for (std::size_t i = 0; i < N; ++i) keys.push_back(i * 2);      // even
       for (std::size_t i = 0; i < N; ++i) miss.push_back(i * 2 + 1);  // odd: disjoint
       std::printf("sequential: %zu keys\n", keys.size());
-      run_u64<artpp_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
+      run_u64<artpp_u64, artpp_buckets_u64, artpp_malloc_u64, libart_u64, absl_btree_u64, std_map_u64>(
           "sequential", keys, miss, scan_reps);
    }
 

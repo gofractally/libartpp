@@ -1,20 +1,23 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 290" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="Insert — sequential uint64">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 334" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="Insert — sequential uint64">
 <defs><linearGradient id="hot" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#34d399"/></linearGradient><linearGradient id="hot2" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#a3e635"/></linearGradient></defs>
 <text x="14" y="28" font-size="17" font-weight="600" fill="#e6edf6">Insert — sequential uint64</text>
 <text x="14" y="46" font-size="12" fill="#8da3bf">ns / operation — lower is better</text>
 <text x="180" y="73.0" font-size="13" font-weight="600" fill="#e6edf6" text-anchor="end">artpp::map</text>
-<rect x="190" y="54" width="105.2" height="30" rx="6" fill="url(#hot)"/>
-<text x="303.24714047037656" y="73.0" font-size="13" fill="#e6edf6">16.9</text>
-<text x="180" y="117.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">artpp::map (std::allocator)</text>
-<rect x="190" y="98" width="128.7" height="30" rx="6" fill="#3f8f86"/>
-<text x="326.6975967099345" y="117.0" font-size="13" fill="#e6edf6">20.7</text>
-<text x="180" y="161.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">libart</text>
-<rect x="190" y="142" width="116.2" height="30" rx="6" fill="#5e97d0"/>
-<text x="314.19483356895" y="161.0" font-size="13" fill="#e6edf6">18.7</text>
-<text x="180" y="205.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">absl::btree_map</text>
-<rect x="190" y="186" width="172.8" height="30" rx="6" fill="#7587a3"/>
-<text x="370.7993831127104" y="205.0" font-size="13" fill="#e6edf6">27.8</text>
-<text x="180" y="249.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">std::map</text>
-<rect x="190" y="230" width="484.0" height="30" rx="6" fill="#4a5a73"/>
-<text x="682.0" y="249.0" font-size="13" fill="#e6edf6">77.8</text>
+<rect x="190" y="54" width="102.8" height="30" rx="6" fill="url(#hot)"/>
+<text x="300.8407350689127" y="73.0" font-size="13" fill="#e6edf6">16.6</text>
+<text x="180" y="117.0" font-size="13" font-weight="600" fill="#e6edf6" text-anchor="end">artpp::map&lt;buckets&gt;</text>
+<rect x="190" y="98" width="252.2" height="30" rx="6" fill="url(#hot2)"/>
+<text x="450.1914241960184" y="117.0" font-size="13" fill="#e6edf6">40.8</text>
+<text x="180" y="161.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">artpp::map (std::allocator)</text>
+<rect x="190" y="142" width="125.3" height="30" rx="6" fill="#3f8f86"/>
+<text x="323.3236345074017" y="161.0" font-size="13" fill="#e6edf6">20.3</text>
+<text x="180" y="205.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">libart</text>
+<rect x="190" y="186" width="119.3" height="30" rx="6" fill="#5e97d0"/>
+<text x="317.27054619703927" y="205.0" font-size="13" fill="#e6edf6">19.3</text>
+<text x="180" y="249.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">absl::btree_map</text>
+<rect x="190" y="230" width="176.0" height="30" rx="6" fill="#7587a3"/>
+<text x="374.03369065849927" y="249.0" font-size="13" fill="#e6edf6">28.5</text>
+<text x="180" y="293.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">std::map</text>
+<rect x="190" y="274" width="484.0" height="30" rx="6" fill="#4a5a73"/>
+<text x="682.0" y="293.0" font-size="13" fill="#e6edf6">78.4</text>
 </svg>

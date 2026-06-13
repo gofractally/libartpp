@@ -190,6 +190,24 @@ namespace artpp_bench
       }
    };
 
+   struct artpp_buckets_u64
+   {
+      using key_type = uint64_t;
+      using A        = artpp::pool_alloc<uint64_t>;
+      static const char* name() { return "artpp::map<buckets>"; }
+      artpp::line_pool pool;
+      artpp::map<uint64_t, uint64_t, artpp::mode::buckets, A> m{A{&pool}};
+      void     insert(key_type k, uint64_t v) { m.insert(k, v); }
+      bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
+      bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t scan_sum() const
+      {
+         uint64_t s = 0;
+         m.for_each_value([&](const uint64_t& v) { s += v; });
+         return s;
+      }
+   };
+
    struct artpp_malloc_u64
    {
       using key_type = uint64_t;

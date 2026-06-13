@@ -3,21 +3,21 @@
 <text x="14" y="28" font-size="17" font-weight="600" fill="#e6edf6">Point lookups — clustered strings (885k keys)</text>
 <text x="14" y="46" font-size="12" fill="#8da3bf">ns / operation — lower is better</text>
 <text x="180" y="73.0" font-size="13" font-weight="600" fill="#e6edf6" text-anchor="end">artpp::map</text>
-<rect x="190" y="54" width="118.1" height="30" rx="6" fill="url(#hot)"/>
-<text x="316.11414392059555" y="73.0" font-size="13" fill="#e6edf6">119.0</text>
+<rect x="190" y="54" width="136.8" height="30" rx="6" fill="url(#hot)"/>
+<text x="334.82525671050263" y="73.0" font-size="13" fill="#e6edf6">125.5</text>
 <text x="180" y="117.0" font-size="13" font-weight="600" fill="#e6edf6" text-anchor="end">artpp::map&lt;buckets&gt;</text>
-<rect x="190" y="98" width="149.8" height="30" rx="6" fill="url(#hot2)"/>
-<text x="347.8362282878412" y="117.0" font-size="13" fill="#e6edf6">151.0</text>
+<rect x="190" y="98" width="166.0" height="30" rx="6" fill="url(#hot2)"/>
+<text x="364.0235092776077" y="117.0" font-size="13" fill="#e6edf6">152.3</text>
 <text x="180" y="161.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">artpp::map (std::allocator)</text>
-<rect x="190" y="142" width="137.7" height="30" rx="6" fill="#3f8f86"/>
-<text x="335.6873449131514" y="161.0" font-size="13" fill="#e6edf6">138.7</text>
+<rect x="190" y="142" width="166.4" height="30" rx="6" fill="#3f8f86"/>
+<text x="364.4267699513601" y="161.0" font-size="13" fill="#e6edf6">152.7</text>
 <text x="180" y="205.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">libart</text>
-<rect x="190" y="186" width="191.2" height="30" rx="6" fill="#5e97d0"/>
-<text x="389.1861042183623" y="205.0" font-size="13" fill="#e6edf6">192.6</text>
+<rect x="190" y="186" width="181.4" height="30" rx="6" fill="#5e97d0"/>
+<text x="379.36921275445866" y="205.0" font-size="13" fill="#e6edf6">166.4</text>
 <text x="180" y="249.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">absl::btree_map</text>
-<rect x="190" y="230" width="286.8" height="30" rx="6" fill="#7587a3"/>
-<text x="484.8387096774194" y="249.0" font-size="13" fill="#e6edf6">289.0</text>
+<rect x="190" y="230" width="342.0" height="30" rx="6" fill="#7587a3"/>
+<text x="540.0413439019997" y="249.0" font-size="13" fill="#e6edf6">313.8</text>
 <text x="180" y="293.0" font-size="13" font-weight="400" fill="#b7c5d8" text-anchor="end">std::map</text>
 <rect x="190" y="274" width="484.0" height="30" rx="6" fill="#4a5a73"/>
-<text x="682.0" y="293.0" font-size="13" fill="#e6edf6">487.6</text>
+<text x="682.0" y="293.0" font-size="13" fill="#e6edf6">444.1</text>
 </svg>

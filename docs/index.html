@@ -112,28 +112,30 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">1.6–2.4×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2–4×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">3 of 4</div><div class="l">workloads won outright vs the original libart (−13% dict, −38% clustered, −7% sequential); parity on uniform</div></div>
-    <div class="stat"><div class="n">≤ 1</div><div class="l">cold cacheline per level of descent — the invariant everything above falls out of</div></div>
+    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart with the right mode: −28% dict, −25% clustered, −16% uniform, −12% sequential</div></div>
+    <div class="stat"><div class="n">2–2.5×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.5–4.5×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">≤ 1</div><div class="l">cold cacheline per level of descent — the invariant the numbers fall out of</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
   <div class="figs">
     <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 88ns, artpp 112ns, libart 130ns, absl::btree_map 190ns, std::map 230ns"></div>
     <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
-    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 45ns, libart 43ns — parity"></div>
-    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 38.5ns beats libart 41.3ns"></div>
+    <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp buckets 38.2ns beats libart 45.4ns"></div>
+    <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 38.8ns beats libart 44.3ns"></div>
   </div>
   <p class="method">
-    <b>Sequential integers were libart's home game</b> — its per-node prefix rides the
-    header it loads anyway, while our compressed run used to cost a dedicated
-    prefix-node hop. The in-header prefix closed that: a compressed run now lives in
-    the node's <i>own</i> header cacheline, the pointer tag hints when it must be read,
-    and prefix-free nodes never touch it — so this workload flipped to artpp too
-    (38.5 vs 41.3 ns). Uniform random integers — pure 8-byte dispersion, nothing to
-    compress, an identical dense ladder in both libraries — are the one workload at
-    parity. Values that fit 5 bytes skip the leaf line entirely (inline in the handle).
+    Two case studies in counting cachelines. <b>Sequential integers</b> were libart's
+    home game until the in-header prefix landed: a compressed run now lives in the
+    node's <i>own</i> header cacheline (the pointer tag hints when it must be read;
+    prefix-free nodes never touch it), deleting the one extra hop — 38.8 vs 44.3 ns.
+    <b>Uniform random integers</b> were at parity for a different reason: the routers
+    were already perfect (headerless, one line each), but a million single-value leaves
+    on their own 128-byte lines made a 122 MB terminal working set vs libart's ~40 MB —
+    the routers' win, refunded at the last load. Bucket mode packs those terminals
+    ~30 to a page (a few MB total): 38.2 vs 45.4 ns, and the ordered scan drops from
+    18.3 to 3.1 ns/element. Same invariant both times: spend lines where the entropy is.
   </p>
 
   <h3 style="margin:38px 0 14px">Inserts</h3>
@@ -179,9 +181,9 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td><b>−13% / −38% / −7%</b> latency on dictionary / clustered / sequential keys
-        (pool allocator; <b>−29%</b> dict in bucket mode); parity on uniform random —
-        the one workload with nothing to compress</td></tr>
+        <td>won on <b>all four workloads</b> with the right mode: <b>−28%</b> dictionary,
+        <b>−25%</b> clustered, <b>−16%</b> uniform, <b>−12%</b> sequential (pool
+        allocator; bucket mode where terminals dominate)</td></tr>
     <tr><td>Path compression</td><td>per-node prefix read with the header on
         <i>every</i> hop</td>
         <td>prefix fused into the header line, read <b>only when the pointer tag says
