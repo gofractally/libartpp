@@ -18,6 +18,7 @@
     <nav class="links">
       <a href="#why">Why</a>
       <a href="#benchmarks">Benchmarks</a>
+      <a href="#scaling">Scaling</a>
       <a href="#features">Features</a>
       <a href="#start">Get&nbsp;started</a>
       <a href="https://github.com/gofractally/libartpp">GitHub</a>
@@ -197,6 +198,57 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <a href="https://github.com/gofractally/libartpp/blob/main/bench/engine.hpp">bench/engine.hpp</a>.
     A separate machine-calibrated <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
     guards artpp-vs-libart regressions in CI fashion.
+  </p>
+</section>
+
+<!-- ── scaling: doubles at 100M ─────────────────────────────────────────── -->
+<section id="scaling">
+  <h2>The bigger the data, the bigger the lead</h2>
+  <p class="sub">A radix descent touches a <b>bounded number of cache lines</b> however many
+  keys you store, so as a map grows it barely slows — while comparison trees pay ever more
+  cold-cache comparisons per level. Here it is on the case people least expect a radix tree to
+  handle — <code>double</code> keys, ordered numerically through
+  <a href="https://github.com/gofractally/psio">psio</a>'s order-preserving codec — scaled from
+  one million to <b>one hundred million</b> entries, against upstream libart, the comparison
+  trees, and a hash map.</p>
+
+  <div class="figs">
+    <div class="fig"><img src="charts/double_scale_hit.svg" alt="Point-lookup latency from 1M to 100M double keys: artpp 38 to 86 ns, libart 54 to 107 ns, std::unordered_map 13 to 37 ns, absl::btree_map 88 to 404 ns, std::map 179 to 614 ns"></div>
+  </div>
+  <p class="method">
+    Grow the map 100× and the two radix trees barely move — artpp <b>38 → 86 ns</b>, libart
+    54 → 107 — while the comparison trees fan out: <code>absl::btree_map</code> 88 → 404,
+    <code>std::map</code> 179 → 614. That is the radix economics: each level of descent is one
+    cold cache line, and depth grows with the <i>key length</i>, not the key count, so both
+    radix trees scale ~2× across the 100× growth versus 3.4–4.6× for the comparison trees.
+    artpp stays fastest at every size — at 100M it is <b>4.7× faster than
+    <code>absl::btree_map</code></b>, <b>7.2× faster than <code>std::map</code></b>, and
+    <b>1.25× faster than upstream libart</b> on the operation maps exist for.
+  </p>
+
+  <h3 style="margin:38px 0 14px">Almost a hash map — but fully ordered</h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/double_hit_100M.svg" alt="Point lookups at 100M double keys: artpp 86 ns, libart 107 ns, std::unordered_map 37 ns, absl::btree_map 404 ns, std::map 614 ns"></div>
+    <div class="fig"><img src="charts/double_lbound_100M.svg" alt="lower_bound at 100M double keys: artpp 179 ns, absl::btree_map 398 ns, std::map 643 ns; libart and std::unordered_map have no ordered API"></div>
+  </div>
+  <p class="method">
+    A hash map is the floor for raw point lookups — <code>std::unordered_map</code> hits in
+    37 ns at 100M — and artpp lands <b>within ~2× of it</b> (86 ns), a gap that <i>narrows</i>
+    with scale (2.9× at 1M → 2.3× at 100M). But a hash map answers only "is this exact key
+    present"; it has <b>no <code>lower_bound</code>, no ordered scan, no range</b> — and neither
+    does upstream libart. Those are what an ordered map is for, and at 100M keys artpp leads
+    them outright: <code>lower_bound</code> in <b>179 ns</b> versus 398 for
+    <code>absl::btree_map</code> and 643 for <code>std::map</code> — two of the five contestants
+    have no answer at all.
+    <br><br>
+    Methodology: Apple M5 (128 GB), clang -O3, idle machine, one process; each container is
+    built and measured in isolation (one map resident at a time, so 100M fits in RAM). Random
+    insertion order; point ops are the fastest of repeated passes. <code>double</code> keys go
+    through psio's <code>key</code> codec — fixed-width, so <code>psio::to_key</code> writes
+    them straight into a stack buffer with no per-operation allocation. libart is fed the same
+    normalized key bytes (point ops only — it has no ordered query API).
+    <code>absl::btree_map</code> keeps the scan crown (contiguous leaves); among ordered maps
+    artpp wins point lookups, inserts, and <code>lower_bound</code>.
   </p>
 </section>
 

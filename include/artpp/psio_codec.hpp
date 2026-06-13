@@ -24,6 +24,7 @@
 #include <span>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace artpp
@@ -38,11 +39,14 @@ namespace artpp
    template <class K>
    struct key_codec<K, std::enable_if_t<use_psio_key<K>::value>>
    {
-      using scratch = std::vector<char>;  // psio encodes into a growable sink
+      // psio::to_key returns std::array for compile-time-sized keys (doubles, ints, fixed
+      // structs — encoded into a stack buffer, no packsize pass, no allocation) and
+      // std::vector for value-dependent sizes. The scratch holds it so the returned view
+      // stays valid through the descent; fixed-width keys cost zero heap traffic.
+      using scratch = decltype(psio::to_key(std::declval<const K&>()));
       static std::string_view encode(const K& k, scratch& s)
       {
-         s.clear();
-         psio::encode(psio::key{}, k, s);
+         s = psio::to_key(k);
          return std::string_view(s.data(), s.size());
       }
       static K decode(std::string_view b)

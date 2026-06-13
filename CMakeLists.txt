@@ -114,7 +114,7 @@ if(ARTPP_BENCHMARKS)
    # artpp::map<double> vs std::map<double> vs absl::btree_map<double>. Only when psio is on.
    if(ARTPP_WITH_PSIO)
       add_executable(artpp_bench_double bench/bench_double.cpp)
-      target_link_libraries(artpp_bench_double PRIVATE artpp psio absl::btree)
+      target_link_libraries(artpp_bench_double PRIVATE artpp psio absl::btree artpp_vendor_libart)
       target_compile_options(artpp_bench_double PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
       set_target_properties(artpp_bench_double PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
    endif()
