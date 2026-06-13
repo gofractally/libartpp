@@ -140,11 +140,24 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     throughout: spend lines where the entropy is.
   </p>
 
-  <h3 style="margin:38px 0 14px">Inserts</h3>
+  <h3 style="margin:38px 0 14px">Inserts <span style="color:var(--muted);font-weight:400">(build time is allocator-bound — so compare the allocator)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_insert.svg" alt="Insert latency, dictionary words"></div>
-    <div class="fig"><img src="charts/uniform_insert.svg" alt="Insert latency, uniform uint64"></div>
+    <div class="fig"><img src="charts/clustered_insert.svg" alt="Insert latency, clustered strings: artpp pool 144ns, std::allocator 168ns, libart 168ns, btree 241ns, std::map 345ns"></div>
+    <div class="fig"><img src="charts/uniform_insert.svg" alt="Insert latency, uniform uint64: artpp pool 44ns, std::allocator 61ns, libart 54ns, btree 97ns, std::map 207ns"></div>
   </div>
+  <p class="method">
+    A bulk build is dominated by where the nodes come from, so the honest insert
+    comparison holds the tree fixed and swaps the allocator. The flagship
+    <code>line_pool</code> (bump placement, children next to parents) builds the same
+    tree <b>1.1–1.4× faster than <code>std::allocator</code></b> — that's the
+    allocator's contribution, cleanly isolated (both rows are on every insert chart).
+    Held to the <i>same</i> malloc class, artpp and libart build at similar rates:
+    artpp leads on sequential and runs even on clustered, and libart's flatter node
+    growth leads on the deeply-shared dictionary, where a radix does the most splitting
+    — the up-front structuring that buys the lookup, scan, and ordered-iteration wins
+    above. Net with the pool: builds beat <code>absl::btree_map</code> (1.7–2.8×) and
+    <code>std::map</code> (2.4–7.2×) on every workload.
+  </p>
 
   <h3 style="margin:38px 0 14px">Ordered scans <span style="color:var(--muted);font-weight:400">(bucket mode keeps pace with B-trees)</span></h3>
   <div class="figs">

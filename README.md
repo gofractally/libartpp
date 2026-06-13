@@ -393,7 +393,15 @@ Bucket mode is faster still on the dictionary (1.16× over the default radix)
 and its scans rival `absl::btree_map`. The headerless tagged-pointer dispatch
 is the structural reason reads win: libart loads a node header on every hop
 before it can route; artpp routes from the pointer itself, and a small leaf
-often rides in the routing node's own cacheline. Reproduce with
+often rides in the routing node's own cacheline.
+
+**Inserts** are allocator-bound, so the honest comparison holds the tree fixed
+and swaps the allocator: `line_pool` builds the same tree **1.1–1.4× faster
+than `std::allocator`** (bump placement, children next to parents). Held to the
+same malloc class, artpp and libart build at similar rates — artpp leads on
+sequential keys, libart's flatter node growth leads on the deeply-shared
+dictionary (a radix splits more there). With the pool, builds beat
+`absl::btree_map` 1.7–2.8× and `std::map` 2.4–7.2×. Reproduce with
 `-DARTPP_BENCHMARKS=ON` (`bench/`); the per-process regression gate lives in
 `bench/perf_gate.cpp`.
 
