@@ -70,24 +70,35 @@ namespace artpp_bench
       std::vector<Key> shuffled(keys);
       std::mt19937_64  rng(0xA11CE5);
       std::shuffle(shuffled.begin(), shuffled.end(), rng);
-      {  // point hits (shuffled order, value checksum verified)
-         uint64_t     sum = 0, want = 0;
+      {  // point hits — repeated; report the fastest rep (least thermal interference,
+         // standard latency practice). A single pass is too noisy on a fanless machine.
+         uint64_t sum = 0, want = 0;
          for (const Key& k : keys) want += val_of(k);
-         uint64_t     out = 0;
-         const double t0  = now_ns();
-         for (const Key& k : shuffled)
-            if (c.find(k, out)) sum += out;
-         const double t1 = now_ns();
-         record("hit", n, t0, t1);
+         double best = 1e30;
+         for (int r = 0; r < scan_reps; ++r)
+         {
+            uint64_t     out = 0;
+            sum              = 0;
+            const double t0  = now_ns();
+            for (const Key& k : shuffled)
+               if (c.find(k, out)) sum += out;
+            best = std::min(best, (now_ns() - t0) / double(n));
+         }
+         results().push_back(row{C::name(), workload, "hit", n, best});
          if (sum != want) std::fprintf(stderr, "BAD CHECKSUM %s/%s\n", C::name(), workload);
          g_sink ^= sum;
       }
-      {  // point misses
-         uint64_t     out = 0, found = 0;
-         const double t0  = now_ns();
-         for (const Key& k : misses) found += c.find(k, out);
-         const double t1 = now_ns();
-         record("miss", misses.size(), t0, t1);
+      {  // point misses — repeated, fastest rep
+         uint64_t out = 0, found = 0;
+         double   best = 1e30;
+         for (int r = 0; r < scan_reps; ++r)
+         {
+            const double t0 = now_ns();
+            found           = 0;
+            for (const Key& k : misses) found += c.find(k, out);
+            best = std::min(best, (now_ns() - t0) / double(misses.size()));
+         }
+         results().push_back(row{C::name(), workload, "miss", misses.size(), best});
          if (found) std::fprintf(stderr, "MISS SET NOT DISJOINT %s/%s\n", C::name(), workload);
       }
       {  // full ordered scans

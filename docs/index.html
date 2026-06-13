@@ -87,11 +87,11 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
       compression at <b>zero extra lines</b>.</p>
     </div>
     <div class="card">
-      <h3><span class="dot"></span>Terminals are 16-byte dense</h3>
-      <p>Values ≤5 bytes pack <b>inline in the handle bits</b> — zero lines. Larger ones
-      live in a dedicated <b>16-byte-aligned terminal region</b>: a leaf is pure payload,
-      so it doesn't get a 128-byte line, it gets exactly what it needs — an 8× smaller
-      terminal working set than one-line-per-leaf.</p>
+      <h3><span class="dot"></span>Terminals cost almost nothing</h3>
+      <p>Values ≤5 bytes pack <b>inline in the handle bits</b> — zero lines. A small leaf
+      can live <b>inside the routing setlist's own cacheline</b> (no separate load at all).
+      Anything else sits in a dedicated <b>16-byte-aligned terminal region</b> — a leaf is
+      pure payload, so it gets exactly what it needs, not a 128-byte line.</p>
     </div>
     <div class="card">
       <h3><span class="dot"></span>Levels collapse adaptively</h3>
@@ -113,15 +113,15 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart: −42% sequential, −22% uniform, −17% clustered, −22% dict (bucket mode; plain radix is par)</div></div>
-    <div class="stat"><div class="n">1.8–3.1×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.2–5.1×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">≤ 1</div><div class="l">cold cacheline per level of descent — the invariant the numbers fall out of</div></div>
+    <div class="stat"><div class="n">4 of 4</div><div class="l">workloads won vs the original libart, plain radix: −50% sequential, −18% uniform, −24% clustered, −14% dictionary</div></div>
+    <div class="stat"><div class="n">1.8–2.6×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
+    <div class="stat"><div class="n">2.2–6.7×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">0</div><div class="l">extra cachelines for a small leaf — it shares the line of the setlist that routes to it</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp buckets 88ns, artpp 112ns, libart 130ns, absl::btree_map 190ns, std::map 230ns"></div>
+    <div class="fig"><img src="charts/dict_hit.svg" alt="Point lookup latency, dictionary words: artpp 107ns, buckets 97ns, libart 125ns, absl::btree_map 198ns, std::map 240ns"></div>
     <div class="fig"><img src="charts/clustered_hit.svg" alt="Point lookup latency, clustered strings: artpp 118ns fastest, libart 164ns, std::map 410ns"></div>
     <div class="fig"><img src="charts/uniform_hit.svg" alt="Point lookup latency, uniform uint64: artpp 34.8ns beats libart 44.7ns"></div>
     <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 25.9ns beats libart 44.3ns"></div>
@@ -164,7 +164,8 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <code>std::allocator</code> row shows zero-setup behavior. Workloads: 236k
     dictionary words, 885k clustered strings, 1M uniform &amp; sequential
     <code>uint64</code> (typed APIs; libart receives the identical big-endian bytes).
-    Full data: <a href="results.csv">results.csv</a> · engine:
+    Point-lookup latency is the fastest of five repetitions per contestant. Full data:
+    <a href="results.csv">results.csv</a> · engine:
     <a href="https://github.com/gofractally/libartpp/blob/main/bench/engine.hpp">bench/engine.hpp</a>.
     A separate machine-calibrated <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
     guards artpp-vs-libart regressions in CI fashion.
@@ -184,9 +185,12 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td>won on <b>all four workloads</b>, plain radix: <b>−42%</b> sequential,
-        <b>−22%</b> uniform, <b>−17%</b> clustered integers/strings, par-to-<b>−22%</b>
-        dictionary (bucket mode)</td></tr>
+        <td>won on <b>all four workloads</b>, plain radix: <b>−50%</b> sequential,
+        <b>−24%</b> clustered, <b>−18%</b> uniform, <b>−14%</b> dictionary</td></tr>
+    <tr><td>Small leaves</td><td>a malloc'd node per key</td>
+        <td>a leaf that fits goes <b>inside the routing node's cacheline</b> — the byte
+        that selects it and the value it yields are one line, so the lookup ends without
+        a second load (the 1-byte <code>inl</code> header flags which children are inline)</td></tr>
     <tr><td>Leaf storage</td><td>~32 B mallocs, header read per probe</td>
         <td>a dedicated <b>16-byte-aligned terminal region</b> — the tag carries the
         4 bits a terminal pointer needs, so leaves pay no line-alignment tax and the

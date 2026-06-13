@@ -4,15 +4,15 @@
 
 **[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
 with the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
-two regions): point lookups 1.8–3.1× faster than `absl::btree_map`, 2.2–5.1×
+two regions): point lookups 1.8–2.6× faster than `absl::btree_map`, 2.2–6.7×
 faster than `std::map`, and faster than upstream libart on **all four
-workloads** — sequential integers −42%, uniform integers −22%, clustered
-strings −17%, dictionary par (−22% in bucket mode). The invariant behind the
-numbers: **at most one cold cacheline per level of descent** — headerless
-tagged-pointer dispatch, prefixes fused into the node's own header line, small
-values inline in the handle, and leaves in a dedicated **16-byte-aligned
-terminal region** (a terminal is pure payload; the tag needs only 4 alignment
-bits, so it doesn't pay for a line).
+workloads** (plain radix) — sequential integers −50%, clustered strings −24%,
+uniform integers −18%, dictionary −14%. The invariant behind the numbers: **at
+most one cold cacheline per level of descent** — headerless tagged-pointer
+dispatch; prefixes fused into the node's own header line; small values inline
+in the handle; a small leaf living **inside the routing node's cacheline** (the
+`inl` byte); and larger leaves in a dedicated **16-byte-aligned terminal
+region** (a terminal is pure payload — it doesn't pay for a 128-byte line).
 
 `artpp::map<Key, T>` is an ordered associative container backed by an adaptive
 radix tree (ART) with *headerless dispatch*: the node kind rides in the tagged
