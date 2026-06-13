@@ -557,6 +557,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Clamped so pack/unpack are instantiation-safe even for non-inlineable T (dead
       // code under the runtime guard); == sizeof(T) on the path that actually inlines.
       static constexpr size_t inline_bytes = sizeof(T) <= inline_cap ? sizeof(T) : inline_cap;
+      // A setlist may host small leaf children INSIDE its own line (see setlist_t).
+      // Requires trivially-copyable T: inline payloads are relocated by memcpy during
+      // repack/externalize, and a leaf's value object then lives in the parent's line.
+      // Non-trivial T falls back to external (terminal-region) leaves throughout.
+      static constexpr bool inline_children_ok = std::is_trivially_copyable_v<T>;
 
      private:
       // Per-node allocation. Every node/value blob is a run of 128-byte-aligned blocks taken
@@ -970,11 +975,20 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   const uint8_t byte = uint8_t(key[depth]);
                   if (int i = setlist_index(s, byte); i >= 0)  // existing child -> descend
                   {
+                     // An inline-leaf child must become a real leaf before descent: the
+                     // generic loop (split_leaf) treats *slot as an external value_ptr.
+                     if (sl_is_inline(s, i)) sl_externalize_(s, i);  // throws → strong: unchanged
                      if constexpr (WideStems) pslot = slot;
                      slot  = &s->branch[i];
                      ++depth;
                      continue;
                   }
+                  // New child. setlist_set shifts branch[] (and would desync the inl bits),
+                  // so flatten any inline children first. We do NOT re-compact on growth:
+                  // inline is established once at split creation; a setlist that outgrows its
+                  // split shape goes external and stays there (re-compacting per insert is
+                  // O(n) alloc/free churn that wrecked clustered builds).
+                  if (sl_inl_active(s)) sl_externalize_all_(s);  // one-time; throws → strong
                   packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
                   if (setlist_set(s, byte, lf))  // room: in place (prefix untouched)
                   {
@@ -1077,7 +1091,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
    const setlist* s = reinterpret_cast<const setlist*>(ARTPP_PTR(raw)); const unsigned pl = s->rh.hdr.prefix_len; \
    if (pl) { if (klen - depth < pl || std::memcmp(s->prefix, kp + depth, pl) != 0) return op.miss(); depth += pl; } \
    if (depth == klen) return op.term(&s->rh); \
-   raw = setlist_find(s, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
+   const int sli_ = setlist_index(s, uint8_t(kp[depth])); \
+   if (sli_ < 0) return op.miss(); \
+   if (sl_is_inline(s, sli_)) /* inline leaf shares this line — no extra cacheline */ \
+      return op.leaf(sl_inline_leaf(s, sli_), kp + depth + 1, klen - depth - 1); \
+   raw = s->branch[sli_].raw(); ARTPP_NEXT(depth + 1); }
 #define ARTPP_BODY_SETLIST16 { \
    const setlist16* s = reinterpret_cast<const setlist16*>(ARTPP_PTR(raw)); \
    if (klen - depth < 2) return depth == klen ? op.term(&s->rh) : op.miss(); \
@@ -1294,6 +1312,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   const uint8_t byte = uint8_t(key[depth]);
                   packed_ptr*   cs   = router_find_slot(cur, byte);
                   if (!cs) return op.miss();
+                  if (ck == K::setlist_u8)  // the matched child may be an inline leaf
+                  {
+                     setlist*  s2 = static_cast<setlist*>(deref_(cur));
+                     const int i  = int(cs - s2->branch);
+                     if (sl_is_inline(s2, i))  // terminal in this line — assign in place
+                        return op.leaf(cs, sl_inline_leaf(s2, i), key.substr(depth + 1), cur, byte, pstem);
+                  }
                   parent = cur; pbyte = byte; slot = cs; ++depth; continue;
                }
             }
@@ -1576,6 +1601,34 @@ namespace detail  // implementation types & node helpers — not part of the pub
             return t_->with_router(node,
                                    [&](auto* n) noexcept { return router_next(n, from, ob, oc); });
          }
+         // Position the cursor on a setlist's INLINE leaf child (branch i) — the leaf lives
+         // in the parent's line, so it can't be resolved from the child handle alone. Mirrors
+         // descend_'s value_ptr arm. Caller has already pushed the parent frame.
+         void emit_inline_leaf_(const setlist* s, int i, size_t base)
+         {
+            const char* L = t_->sl_inline_leaf(s, i);
+            sfx_          = leaf_suf(L);
+            sfxlen_       = leaf_slen(L);
+            if (leaf_has_full(L)) { full_str_ = leaf_str(L); full_len_ = leaf_strlen(L); }
+            else                    full_str_ = nullptr;
+            set_ptr_(leaf_val(L));
+            if (maintain_) { key_.len = base; if (!full_str_) key_.append(sfx_, sfxlen_); }
+         }
+         // True if `parent`'s child at stem `byte` is an inline leaf (then positions on it);
+         // else descends `child` normally. Used at every forward child-follow.
+         bool descend_branch_(packed_ptr parent, uint8_t byte, packed_ptr child, size_t base)
+         {
+            if (parent.tag() == K::setlist_u8)
+            {
+               const setlist* s = static_cast<const setlist*>(deref_(parent));
+               if (s->inl & 0x80)
+               {
+                  const int i = setlist_index(s, byte);
+                  if (i >= 0 && map::sl_is_inline(s, i)) { emit_inline_leaf_(s, i, base); return true; }
+               }
+            }
+            return descend_(child, base);
+         }
          // true → positioned at a terminal (sets val_ + suffix); false → pushed a frame.
          // `base` is the key length at this child's start; key_ is grown only when
          // maintain_ is on (the eager fast path), otherwise the path in stk_ suffices.
@@ -1711,7 +1764,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   f.cur = bb + 1;
                   if (maintain_) { key_.len = f.cbase; key_.push(bb); }
-                  if (descend_(child, key_.len)) return;
+                  if (descend_branch_(f.node, bb, child, key_.len)) return;  // inline-aware
                }
                else { if (maintain_) key_.len = f.plen; stk_.pop_back(); }
             }
@@ -1819,7 +1872,26 @@ namespace detail  // implementation types & node helpers — not part of the pub
                stk_.push_back(Frame{cur, upper ? 0 : -1, 0, 0});
                return false;
             }
-            const uint8_t    byte  = uint8_t(key[depth]);
+            const uint8_t byte = uint8_t(key[depth]);
+            // inline-leaf child of a setlist: a terminal reached here (needs parent context).
+            // Mirror the value_ptr arm — push the resume frame, position iff it qualifies.
+            if (cur.tag() == K::setlist_u8)
+            {
+               const setlist* s = static_cast<const setlist*>(deref_(cur));
+               if (s->inl & 0x80)
+               {
+                  const int i = setlist_index(s, byte);
+                  if (i >= 0 && map::sl_is_inline(s, i))
+                  {
+                     stk_.push_back(Frame{cur, byte + 1, 0, 0});  // seek_/retreat_ resume here
+                     const char*      L = t_->sl_inline_leaf(s, i);
+                     std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
+                     const int        cmp = S.compare(key.substr(depth + 1));
+                     if (upper ? cmp > 0 : cmp >= 0) { emit_inline_leaf_(s, i, 0); return true; }
+                     return false;  // < target → seek_ from the frame yields the bound
+                  }
+               }
+            }
             const packed_ptr child = router_child_(cur, byte);
             if (!child.is_null())  // exact child → follow the key deeper
             {
@@ -1930,6 +2002,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      {
                         stk_.push_back(Frame{child, int(bb) + 1, uint32_t(base), cb});
                         if (maintain_) key_.push(bb);
+                        if (child.tag() == K::setlist_u8)  // rightmost child may be inline
+                        {
+                           const setlist* s = static_cast<const setlist*>(deref_(child));
+                           if (s->inl & 0x80)
+                           {
+                              const int i = setlist_index(s, bb);
+                              if (i >= 0 && map::sl_is_inline(s, i))
+                              { emit_inline_leaf_(s, i, maintain_ ? size_t(key_.len) : 0); return; }
+                           }
+                        }
                         child = nc;
                         base  = maintain_ ? size_t(key_.len) : size_t(cb) + 1;
                         continue;
@@ -2007,6 +2089,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   {
                      f.cur = int(bb) + 1;
                      if (maintain_) { key_.len = f.cbase; key_.push(bb); }
+                     if (f.node.tag() == K::setlist_u8)  // previous child may be inline
+                     {
+                        const setlist* s = static_cast<const setlist*>(deref_(f.node));
+                        if (s->inl & 0x80)
+                        {
+                           const int i = setlist_index(s, bb);
+                           if (i >= 0 && map::sl_is_inline(s, i))
+                           { emit_inline_leaf_(s, i, maintain_ ? size_t(key_.len) : 0); return; }
+                        }
+                     }
                      descend_max_(child, maintain_ ? size_t(key_.len) : 0);
                      return;
                   }
@@ -2794,6 +2886,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             if (nb == 1 && !tm)
             {
+               // A lone INLINE survivor can't be collapsed here (rm_shrink_ is noexcept;
+               // absorbing it into a prefix_node would need an alloc). Leave the setlist
+               // as a valid 1-branch node — a future insert can re-shape it.
+               if (k == K::setlist_u8 && sl_is_inline(static_cast<setlist*>(deref_(nd)), 0))
+                  return false;
                uint8_t  pfx[node_full::PFX_CAP + 2];  // largest inline prefix + edge byte(s)
                unsigned pl = 0;
                if (k == K::setlist_u8)
@@ -3036,6 +3133,26 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      packed_ptr*   cs   = router_find_slot(cur, byte);
                      if (!cs)
                         return false;
+                     if (ck == K::setlist_u8)  // the matched child may be an inline leaf
+                     {
+                        setlist*  s = static_cast<setlist*>(deref_(cur));
+                        const int i = int(cs - s->branch);
+                        if (sl_is_inline(s, i))
+                        {
+                           const char* lf = sl_inline_leaf(s, i);  // leaf shares cur's line
+                           if (std::string_view(reinterpret_cast<const char*>(leaf_suf(lf)),
+                                                leaf_slen(lf)) != key.substr(depth + 1))
+                              return false;  // stem matched but suffix didn't → absent
+                           sl_remove_branch_(s, i);  // drop branch + payload (alloc-free)
+                           --count_;
+                           if (rm_shrink_(slot))  // cur emptied/collapsed → unlink from parent
+                           {
+                              if (n >= 2) rm_unwind_(path, n, n - 2);
+                              else        root_ = packed_ptr::null();
+                           }
+                           return true;
+                        }
+                     }
                      slot               = cs;
                      path[n++ % RM_LVN] = {slot, byte};
                      ++depth;
@@ -3196,6 +3313,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                const setlist* A = static_cast<const setlist*>(deref_(a));
                const setlist* B = static_cast<const setlist*>(tb.deref_(b));
+               // Inline children are a representation detail; let the canonical sequence
+               // compare (inline-aware iterators) decide rather than match them structurally.
+               if ((A->inl & 0x80) || (B->inl & 0x80)) return -1;
                const unsigned pa = A->rh.hdr.prefix_len, pb = B->rh.hdr.prefix_len;
                const unsigned m  = pa < pb ? pa : pb;
                if (m && std::memcmp(A->prefix, B->prefix, m) != 0) return 0;
@@ -3431,7 +3551,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   {
                      const setlist* s = static_cast<const setlist*>(deref_(cur));
                      const int      n = s->rh.hdr.nbranch;
-                     for (int i = 0; i < n; ++i) walk_v_(s->branch[i], f);
+                     for (int i = 0; i < n; ++i)
+                        if (sl_is_inline(s, i)) f(static_cast<const T&>(*leaf_val(sl_inline_leaf(s, i))));
+                        else                    walk_v_(s->branch[i], f);
                      break;
                   }
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
@@ -3525,7 +3647,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   {
                      const setlist* s = static_cast<const setlist*>(deref_(cur));
                      const int      n = s->rh.hdr.nbranch;
-                     for (int i = 0; i < n; ++i) recurse(s->bytes[i], s->branch[i]);  // bytes[] sorted
+                     for (int i = 0; i < n; ++i)  // bytes[] sorted
+                        if (sl_is_inline(s, i))   // inline leaf: emit key = path+byte+suffix
+                        {
+                           const char* L = sl_inline_leaf(s, i);
+                           key.push(s->bytes[i]);
+                           key.append(leaf_suf(L), leaf_slen(L));
+                           f(key.view(), static_cast<const T&>(*leaf_val(L)));
+                           key.len = cb;
+                        }
+                        else recurse(s->bytes[i], s->branch[i]);
                      break;
                   }
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
@@ -3686,6 +3817,166 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::memcpy(p, &slen, 2);
          std::memcpy(p + 2, &pfxfield, 2);
       }
+
+      // ── setlist inline children (Dan's `inl` byte) ──────────────────────────────
+      // An inline branch's handle is NOT a pool address: tag stays value_ptr, the rest
+      // holds a tail-offset, and the leaf bytes live at line+128-tailoff in the
+      // setlist's own line. The `inl` byte (bit7 active, bits0-6 per branch 0..6) is the
+      // sole source of truth — never trust an inline branch's bits as an address. Inline
+      // payloads pack against the tail in branch order (canonical), re-established after
+      // every change. Trivially-copyable T only (payloads move by memcpy).
+      static constexpr unsigned SL_LINE          = cacheline_bytes;
+      static constexpr unsigned sl_branch_off    = unsigned(offsetof(setlist, branch));
+      static constexpr int      SL_INLINE_BRANCH = 7;  // bits 0..6 cover branches 0..6
+      static bool     sl_inl_active(const setlist* s) noexcept { return s->inl & 0x80; }
+      static bool     sl_is_inline(const setlist* s, int i) noexcept
+      {
+         return (s->inl & 0x80) && i < SL_INLINE_BRANCH && (s->inl & (1u << i));
+      }
+      static packed_ptr sl_inline_handle(unsigned tailoff) noexcept
+      {
+         packed_ptr p;
+         std::memset(p.b, 0, sizeof(Ptr));
+         const uint64_t raw = (uint64_t(tailoff) << 4) | uint8_t(K::value_ptr);
+         std::memcpy(p.b, &raw, sizeof(Ptr));
+         return p;
+      }
+      static unsigned sl_tailoff(packed_ptr p) noexcept { return unsigned(p.raw() >> 4); }
+      // The inline leaf bytes for branch i (caller guarantees sl_is_inline). `s` IS the
+      // line base (deref_ returns it), so this resolves for direct and indexed alike.
+      char*       sl_inline_leaf(setlist* s, int i) const noexcept
+      {
+         return reinterpret_cast<char*>(s) + (SL_LINE - sl_tailoff(s->branch[i]));
+      }
+      const char* sl_inline_leaf(const setlist* s, int i) const noexcept
+      {
+         return reinterpret_cast<const char*>(s) + (SL_LINE - sl_tailoff(s->branch[i]));
+      }
+      static unsigned sl_used_branch_end(const setlist* s) noexcept
+      {
+         return sl_branch_off + unsigned(s->rh.hdr.nbranch) * unsigned(sizeof(Ptr));
+      }
+      // Inline leaves must start on alignof(T) so the value field lands aligned (the line
+      // base is 128-aligned, so an aligned line-offset gives an aligned address). >=1.
+      static constexpr unsigned SL_VAL_ALIGN = alignof(T) < 1 ? 1 : unsigned(alignof(T));
+      // Repack inline payloads contiguously against the tail in ascending branch order
+      // (canonical). No allocation; safe because trivially-copyable payloads move by
+      // memcpy and the new positions never overlap the branch array.
+      void sl_repack_(setlist* s) const noexcept
+      {
+         if (!sl_inl_active(s)) return;
+         const int n = std::min<int>(s->rh.hdr.nbranch, SL_INLINE_BRANCH);
+         char      tmp[SL_LINE];
+         unsigned  pos = SL_LINE, newoff[SL_INLINE_BRANCH];
+         for (int i = 0; i < n; ++i)
+            if (sl_is_inline(s, i))
+            {
+               const char*    lf = sl_inline_leaf(s, i);
+               const unsigned sz = unsigned(leaf_alloc_size(lf));
+               pos = (pos - sz) & ~(SL_VAL_ALIGN - 1);  // align the leaf start (value aligned)
+               std::memcpy(tmp + pos, lf, sz);
+               newoff[i] = pos;
+            }
+         std::memcpy(reinterpret_cast<char*>(s) + pos, tmp + pos, SL_LINE - pos);
+         for (int i = 0; i < n; ++i)
+            if (sl_is_inline(s, i)) s->branch[i] = sl_inline_handle(SL_LINE - newoff[i]);
+      }
+      // Opportunistically move external leaf children INTO the line, all-or-nothing:
+      // allocation-free (frees the externals), canonical by construction. The creation
+      // workhorse — call after building/growing a small setlist.
+      void sl_inline_compact_(setlist* s) noexcept
+      {
+         if constexpr (!inline_children_ok) { (void)s; return; }
+         else
+         {
+            const int n = std::min<int>(s->rh.hdr.nbranch, SL_INLINE_BRANCH);
+            char      tmp[SL_LINE];
+            unsigned  pos = SL_LINE, newoff[SL_INLINE_BRANCH];
+            uint8_t   newinl = 0x80;
+            bool      any = false, was_ext[SL_INLINE_BRANCH] = {};
+            for (int i = 0; i < n; ++i)
+            {
+               const char* src = nullptr;
+               if (sl_is_inline(s, i)) src = sl_inline_leaf(s, i);
+               else if (s->branch[i].tag() == K::value_ptr)
+               {
+                  src        = static_cast<const char*>(deref_term_(s->branch[i]));
+                  was_ext[i] = true;
+               }
+               if (!src) continue;
+               const unsigned sz = unsigned(leaf_alloc_size(src));
+               // Align the leaf start (value alignment); a leaf too big to fit the region
+               // would underflow pos — all-or-nothing, so bail and leave everything external.
+               if (sz > pos) return;
+               const unsigned np = (pos - sz) & ~(SL_VAL_ALIGN - 1);
+               if (np < sl_used_branch_end(s)) return;
+               pos = np;
+               std::memcpy(tmp + pos, src, sz);
+               newoff[i] = pos;
+               newinl |= uint8_t(1u << i);
+               any = true;
+            }
+            if (!any) return;  // no leaf children to pull inline
+            for (int i = 0; i < n; ++i)
+               if (was_ext[i])
+                  term_free_(deref_term_(s->branch[i]), leaf_alloc_size(static_cast<const char*>(deref_term_(s->branch[i]))));
+            std::memcpy(reinterpret_cast<char*>(s) + pos, tmp + pos, SL_LINE - pos);
+            for (int i = 0; i < n; ++i)
+               if (newinl & (1u << i)) s->branch[i] = sl_inline_handle(SL_LINE - newoff[i]);
+            s->inl = newinl;
+         }
+      }
+      // Move one inline child OUT to a real terminal leaf (throws on alloc). Used before
+      // any path that must treat the child as an ordinary external leaf (split/collapse/
+      // widen). Leaves the rest of the inline set intact and valid.
+      void sl_externalize_(setlist* s, int i)
+      {
+         char*          lf = sl_inline_leaf(s, i);
+         const unsigned sz = unsigned(leaf_alloc_size(lf));
+         char*          ext = static_cast<char*>(term_alloc_(sz));  // throws
+         std::memcpy(ext, lf, sz);
+         s->branch[i] = pack_term_(ext, K::value_ptr);
+         s->inl &= uint8_t(~(1u << i));
+         if (!(s->inl & 0x7F)) s->inl = 0;  // no inline children left → drop active bit
+         else sl_repack_(s);                // keep the survivors canonical
+      }
+      void sl_externalize_all_(setlist* s)  // throws on alloc (basic guarantee: partial is valid)
+      {
+         if (!sl_inl_active(s)) return;
+         const int n = std::min<int>(s->rh.hdr.nbranch, SL_INLINE_BRANCH);
+         for (int i = 0; i < n; ++i)
+            if (sl_is_inline(s, i))
+            {
+               char*          lf  = sl_inline_leaf(s, i);
+               const unsigned sz  = unsigned(leaf_alloc_size(lf));
+               char*          ext = static_cast<char*>(term_alloc_(sz));  // throws
+               std::memcpy(ext, lf, sz);
+               s->branch[i] = pack_term_(ext, K::value_ptr);
+               s->inl &= uint8_t(~(1u << i));
+            }
+         s->inl = 0;
+      }
+      // Drop branch i (stems/handles shift down, the inl bits shift with them), reclaiming
+      // an inline payload if branch i had one. Allocation-free — the inline-aware twin of
+      // setlist_remove, used on the remove path so inl never desyncs from the branch array.
+      void sl_remove_branch_(setlist* s, int i) const noexcept
+      {
+         const int n = s->rh.hdr.nbranch;
+         std::memmove(&s->bytes[i], &s->bytes[i + 1], size_t(n - 1 - i));
+         std::memmove(&s->branch[i], &s->branch[i + 1], size_t(n - 1 - i) * sizeof(Ptr));
+         s->bytes[n - 1]   = 0xFF;
+         s->rh.hdr.nbranch = uint16_t(n - 1);
+         if (s->inl & 0x80)
+         {
+            const uint8_t flags = uint8_t(s->inl & 0x7F);  // drop active bit BEFORE the shift,
+            const uint8_t lo    = uint8_t(flags & ((1u << i) - 1));               // else bit7→bit6
+            const uint8_t hi    = uint8_t((flags >> 1) & ~((1u << i) - 1) & 0x7F);  // (i,7)→[i,6)
+            const uint8_t bits  = uint8_t(lo | hi);
+            s->inl = bits ? uint8_t(0x80 | bits) : 0;
+            sl_repack_(s);  // re-pack survivors canonically (reclaims the dropped payload)
+         }
+      }
+
       template <class VF>
       packed_ptr make_leaf(std::string_view suf, VF&& val)  // suffix-only (compressed) leaf
       {
@@ -3852,6 +4143,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             if ((ck == K::setlist_u8 || ck == K::pfxd) && crh->hdr.prefix_len != 0)
                return;  // an inline (or fused) prefix is not representable in the wide node
+            if (ck == K::setlist_u8 && sl_inl_active(static_cast<setlist*>(deref_(c))))
+               return;  // child's inline leaves can't move into the u16 — skip fusion
             total += crh->hdr.nbranch;
             if (total > FUSE_THRESH)
                return;
@@ -4154,6 +4447,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static void router_remove(node_full* f, uint8_t byte) noexcept { full_set(f, byte, packed_ptr::null()); }
       void router_remove(packed_ptr cur, uint8_t byte) const noexcept
       {
+         if (cur.tag() == K::setlist_u8)  // inline-aware: keep inl in sync with branch[]
+         {
+            setlist* s = static_cast<setlist*>(deref_(cur));
+            if (sl_inl_active(s))
+            {
+               const int i = setlist_index(s, byte);
+               if (i >= 0) sl_remove_branch_(s, i);
+               return;
+            }
+         }
          with_router(cur, [byte](auto* n) noexcept { router_remove(n, byte); });
       }
 
@@ -4204,7 +4507,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // rebuild, so it trades insert throughput for footprint. Pick per workload.
       packed_ptr widen(packed_ptr cur)
       {
-         const K      k  = cur.tag();
+         const K k = cur.tag();
+         // cN / node_full have no inline region: a setlist's inline leaves must become
+         // real terminal leaves before the rebuild copies its branches.
+         if (k == K::setlist_u8)
+         {
+            setlist* s = static_cast<setlist*>(deref_(cur));
+            if (sl_inl_active(s)) sl_externalize_all_(s);  // throws bad_alloc → caller's guard
+         }
          const size_t os = node_size(k);
          packed_ptr   out;
          if constexpr (!DenseTiers)
@@ -4325,6 +4635,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             setlist* r = new_setlist();
             set_term(&r->rh, std::move(oldv));                                    // old key terminates
             setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
+            sl_inline_compact_(r);          // pull the small leaf child into this line
             return pack_(r, K::setlist_u8);  // c == 0, no prefix node needed
          }
          char*            L = static_cast<char*>(deref_term_(cur));
@@ -4362,6 +4673,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          v_destroy(alloc_, leaf_val(L));  // old value moved out → destroy moved-from + free
          term_free_(L, Lsize);
          g.release();  // committed: the caller adopts `partial`
+         sl_inline_compact_(r);  // both children are small leaves → pull them into this line
          inserted = true;
          return partial;
       }
@@ -4394,6 +4706,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          setlist_set(r, uint8_t(PP[c]), cont);  // non-throwing graft of the live child
          g.release();
          node_free_(P, Psize);
+         sl_inline_compact_(r);  // the new-value branch is a small leaf → pull it inline
          return partial;
       }
 
@@ -4427,6 +4740,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::memmove(s->prefix, s->prefix + c + 1, newpl);
          s->rh.hdr.prefix_len = newpl;
          g.release();
+         sl_inline_compact_(r);  // the new-value branch is a small leaf → pull it inline
          return partial;
       }
 
@@ -4458,6 +4772,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // commit (non-throwing): shorten the fused prefix in place, then graft
          setlist_set(r, oldbyte, pfxd_set_prefix(n, pb + c + 1, newpl));
          g.release();
+         sl_inline_compact_(r);  // the new-value branch is a small leaf → pull it inline
          return partial;
       }
 
@@ -4551,7 +4866,26 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return dp;
             }
             case K::setlist_u8:
-               return clone_router_(src, static_cast<const setlist*>(src.deref_(s)), K::setlist_u8);
+            {
+               // Copy the WHOLE line: inline-leaf payloads live in the tail (possibly past
+               // sizeof(setlist)) and their branch handles are line-relative, so the memcpy
+               // carries them verbatim. Only EXTERNAL children are re-pointed to clones;
+               // inline branches stay as the memcpy left them.
+               const setlist* S = static_cast<const setlist*>(src.deref_(s));
+               setlist*       D = ::new (node_alloc_(sizeof(setlist))) setlist;
+               std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), SL_LINE);
+               const int nb = S->rh.hdr.nbranch;
+               D->rh.term   = packed_ptr::null();
+               for (int i = 0; i < nb; ++i)
+                  if (!sl_is_inline(S, i)) D->branch[i] = packed_ptr::null();  // null before throws
+               packed_ptr  dp = pack_(D, K::setlist_u8);
+               build_guard g{this, &dp};
+               D->rh.term = clone_walk_(src, S->rh.term);
+               for (int i = 0; i < nb; ++i)
+                  if (!sl_is_inline(S, i)) D->branch[i] = clone_walk_(src, S->branch[i]);
+               g.release();
+               return dp;
+            }
             case K::pfxd:  // full body + in-header prefix; the memcpy carries both
                return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
             case K::c2:
@@ -4615,6 +4949,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             }
             case K::setlist_u8:
+            {
+               setlist* s = static_cast<setlist*>(deref_(cur));
+               free_all_(s->rh.term);
+               const int n = s->rh.hdr.nbranch;
+               for (int i = 0; i < n; ++i)
+                  if (!sl_is_inline(s, i)) free_all_(s->branch[i]);  // inline leaves ride the line
+               node_free_(s, node_size(K::setlist_u8));
+               return;
+            }
             case K::setlist_u16:
             case K::c2:
             case K::c4:
