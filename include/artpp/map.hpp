@@ -69,24 +69,41 @@ namespace detail  // implementation types & node helpers — not part of the pub
    // Carries a short shared prefix INLINE (rh.hdr.prefix_len bytes, in the trailing
    // `prefix` field) so a path-compressed run does NOT cost a separate prefix_node
    // hop — measured: dict shared prefixes avg <2 bytes and 99.9% are <=8, so this
-   // removes essentially all prefix_node pointer-chases. bytes[]/branch[] keep their
-   // offsets (the SIMD scan is unchanged); the prefix lives in the old pad bytes.
+   // removes essentially all prefix_node pointer-chases.
+   //
+   // INLINE CHILDREN (`inl` byte): a setlist can host small leaf children INSIDE its
+   // own 128-byte line instead of as separate terminal allocations. `inl` bit 7 =
+   // "inline mode active"; bits 0..6 flag, per branch 0..6, whether branch[i] is an
+   // INLINE leaf — its handle then holds a tail-offset (resolve at line+128-offset),
+   // not a pool address. The leaf bytes live in the line's free region, which is one
+   // contiguous block [&branch[nbranch], line+128): members are ordered so the unused
+   // branch slots abut the line tail. Inline payloads pack against the tail (offset
+   // 128), growing down, in ascending branch-index order — a CANONICAL layout
+   // re-established after every structural change (sl_repack_). A key terminating
+   // under an inline branch costs NO extra cacheline — the leaf shares the line the
+   // descent already loaded. Only setlist_u8 does this (other tiers leave inl == 0).
    template <class Ptr>
    struct setlist_t
    {
-      static constexpr int PREFIX_CAP = 8;
+      static constexpr int PREFIX_CAP = 7;   // was 8; the `inl` byte reclaims one, keeping
+                                             // CAP at 16 for BOTH handles (no widen-point shift).
+                                             // 7 still covers ~all runs; an 8-byte one takes a pn.
       static constexpr int LANES      = 16;  // stem lanes the SIMD scans read; [CAP..LANES) stay 0xFF
-      // one cacheline: header + LANES stems + CAP branches + PREFIX_CAP. Derived from sizeof(Ptr).
-      static constexpr int CAP =
-          std::min(LANES, (int(cacheline_bytes) - int(sizeof(router_hdr_t<Ptr>)) - PREFIX_CAP - LANES) /
-                              int(sizeof(Ptr)));  // 16 at 6B
+      // CAP derived so the struct fits one line WITH the `inl` byte. branch[] is LAST
+      // so the unused slots [nbranch..CAP) plus the line tail [sizeof..128) form one
+      // contiguous inline region growing down from the tail.
+      static constexpr int CAP = std::min(
+          LANES, (int(cacheline_bytes) - int(sizeof(router_hdr_t<Ptr>)) - 1 - PREFIX_CAP - LANES) /
+                     int(sizeof(Ptr)));  // 16 at both 4B and 6B
       router_hdr_t<Ptr>    rh;
+      uint8_t              inl;                 // bit7 inline-active; bits0-6 per-branch inline flag
       uint8_t              bytes[LANES];
-      Ptr                  branch[CAP];
-      uint8_t              prefix[PREFIX_CAP];  // rh.hdr.prefix_len bytes used
+      uint8_t              prefix[PREFIX_CAP];   // rh.hdr.prefix_len bytes used (moved before branch)
+      Ptr                  branch[CAP];          // LAST: tail past branch[nbranch] is the inline region
    };
    using setlist = setlist_t<packed_ptr>;
-   static_assert(sizeof(setlist) == 128, "setlist is one cacheline");
+   static_assert(sizeof(setlist) <= 128, "setlist fits one cacheline (tail is the inline region)");
+   static_assert(offsetof(setlist_t<packed_ptr>, branch) % 1 == 0, "branch handles are unaligned-safe");
 
    // Stems are kept SORTED ascending; unused lanes are padded with 0xFF (the max
    // byte). That makes this container ordered (lower_bound / range scans work) AND
@@ -3789,6 +3806,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          setlist* s = ::new (node_alloc_(sizeof(setlist))) setlist;
          s->rh.hdr  = node_hdr{0, 0, 0};
          s->rh.term = packed_ptr::null();
+         s->inl     = 0;  // no inline children yet
          std::memset(s->bytes, 0xFF, sizeof(s->bytes));  // pad unused lanes with max for sorted SIMD lower_bound
          return s;
       }

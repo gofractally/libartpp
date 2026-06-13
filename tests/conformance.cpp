@@ -604,9 +604,10 @@ static void test_equality()
       CHECK(s != w);
       w.update(key('c'), uint64_t('c'));
       CHECK(s == w);
-      // erase down to 12: the wide node de-widens (carrying its fused prefix into the
-      // setlist's inline slot); both setlists → the fast path again
-      for (char c = 'a' + 12; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }
+      // erase well below the de-widen threshold (SHRINK_MAX = setlist CAP - 4): the
+      // wide node de-widens (carrying its fused prefix into the setlist's inline slot);
+      // both setlists → the fast path again
+      for (char c = 'a' + 8; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }
       CHECK(w.debug_stats().full == 0 && w.debug_stats().fullp == 0);
       CHECK(s == w);
    }
