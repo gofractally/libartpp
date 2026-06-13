@@ -116,7 +116,7 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <div class="stat"><div class="n">1.2–2.0×</div><div class="l">faster point lookups than the original libart — on all four workloads (plain radix): 2.0× sequential, 1.37× uniform, 1.32× clustered, 1.18× dictionary</div></div>
     <div class="stat"><div class="n">1.9–4.3×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
     <div class="stat"><div class="n">2.1–7.6×</div><div class="l">faster point lookups than std::map</div></div>
-    <div class="stat"><div class="n">0</div><div class="l">extra cachelines for a small leaf — it shares the line of the setlist that routes to it</div></div>
+    <div class="stat"><div class="n">1.2–1.6×</div><div class="l">faster <code>lower_bound</code> than absl::btree_map on clustered &amp; integer keys — an ordered query libart has no API for</div></div>
   </div>
 
   <h3 style="margin:38px 0 14px">Point lookups <span style="color:var(--muted);font-weight:400">(the operation maps exist for)</span></h3>
@@ -127,17 +127,30 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <div class="fig"><img src="charts/sequential_hit.svg" alt="Point lookup latency, sequential uint64: artpp 19ns, libart 39ns, btree 84ns, std::map 156ns"></div>
   </div>
   <p class="method">
-    Two case studies in counting cachelines, both ending in a win. <b>Sequential
-    integers</b> are now <b>2.0× faster than libart</b> (19 vs 39 ns): the in-header
-    prefix deleted the one extra descent hop, and the two-region allocator keeps the
-    leaves dense. <b>Uniform random integers</b> reach <b>1.37×</b> (31 vs 43 ns) —
-    the routers were already headerless and one-line-per-hop, so the lever was the
-    terminal: a million single-value leaves once spread across a 122 MB working set,
-    now packed into a <b>16-byte-aligned terminal region</b> (~16 MB, SLC-resident).
-    On the string workloads the same idea moves up a level: a small leaf rides
-    <b>inside the routing setlist's own cacheline</b>, so dictionary lookups land
-    <b>1.18×</b> and clustered <b>1.32×</b> faster than libart. Same invariant
-    throughout: spend lines where the entropy is.
+    Every lookup costs the cachelines its descent touches — and artpp is built so each
+    level of descent touches at most one cold line: the node kind is in the tagged
+    pointer (no header read to route), a compressed run lives in that line instead of a
+    separate node, and a small leaf can ride in the routing node's own line rather than
+    a line of its own. Against libart that's <b>2.0×</b> on sequential integers,
+    <b>1.37×</b> uniform, <b>1.32×</b> clustered, and <b>1.18×</b> on dictionary words;
+    against the comparison-based maps, 1.9–4.3× over <code>absl::btree_map</code> and
+    2.1–7.6× over <code>std::map</code>.
+  </p>
+
+  <h3 style="margin:38px 0 14px"><code>lower_bound</code> <span style="color:var(--muted);font-weight:400">(the ordered query a hash map can't answer — and libart has no API for)</span></h3>
+  <div class="figs">
+    <div class="fig"><img src="charts/clustered_lbound.svg" alt="lower_bound, clustered strings: artpp 155ns, btree 232ns, std::map 261ns, libart unsupported"></div>
+    <div class="fig"><img src="charts/uniform_lbound.svg" alt="lower_bound, uniform uint64: artpp 68ns, btree 85ns, std::map 142ns, libart unsupported"></div>
+  </div>
+  <p class="method">
+    Positioning to the next-greater key (predecessor/successor, range starts) is what
+    an <i>ordered</i> map is for — and it's the line where the field thins out: a hash
+    map can't do it at all, and <b>upstream libart exposes no <code>lower_bound</code>
+    either</b> (shown as unsupported above). Among the containers that can, artpp leads:
+    <b>1.5× faster than <code>absl::btree_map</code></b> on clustered strings, 1.24× on
+    uniform and 1.6× on sequential integers, and on par on dictionary words — versus
+    <code>std::map</code>, up to 2.1×. The descent is the same shape as a point lookup,
+    so the same one-line-per-level economics apply.
   </p>
 
   <h3 style="margin:38px 0 14px">Inserts <span style="color:var(--muted);font-weight:400">(build time is allocator-bound — so compare the allocator)</span></h3>
@@ -148,9 +161,10 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <p class="method">
     A bulk build is dominated by where the nodes come from, so the honest insert
     comparison holds the tree fixed and swaps the allocator. The flagship
-    <code>line_pool</code> (bump placement, children next to parents) builds the same
-    tree <b>1.1–1.4× faster than <code>std::allocator</code></b> — that's the
-    allocator's contribution, cleanly isolated (both rows are on every insert chart).
+    <code>line_pool</code> — a contiguous reservation handed out by a bump frontier with
+    exact-size free lists, no per-node <code>malloc</code> — builds the same tree
+    <b>1.1–1.4× faster than <code>std::allocator</code></b>, the allocator's
+    contribution cleanly isolated (both rows are on every insert chart).
     Held to the <i>same</i> malloc class, artpp and libart build at similar rates:
     artpp leads on sequential and runs even on clustered, and libart's flatter node
     growth leads on the deeply-shared dictionary, where a radix does the most splitting
@@ -205,10 +219,10 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
         <td>a leaf that fits goes <b>inside the routing node's cacheline</b> — the byte
         that selects it and the value it yields are one line, so the lookup ends without
         a second load (the 1-byte <code>inl</code> header flags which children are inline)</td></tr>
-    <tr><td>Leaf storage</td><td>~32 B mallocs, header read per probe</td>
-        <td>a dedicated <b>16-byte-aligned terminal region</b> — the tag carries the
-        4 bits a terminal pointer needs, so leaves pay no line-alignment tax and the
-        terminal working set stays cache-resident</td></tr>
+    <tr><td>Leaf storage</td><td>one <code>malloc</code> per leaf</td>
+        <td>a dedicated <b>16-byte-granular terminal region</b> — the tag carries the
+        4 bits a terminal pointer needs, so a leaf is sized to its payload instead of
+        rounded up to a node-sized block</td></tr>
     <tr><td>Path compression</td><td>per-node prefix read with the header on
         <i>every</i> hop</td>
         <td>prefix fused into the header line, read <b>only when the pointer tag says
@@ -230,8 +244,8 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
         point — zero leaks, no double-destroys</td></tr>
     <tr><td>Structure</td><td>one fixed node ladder (4/16/48/256)</td>
         <td>selectable modes per workload: <code>buckets</code> packs key tails into
-        cacheline pages (the 99 ns dictionary number), <code>dense_tiers</code> and
-        <code>wide_stems</code> trade footprint vs hop depth — same semantics, same tests</td></tr>
+        cacheline pages (the fastest dictionary lookups here), <code>dense_tiers</code>
+        and <code>wide_stems</code> trade footprint vs hop depth — same semantics, same tests</td></tr>
   </table>
 </section>
 

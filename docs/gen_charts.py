@@ -39,6 +39,10 @@ TITLES = {
     ("clustered", "scan"): "Full ordered scan — clustered strings",
     ("uniform", "scan"): "Full ordered scan — uniform uint64",
     ("sequential", "scan"): "Full ordered scan — sequential uint64",
+    ("dict", "lbound"): "lower_bound — dictionary words (positions to next-greater key)",
+    ("clustered", "lbound"): "lower_bound — clustered strings",
+    ("uniform", "lbound"): "lower_bound — uniform random uint64",
+    ("sequential", "lbound"): "lower_bound — sequential uint64",
 }
 
 
@@ -46,11 +50,13 @@ def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def chart(title: str, rows: list[tuple[str, float]], out: Path) -> None:
+def chart(title: str, rows: list[tuple[str, float | None]], out: Path) -> None:
+    # rows: (name, ns) — ns None means the contestant has no API for this op
+    # (rendered as "unsupported", no bar) so the gap is visible, not hidden.
     pad_l, pad_r, bar_h, gap, top = 190, 86, 30, 14, 54
     width = 760
     height = top + len(rows) * (bar_h + gap) + 16
-    vmax = max(v for _, v in rows)
+    vmax = max((v for _, v in rows if v is not None), default=1.0)
     span = width - pad_l - pad_r
     p = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
@@ -66,14 +72,24 @@ def chart(title: str, rows: list[tuple[str, float]], out: Path) -> None:
     ]
     for i, (name, v) in enumerate(rows):
         y = top + i * (bar_h + gap)
-        w = max(3.0, span * v / vmax)
-        fill = ACCENT.get(name) or GRAY.get(name, "#4a5a73")
         weight = "600" if name in ACCENT else "400"
         col = "#e6edf6" if name in ACCENT else "#b7c5d8"
         p.append(
             f'<text x="{pad_l - 10}" y="{y + bar_h / 2 + 4}" font-size="13" font-weight="{weight}" '
             f'fill="{col}" text-anchor="end">{esc(name)}</text>'
         )
+        if v is None:  # no API for this operation
+            p.append(
+                f'<rect x="{pad_l}" y="{y}" width="{span}" height="{bar_h}" rx="6" fill="none" '
+                f'stroke="#2e4f7a" stroke-width="1.5" stroke-dasharray="5 4"/>'
+            )
+            p.append(
+                f'<text x="{pad_l + span / 2}" y="{y + bar_h / 2 + 4}" font-size="12.5" '
+                f'fill="#7587a3" text-anchor="middle" font-style="italic">no lower_bound API — unsupported</text>'
+            )
+            continue
+        w = max(3.0, span * v / vmax)
+        fill = ACCENT.get(name) or GRAY.get(name, "#4a5a73")
         p.append(f'<rect x="{pad_l}" y="{y}" width="{w:.1f}" height="{bar_h}" rx="6" fill="{fill}"/>')
         p.append(
             f'<text x="{pad_l + w + 8}" y="{y + bar_h / 2 + 4}" font-size="13" '
@@ -94,7 +110,11 @@ def main() -> None:
     for key, title in TITLES.items():
         if key not in data:
             continue
-        rows = [(c, data[key][c]) for c in ORDER if c in data[key]]
+        present = data[key]
+        # lower_bound charts list every contestant; ones with no row are "unsupported"
+        # (libart has no ordered-positioning API). Other ops only show contestants present.
+        names = ORDER if key[1] == "lbound" else [c for c in ORDER if c in present]
+        rows = [(c, present.get(c)) for c in names]
         chart(title, rows, outdir / f"{key[0]}_{key[1]}.svg")
         made += 1
     print(f"wrote {made} charts to {outdir}")

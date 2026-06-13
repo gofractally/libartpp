@@ -35,6 +35,11 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const
+      {
+         auto it = m.lower_bound(k);
+         return it == m.end() ? 0 : it.value();
+      }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -53,6 +58,11 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const
+      {
+         auto it = m.lower_bound(k);
+         return it == m.end() ? 0 : it.value();
+      }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -69,6 +79,11 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const
+      {
+         auto it = m.lower_bound(k);
+         return it == m.end() ? 0 : it.value();
+      }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -120,6 +135,7 @@ namespace artpp_bench
       using key_type = std::string_view;
       static const char* name() { return "absl::btree_map"; }
       absl::btree_map<std::string, uint64_t, std::less<>> m;  // heterogeneous lookup
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it->second; }
       void     insert(key_type k, uint64_t v) { m.insert_or_assign(std::string(k), v); }
       bool     find(key_type k, uint64_t& out) const
       {
@@ -148,6 +164,7 @@ namespace artpp_bench
       using key_type = std::string_view;
       static const char* name() { return "std::map"; }
       std::map<std::string, uint64_t, std::less<>> m;
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it->second; }
       void     insert(key_type k, uint64_t v) { m.insert_or_assign(std::string(k), v); }
       bool     find(key_type k, uint64_t& out) const
       {
@@ -182,6 +199,7 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it.value(); }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -200,6 +218,7 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it.value(); }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -216,6 +235,7 @@ namespace artpp_bench
       void     insert(key_type k, uint64_t v) { m.insert(k, v); }
       bool     find(key_type k, uint64_t& out) const { return m.find(k, out); }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it.value(); }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -283,6 +303,7 @@ namespace artpp_bench
          return true;
       }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it->second; }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;
@@ -305,6 +326,7 @@ namespace artpp_bench
          return true;
       }
       bool     erase(key_type k) { return m.erase(k) != 0; }
+      uint64_t lower_bound_val(key_type k) const { auto it = m.lower_bound(k); return it == m.end() ? 0 : it->second; }
       uint64_t scan_sum() const
       {
          uint64_t s = 0;

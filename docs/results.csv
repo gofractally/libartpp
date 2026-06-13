@@ -1,121 +1,141 @@
 contestant,workload,op,n,ns_per_op
-artpp::map,dict,insert,235976,97.18
-artpp::map,dict,hit,235976,89.29
-artpp::map,dict,miss,235976,35.87
-artpp::map,dict,scan,1179880,7.38
-artpp::map,dict,erase,117988,150.88
-artpp::map<buckets>,dict,insert,235976,87.98
-artpp::map<buckets>,dict,hit,235976,76.79
-artpp::map<buckets>,dict,miss,235976,34.87
-artpp::map<buckets>,dict,scan,1179880,2.58
-artpp::map<buckets>,dict,erase,117988,145.48
-artpp::map (std::allocator),dict,insert,235976,109.33
-artpp::map (std::allocator),dict,hit,235976,94.88
-artpp::map (std::allocator),dict,miss,235976,37.04
-artpp::map (std::allocator),dict,scan,1179880,7.43
-artpp::map (std::allocator),dict,erase,117988,171.09
-libart,dict,insert,235976,74.19
-libart,dict,hit,235976,105.62
-libart,dict,miss,235976,46.98
-libart,dict,scan,1179880,5.59
-libart,dict,erase,117988,170.55
-absl::btree_map,dict,insert,235976,68.73
-absl::btree_map,dict,hit,235976,172.27
-absl::btree_map,dict,miss,235976,74.39
-absl::btree_map,dict,scan,1179880,0.89
-absl::btree_map,dict,erase,117988,198.14
-std::map,dict,insert,235976,116.84
-std::map,dict,hit,235976,191.36
-std::map,dict,miss,235976,75.41
-std::map,dict,scan,1179880,4.35
-std::map,dict,erase,117988,265.18
-artpp::map,clustered,insert,884615,143.74
-artpp::map,clustered,hit,884615,106.99
-artpp::map,clustered,miss,884615,84.25
-artpp::map,clustered,scan,4423075,15.83
-artpp::map,clustered,erase,442308,238.27
-artpp::map<buckets>,clustered,insert,884615,177.23
-artpp::map<buckets>,clustered,hit,884615,144.94
-artpp::map<buckets>,clustered,miss,884615,117.59
-artpp::map<buckets>,clustered,scan,4423075,6.46
-artpp::map<buckets>,clustered,erase,442308,228.67
-artpp::map (std::allocator),clustered,insert,884615,167.69
-artpp::map (std::allocator),clustered,hit,884615,108.28
-artpp::map (std::allocator),clustered,miss,884615,84.59
-artpp::map (std::allocator),clustered,scan,4423075,15.78
-artpp::map (std::allocator),clustered,erase,442308,231.22
-libart,clustered,insert,884615,168.42
-libart,clustered,hit,884615,141.47
-libart,clustered,miss,884615,98.52
-libart,clustered,scan,4423075,14.08
-libart,clustered,erase,442308,235.11
-absl::btree_map,clustered,insert,884615,240.62
-absl::btree_map,clustered,hit,884615,252.23
-absl::btree_map,clustered,miss,884615,228.39
-absl::btree_map,clustered,scan,4423075,8.90
-absl::btree_map,clustered,erase,442308,291.41
-std::map,clustered,insert,884615,345.13
-std::map,clustered,hit,884615,397.56
-std::map,clustered,miss,884615,264.67
-std::map,clustered,scan,4423075,58.50
-std::map,clustered,erase,442308,541.41
-artpp::map,uniform,insert,1000000,43.53
-artpp::map,uniform,hit,1000000,31.53
-artpp::map,uniform,miss,1000000,11.40
-artpp::map,uniform,scan,5000000,13.29
-artpp::map,uniform,erase,500000,95.27
-artpp::map<buckets>,uniform,insert,1000000,54.80
-artpp::map<buckets>,uniform,hit,1000000,32.42
-artpp::map<buckets>,uniform,miss,1000000,25.17
-artpp::map<buckets>,uniform,scan,5000000,2.92
-artpp::map<buckets>,uniform,erase,500000,124.35
-artpp::map (std::allocator),uniform,insert,1000000,60.79
-artpp::map (std::allocator),uniform,hit,1000000,35.69
-artpp::map (std::allocator),uniform,miss,1000000,14.36
-artpp::map (std::allocator),uniform,scan,5000000,18.02
-artpp::map (std::allocator),uniform,erase,500000,136.41
-libart,uniform,insert,1000000,53.62
-libart,uniform,hit,1000000,43.22
-libart,uniform,miss,1000000,16.99
-libart,uniform,scan,5000000,11.79
-libart,uniform,erase,500000,121.09
-absl::btree_map,uniform,insert,1000000,97.30
-absl::btree_map,uniform,hit,1000000,91.23
-absl::btree_map,uniform,miss,1000000,88.94
-absl::btree_map,uniform,scan,5000000,2.61
-absl::btree_map,uniform,erase,500000,109.78
-std::map,uniform,insert,1000000,206.89
-std::map,uniform,hit,1000000,172.44
-std::map,uniform,miss,1000000,163.76
-std::map,uniform,scan,5000000,53.76
-std::map,uniform,erase,500000,371.98
-artpp::map,sequential,insert,1000000,10.83
-artpp::map,sequential,hit,1000000,19.44
-artpp::map,sequential,miss,1000000,5.38
-artpp::map,sequential,scan,5000000,1.58
-artpp::map,sequential,erase,500000,49.38
-artpp::map<buckets>,sequential,insert,1000000,38.89
-artpp::map<buckets>,sequential,hit,1000000,50.46
-artpp::map<buckets>,sequential,miss,1000000,5.36
-artpp::map<buckets>,sequential,scan,5000000,8.94
-artpp::map<buckets>,sequential,erase,500000,100.49
-artpp::map (std::allocator),sequential,insert,1000000,14.88
-artpp::map (std::allocator),sequential,hit,1000000,18.43
-artpp::map (std::allocator),sequential,miss,1000000,4.76
-artpp::map (std::allocator),sequential,scan,5000000,1.86
-artpp::map (std::allocator),sequential,erase,500000,65.04
-libart,sequential,insert,1000000,19.51
-libart,sequential,hit,1000000,39.23
-libart,sequential,miss,1000000,5.30
-libart,sequential,scan,5000000,1.52
-libart,sequential,erase,500000,90.99
-absl::btree_map,sequential,insert,1000000,30.14
-absl::btree_map,sequential,hit,1000000,84.07
-absl::btree_map,sequential,miss,1000000,26.41
-absl::btree_map,sequential,scan,5000000,0.73
-absl::btree_map,sequential,erase,500000,116.01
-std::map,sequential,insert,1000000,78.29
-std::map,sequential,hit,1000000,148.25
-std::map,sequential,miss,1000000,21.19
-std::map,sequential,scan,5000000,3.74
-std::map,sequential,erase,500000,374.72
+artpp::map,dict,insert,235976,107.95
+artpp::map,dict,hit,235976,88.92
+artpp::map,dict,miss,235976,36.01
+artpp::map,dict,lbound,235976,73.49
+artpp::map,dict,scan,1179880,7.30
+artpp::map,dict,erase,117988,168.93
+artpp::map<buckets>,dict,insert,235976,88.76
+artpp::map<buckets>,dict,hit,235976,78.22
+artpp::map<buckets>,dict,miss,235976,35.43
+artpp::map<buckets>,dict,lbound,235976,66.20
+artpp::map<buckets>,dict,scan,1179880,2.59
+artpp::map<buckets>,dict,erase,117988,159.02
+artpp::map (std::allocator),dict,insert,235976,108.22
+artpp::map (std::allocator),dict,hit,235976,92.72
+artpp::map (std::allocator),dict,miss,235976,37.44
+artpp::map (std::allocator),dict,lbound,235976,77.04
+artpp::map (std::allocator),dict,scan,1179880,7.47
+artpp::map (std::allocator),dict,erase,117988,183.87
+libart,dict,insert,235976,76.36
+libart,dict,hit,235976,114.82
+libart,dict,miss,235976,47.39
+libart,dict,scan,1179880,6.15
+libart,dict,erase,117988,186.58
+absl::btree_map,dict,insert,235976,68.19
+absl::btree_map,dict,hit,235976,188.80
+absl::btree_map,dict,miss,235976,75.37
+absl::btree_map,dict,lbound,235976,72.28
+absl::btree_map,dict,scan,1179880,1.05
+absl::btree_map,dict,erase,117988,228.71
+std::map,dict,insert,235976,123.00
+std::map,dict,hit,235976,221.59
+std::map,dict,miss,235976,74.01
+std::map,dict,lbound,235976,71.42
+std::map,dict,scan,1179880,5.45
+std::map,dict,erase,117988,285.65
+artpp::map,clustered,insert,884615,143.38
+artpp::map,clustered,hit,884615,103.31
+artpp::map,clustered,miss,884615,79.33
+artpp::map,clustered,lbound,884615,154.61
+artpp::map,clustered,scan,4423075,13.80
+artpp::map,clustered,erase,442308,214.54
+artpp::map<buckets>,clustered,insert,884615,171.42
+artpp::map<buckets>,clustered,hit,884615,136.43
+artpp::map<buckets>,clustered,miss,884615,110.14
+artpp::map<buckets>,clustered,lbound,884615,181.25
+artpp::map<buckets>,clustered,scan,4423075,6.49
+artpp::map<buckets>,clustered,erase,442308,217.12
+artpp::map (std::allocator),clustered,insert,884615,171.09
+artpp::map (std::allocator),clustered,hit,884615,112.82
+artpp::map (std::allocator),clustered,miss,884615,83.05
+artpp::map (std::allocator),clustered,lbound,884615,158.87
+artpp::map (std::allocator),clustered,scan,4423075,15.95
+artpp::map (std::allocator),clustered,erase,442308,212.88
+libart,clustered,insert,884615,155.98
+libart,clustered,hit,884615,137.61
+libart,clustered,miss,884615,92.64
+libart,clustered,scan,4423075,12.75
+libart,clustered,erase,442308,212.01
+absl::btree_map,clustered,insert,884615,236.70
+absl::btree_map,clustered,hit,884615,250.07
+absl::btree_map,clustered,miss,884615,242.60
+absl::btree_map,clustered,lbound,884615,231.51
+absl::btree_map,clustered,scan,4423075,6.84
+absl::btree_map,clustered,erase,442308,282.58
+std::map,clustered,insert,884615,342.69
+std::map,clustered,hit,884615,358.16
+std::map,clustered,miss,884615,267.39
+std::map,clustered,lbound,884615,261.26
+std::map,clustered,scan,4423075,52.01
+std::map,clustered,erase,442308,525.24
+artpp::map,uniform,insert,1000000,42.17
+artpp::map,uniform,hit,1000000,52.09
+artpp::map,uniform,miss,1000000,9.79
+artpp::map,uniform,lbound,1000000,68.34
+artpp::map,uniform,scan,5000000,12.70
+artpp::map,uniform,erase,500000,92.00
+artpp::map<buckets>,uniform,insert,1000000,59.44
+artpp::map<buckets>,uniform,hit,1000000,35.98
+artpp::map<buckets>,uniform,miss,1000000,24.96
+artpp::map<buckets>,uniform,lbound,1000000,75.37
+artpp::map<buckets>,uniform,scan,5000000,2.70
+artpp::map<buckets>,uniform,erase,500000,111.27
+artpp::map (std::allocator),uniform,insert,1000000,55.51
+artpp::map (std::allocator),uniform,hit,1000000,31.00
+artpp::map (std::allocator),uniform,miss,1000000,11.81
+artpp::map (std::allocator),uniform,lbound,1000000,83.52
+artpp::map (std::allocator),uniform,scan,5000000,15.39
+artpp::map (std::allocator),uniform,erase,500000,117.47
+libart,uniform,insert,1000000,48.83
+libart,uniform,hit,1000000,38.24
+libart,uniform,miss,1000000,15.10
+libart,uniform,scan,5000000,10.61
+libart,uniform,erase,500000,110.65
+absl::btree_map,uniform,insert,1000000,97.63
+absl::btree_map,uniform,hit,1000000,87.42
+absl::btree_map,uniform,miss,1000000,85.03
+absl::btree_map,uniform,lbound,1000000,84.47
+absl::btree_map,uniform,scan,5000000,2.36
+absl::btree_map,uniform,erase,500000,106.15
+std::map,uniform,insert,1000000,193.89
+std::map,uniform,hit,1000000,146.90
+std::map,uniform,miss,1000000,142.09
+std::map,uniform,lbound,1000000,142.09
+std::map,uniform,scan,5000000,46.64
+std::map,uniform,erase,500000,330.18
+artpp::map,sequential,insert,1000000,10.87
+artpp::map,sequential,hit,1000000,15.81
+artpp::map,sequential,miss,1000000,4.81
+artpp::map,sequential,lbound,1000000,15.29
+artpp::map,sequential,scan,5000000,1.55
+artpp::map,sequential,erase,500000,45.74
+artpp::map<buckets>,sequential,insert,1000000,38.32
+artpp::map<buckets>,sequential,hit,1000000,41.11
+artpp::map<buckets>,sequential,miss,1000000,5.19
+artpp::map<buckets>,sequential,lbound,1000000,23.73
+artpp::map<buckets>,sequential,scan,5000000,8.55
+artpp::map<buckets>,sequential,erase,500000,91.33
+artpp::map (std::allocator),sequential,insert,1000000,14.18
+artpp::map (std::allocator),sequential,hit,1000000,17.61
+artpp::map (std::allocator),sequential,miss,1000000,4.27
+artpp::map (std::allocator),sequential,lbound,1000000,15.34
+artpp::map (std::allocator),sequential,scan,5000000,1.85
+artpp::map (std::allocator),sequential,erase,500000,63.17
+libart,sequential,insert,1000000,18.65
+libart,sequential,hit,1000000,34.92
+libart,sequential,miss,1000000,4.92
+libart,sequential,scan,5000000,1.59
+libart,sequential,erase,500000,73.75
+absl::btree_map,sequential,insert,1000000,27.77
+absl::btree_map,sequential,hit,1000000,76.95
+absl::btree_map,sequential,miss,1000000,24.26
+absl::btree_map,sequential,lbound,1000000,24.41
+absl::btree_map,sequential,scan,5000000,0.70
+absl::btree_map,sequential,erase,500000,99.59
+std::map,sequential,insert,1000000,76.59
+std::map,sequential,hit,1000000,127.24
+std::map,sequential,miss,1000000,20.07
+std::map,sequential,lbound,1000000,18.89
+std::map,sequential,scan,5000000,3.43
+std::map,sequential,erase,500000,281.84

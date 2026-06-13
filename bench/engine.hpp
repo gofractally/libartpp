@@ -101,6 +101,25 @@ namespace artpp_bench
          results().push_back(row{C::name(), workload, "miss", misses.size(), best});
          if (found) std::fprintf(stderr, "MISS SET NOT DISJOINT %s/%s\n", C::name(), workload);
       }
+      // lower_bound — ordered positioning to the next-greater key. The query keys are
+      // ABSENT (the miss set), so every call must walk to a successor: this is the
+      // operation an ordered map has and a hash map cannot, and which libart (the C
+      // ART) does not provide — so only the ordered contestants produce a row.
+      if constexpr (requires(const C& cc, Key kk) { cc.lower_bound_val(kk); })
+      {
+         uint64_t sink = 0;
+         double   best = 1e30;
+         for (int r = 0; r < scan_reps; ++r)
+         {
+            uint64_t     s  = 0;
+            const double t0 = now_ns();
+            for (const Key& k : misses) s += c.lower_bound_val(k);
+            best = std::min(best, (now_ns() - t0) / double(misses.size()));
+            sink ^= s;
+         }
+         results().push_back(row{C::name(), workload, "lbound", misses.size(), best});
+         g_sink ^= sink;
+      }
       {  // full ordered scans
          uint64_t     total = 0;
          const double t0    = now_ns();
