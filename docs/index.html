@@ -308,14 +308,16 @@ m.<span class="f">insert</span>( 7, <span class="s">"positive"</span>);    <span
     log(k, v);</code></pre>
     </div>
     <div class="cell">
-      <h3>Structs as keys, via psio</h3>
-<pre><code><span class="k">struct</span> <span class="t">point</span> { <span class="t">double</span> x, y; };
-<span class="f">PSIO_REFLECT</span>(point, x, y)
-<span class="f">ARTPP_PSIO_KEY</span>(point)
+      <h3>Floating-point keys do too — via psio</h3>
+<pre><code><span class="f">ARTPP_PSIO_KEY</span>(<span class="t">double</span>)        <span class="c">// order-preserving codec, one macro</span>
 
-<span class="t">artpp::map</span>&lt;<span class="t">point</span>, <span class="t">std::string</span>&gt; m;
-m.<span class="f">insert</span>({1.5, -2.0}, <span class="s">"a"</span>);   <span class="c">// ordered by (x, y),</span>
-                              <span class="c">// numerically — doubles too</span></code></pre>
+<span class="t">artpp::map</span>&lt;<span class="t">double</span>, <span class="t">std::string</span>&gt; m;
+m.<span class="f">insert</span>(-3.5, <span class="s">"a"</span>);          <span class="c">// IEEE sign-transform: byte</span>
+m.<span class="f">insert</span>( 0.0, <span class="s">"b"</span>);          <span class="c">// order becomes numeric</span>
+m.<span class="f">insert</span>( 2.25, <span class="s">"c"</span>);         <span class="c">// order — negatives and all</span>
+<span class="k">for</span> (<span class="k">const auto</span>&amp; [k, v] : m) <span class="c">// → -3.5, 0.0, 2.25</span>
+    log(k, v);
+<span class="c">// reflected structs, optionals, variants key the same way</span></code></pre>
     </div>
     <div class="cell">
       <h3>File-backed, 4-byte branches</h3>

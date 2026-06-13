@@ -110,6 +110,15 @@ if(ARTPP_BENCHMARKS)
    target_compile_options(artpp_bench PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
    set_target_properties(artpp_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+   # double-keyed comparison (needs psio's order-preserving key codec): demonstrates
+   # artpp::map<double> vs std::map<double> vs absl::btree_map<double>. Only when psio is on.
+   if(ARTPP_WITH_PSIO)
+      add_executable(artpp_bench_double bench/bench_double.cpp)
+      target_link_libraries(artpp_bench_double PRIVATE artpp psio absl::btree)
+      target_compile_options(artpp_bench_double PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+      set_target_properties(artpp_bench_double PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   endif()
+
    # memory footprint probe: bytes/key per contestant per distribution (run alone)
    add_executable(artpp_mem_probe bench/mem_probe.cpp)
    target_link_libraries(artpp_mem_probe PRIVATE artpp artpp_vendor_libart absl::btree)
