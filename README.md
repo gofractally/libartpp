@@ -505,3 +505,25 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 | `artpp_exception_safety` | Exception safety under systematic fault injection (throwing values + failing allocator at every allocation point), leak/corruption/double-destroy counters vs a `std::map` oracle |
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
 | `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`) double / reflected-struct / optional keys vs `std::map` ordering oracles |
+| `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
+| `artpp_fuzz_map` | differential fuzzer vs `std::map` — every op mirrored on both, full forward/reverse/bound/size agreement; standalone seeded RNG runner (also replays corpus files) |
+
+### Fuzzing
+
+`artpp_fuzz_map` is dual-mode. As the ctest binary above it is a deterministic, seeded random
+runner over `std::map` as the oracle. Built with `-DARTPP_FUZZER=ON` (needs a libFuzzer-capable
+clang — e.g. Homebrew `llvm`; the build probes for the runtime and skips otherwise) it is a
+**coverage-guided libFuzzer target** under ASan+UBSan:
+
+```sh
+cmake -B build -DARTPP_FUZZER=ON && cmake --build build --target artpp_fuzzer
+./build/bin/artpp_fuzzer -max_total_time=60        # or pass a corpus dir
+./build/bin/artpp_fuzz_map <corpus-or-crash-file>  # replay a reproducer in the default toolchain
+```
+
+The first input byte selects the config so one corpus exercises every mode (flat / dense_tiers /
++ladder_c8 / buckets / adaptive / wide_stems), the `line_pool` allocator, and a `std::string` value
+(external leaves). Keys are drawn from a small alphabet and a recently-used key pool (extend /
+truncate / mutate a prior key) to manufacture the shared prefixes and wide fan-out that drive the
+split / widen-ladder / bucket-burst / de-widen transitions; any divergence aborts with the input
+bytes for replay.

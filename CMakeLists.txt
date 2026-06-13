@@ -23,6 +23,7 @@ endif()
 option(ARTPP_TESTS      "Build artpp tests"                          ${ARTPP_TOPLEVEL})
 option(ARTPP_BENCHMARKS "Build benchmark/compare suite (libart, absl::btree)" OFF)
 option(ARTPP_WITH_PSIO  "Enable the psio key-format codec adapter"   OFF)
+option(ARTPP_FUZZER     "Build the coverage-guided libFuzzer target (-fsanitize=fuzzer)" OFF)
 set(ARTPP_PSIO_SOURCE_DIR "" CACHE PATH "Existing psio checkout (repo root) to use instead of fetching")
 
 # ── the library: header-only ─────────────────────────────────────────────────
@@ -77,10 +78,37 @@ if(ARTPP_TESTS)
    artpp_test(exception_safety -O1 -g)
    artpp_test(wide_stems       -O3 -DNDEBUG)
    artpp_test(persistence      -O2 -g)  # file-backed line_pool survives close + reopen
+   artpp_test(fuzz_map         -O2 -g)  # differential fuzzer vs std::map (standalone RNG runner)
 
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)
       target_link_libraries(artpp_psio_codec PRIVATE psio)
+   endif()
+endif()
+
+# ── coverage-guided fuzzer (opt-in; needs a clang with the fuzzer runtime) ─────
+# Same source as the artpp_fuzz ctest binary, but built as a libFuzzer target with
+# ASan+UBSan: `cmake -DARTPP_FUZZER=ON …` then `bin/artpp_fuzzer -max_total_time=60`.
+if(ARTPP_FUZZER)
+   # libFuzzer needs the compiler's fuzzer runtime — Apple Command Line Tools clang ships none.
+   # Probe by trying to link a fuzzer stub; skip with a clear note rather than a cryptic link error.
+   include(CheckCXXSourceCompiles)
+   set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer")
+   check_cxx_source_compiles(
+       "extern \"C\" int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long) { return 0; }"
+       ARTPP_HAVE_FUZZER_RT)
+   unset(CMAKE_REQUIRED_FLAGS)
+   if(ARTPP_HAVE_FUZZER_RT)
+      add_executable(artpp_fuzzer tests/fuzz_map.cpp)
+      target_link_libraries(artpp_fuzzer PRIVATE artpp)
+      target_compile_definitions(artpp_fuzzer PRIVATE ARTPP_LIBFUZZER)
+      target_compile_options(artpp_fuzzer PRIVATE -O1 -g -fsanitize=fuzzer,address,undefined)
+      target_link_options(artpp_fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+      set_target_properties(artpp_fuzzer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   else()
+      message(STATUS "ARTPP_FUZZER=ON but this toolchain lacks the libFuzzer runtime; skipping "
+                     "artpp_fuzzer. Use a libFuzzer-capable clang (e.g. Homebrew llvm). The "
+                     "standalone artpp_fuzz_map test covers the default toolchain.")
    endif()
 endif()
 

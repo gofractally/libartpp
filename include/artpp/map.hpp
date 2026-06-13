@@ -1241,9 +1241,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
             bool inl(uint64_t raw, bool at_end) const
             {
                if (!at_end) return false;
-               const uint64_t shifted = raw >> 8;
-               std::memcpy(out, &shifted, inline_bytes);
-               return true;
+               if constexpr (inlineable)  // value_inline exists only for an inlineable T
+               {
+                  const uint64_t shifted = raw >> 8;
+                  std::memcpy(out, &shifted, inline_bytes);
+                  return true;
+               }
+               return false;  // unreachable for a non-inlineable T (no value_inline nodes)
             }
             bool bkt(const bucket* b, const char* rem, size_t rl) const
             {
@@ -3985,7 +3989,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::memcpy(p.b + 1, &v, inline_bytes);  // value in bytes [1..1+sizeof)
          return p;
       }
-      static void unpack_inline(packed_ptr p, T& out) noexcept { std::memcpy(&out, p.b + 1, inline_bytes); }
+      static void unpack_inline(packed_ptr p, T& out) noexcept
+      {
+         // Only ever called on a value_inline slot, which exists only for an inlineable T; the
+         // `if constexpr` keeps the memcpy from instantiating for a non-inlineable T (dead here).
+         if constexpr (inlineable) std::memcpy(&out, p.b + 1, inline_bytes);
+      }
       static void copy_value(T& out, const T* src)
       {
          if constexpr (std::is_trivially_copyable_v<T>)
@@ -4833,25 +4842,29 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <bool Assign, class VF>
       packed_ptr split_leaf(packed_ptr cur, std::string_view key, size_t depth, VF&& val, bool& inserted)
       {
-         if (cur.tag() == K::value_inline)
-         {
-            // Inline terminal: stored key ended here (empty suffix). No allocation to free.
-            std::string_view R = key.substr(depth);
-            if (R.empty())  // exact key
+         // `if constexpr`: a value_inline leaf only exists for an inlineable T, so this whole
+         // branch is dead for non-inlineable T — eliding it avoids instantiating unpack_inline
+         // (a memcpy into a possibly non-trivially-copyable T) that would never run.
+         if constexpr (inlineable)
+            if (cur.tag() == K::value_inline)
             {
-               inserted = false;
-               if constexpr (Assign) return pack_inline(vf_make(std::forward<VF>(val)));
-               else return cur;
+               // Inline terminal: stored key ended here (empty suffix). No allocation to free.
+               std::string_view R = key.substr(depth);
+               if (R.empty())  // exact key
+               {
+                  inserted = false;
+                  if constexpr (Assign) return pack_inline(vf_make(std::forward<VF>(val)));
+                  else return cur;
+               }
+               T oldv;
+               unpack_inline(cur, oldv);  // inlineable T is trivially copyable
+               inserted = true;
+               setlist* r = new_setlist();
+               set_term(&r->rh, std::move(oldv));                                    // old key terminates
+               setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
+               sl_inline_compact_(r);          // pull the small leaf child into this line
+               return pack_(r, K::setlist_u8);  // c == 0, no prefix node needed
             }
-            T oldv;
-            unpack_inline(cur, oldv);  // inlineable T is trivially copyable
-            inserted = true;
-            setlist* r = new_setlist();
-            set_term(&r->rh, std::move(oldv));                                    // old key terminates
-            setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
-            sl_inline_compact_(r);          // pull the small leaf child into this line
-            return pack_(r, K::setlist_u8);  // c == 0, no prefix node needed
-         }
          char*            L = static_cast<char*>(deref_term_(cur));
          std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
          std::string_view R = key.substr(depth);
