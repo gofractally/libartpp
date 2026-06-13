@@ -16,18 +16,19 @@ HIT = {  # (1M, 100M) ns per lookup
     "artpp::map": (51.9, 89.5),
     "std::unordered_map": (64.3, 100.0),
     "libart": (66.0, 117.8),
+    "unodb": (210.4, 352.4),
     "absl::btree_map": (505.3, 1470.8),
     "std::map": (807.1, 1965.9),
 }
 HIT_100 = {k: v[1] for k, v in HIT.items()}
-LB_100 = {"artpp::map": 158.8, "absl::btree_map": 1488.7, "std::map": 2169.1,
+LB_100 = {"artpp::map": 158.8, "unodb": 638.2, "absl::btree_map": 1488.7, "std::map": 2169.1,
           "libart": None, "std::unordered_map": None}
 # why a contestant has no bar
 NOTE = {"libart": "no ordered query API", "std::unordered_map": "no ordered query API",
         "art_map": "key > 16 B — does not compile"}
 
 LINE = {"artpp::map": "#34d399", "libart": "#5e97d0", "std::unordered_map": "#a78bfa",
-        "absl::btree_map": "#7587a3", "std::map": "#4a5a73", "art_map": "#6b6f7a"}
+        "unodb": "#d99a4e", "absl::btree_map": "#7587a3", "std::map": "#4a5a73", "art_map": "#6b6f7a"}
 BARFILL = dict(LINE, **{"artpp::map": "url(#hot)"})
 TXT, SUB, GRID = "#e6edf6", "#8da3bf", "#22304a"
 DEFS = ('<defs><linearGradient id="hot" x1="0" y1="0" x2="1" y2="0">'
@@ -67,7 +68,7 @@ def slope(out: Path) -> None:
         p.append(f'<text x="{x1-8}" y="{y+4:.1f}" font-size="10.5" fill="{SUB}" text-anchor="end">{gv}</text>')
     p.append(f'<text x="{x1}" y="{yb+22}" font-size="12.5" fill="{SUB}" text-anchor="middle">1M keys</text>')
     p.append(f'<text x="{x2}" y="{yb+22}" font-size="12.5" fill="{SUB}" text-anchor="middle">100M keys</text>')
-    for name in ("std::map", "absl::btree_map", "libart", "std::unordered_map", "artpp::map"):
+    for name in ("std::map", "absl::btree_map", "unodb", "libart", "std::unordered_map", "artpp::map"):
         v1, v2 = HIT[name]
         col, wide = LINE[name], (3.4 if name == "artpp::map" else 2.2)
         p.append(f'<line x1="{x1}" y1="{Y(v1):.1f}" x2="{x2}" y2="{Y(v2):.1f}" stroke="{col}" stroke-width="{wide}"/>')
@@ -118,14 +119,14 @@ def main() -> None:
     outdir = Path(sys.argv[1] if len(sys.argv) > 1 else "docs/charts")
     outdir.mkdir(parents=True, exist_ok=True)
     slope(outdir / "buffer_scale_hit.svg")
-    hit_order = ["artpp::map", "std::unordered_map", "libart", "absl::btree_map", "std::map", "art_map"]
+    hit_order = ["artpp::map", "std::unordered_map", "libart", "unodb", "absl::btree_map", "std::map", "art_map"]
     bars("Point lookups at 100M keys (32-byte buffers)",
-         "ns / lookup, lower is better · artpp leads the field — faster than the hash map, 16–22× over the trees",
+         "ns / lookup, lower is better · artpp leads the C++ ART field and the trees alike",
          [(n, {**HIT_100, "art_map": None}.get(n)) for n in hit_order],
          outdir / "buffer_hit_100M.svg")
-    lb_order = ["artpp::map", "absl::btree_map", "std::map", "libart", "std::unordered_map", "art_map"]
+    lb_order = ["artpp::map", "unodb", "absl::btree_map", "std::map", "libart", "std::unordered_map", "art_map"]
     bars("lower_bound at 100M keys (32-byte buffers)",
-         "ns / op · only the ordered radix/tree maps can answer it at all",
+         "ns / op · artpp 4× over unodb (the canonical C++ ART), far over the trees; hash/libart have none",
          [(n, {**LB_100, "art_map": None}.get(n)) for n in lb_order],
          outdir / "buffer_lbound_100M.svg")
     print(f"wrote 3 buffer charts to {outdir}")
