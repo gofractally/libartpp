@@ -24,10 +24,18 @@ static int g_fail = 0;
 using A   = artpp::pool_alloc<std::uint64_t>;
 using Map = artpp::map<std::string_view, std::uint64_t, artpp::mode::none, A>;
 
+// A file-backed pool is a directory with one file per region; clean it between/after runs.
+static void wipe(const char* dir)
+{
+   ::unlink((std::string(dir) + "/nodes").c_str());
+   ::unlink((std::string(dir) + "/terms").c_str());
+   ::rmdir(dir);
+}
+
 int main()
 {
-   const char* path = "/tmp/artpp_persist_test.art";
-   ::unlink(path);
+   const char* path = "/tmp/artpp_persist_test_store";  // a STORE DIRECTORY
+   wipe(path);
 
    const int                       N = 40000;
    std::mt19937_64                 rng(123);
@@ -103,6 +111,6 @@ int main()
       std::printf("artpp_persistence: ALL PASS (%d keys round-tripped through close/reopen)\n", N);
    else
       std::printf("artpp_persistence: %d FAILURES\n", g_fail);
-   ::unlink(path);
+   wipe(path);
    return g_fail ? 1 : 0;
 }

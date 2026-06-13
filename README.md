@@ -371,30 +371,34 @@ file-backed**:
 
 ```c++
 artpp::line_pool                pool;                       // anonymous memory
-artpp::line_pool                disk("store.artpp");          // file-backed (mmap; reopen-or-create)
+artpp::line_pool                disk("mystore");              // file-backed: a store DIRECTORY
 using A = artpp::pool_alloc<uint64_t>;
 artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
 ```
 
 File backing is **two things at once**: out-of-core storage (page eviction,
 larger-than-RAM data sets) and a **durable store across a clean close/reopen**.
-The file carries a self-describing superblock — geometry, the carving state
-(frontier + free-list heads), and the tree's root handle + element count — so
-reopening restores the prior image with **no relocation**: handles are byte
-offsets, so the bytes already *are* the tree.
+A file-backed pool is a **directory with one dense file per address region** —
+`nodes` (128-byte lines; its first page(s) hold a self-describing superblock:
+geometry + carving state + the tree's root handle and count) and `terms`
+(16-byte terminal units). One file per region means each grows densely from
+offset 0 — **no sparse files, no 32 GB logical size, no dependency on sparse-file
+support** (so it's safe to `cp`/`tar`/`rsync`/back up). Reopening restores the
+prior image with **no relocation**: handles are byte offsets, so the bytes
+already *are* the tree.
 
 ```c++
 // write, then close
 {
-   artpp::line_pool pool("store.artpp");                       // reopen-or-create
+   artpp::line_pool pool("mystore");                           // reopen-or-create the directory
    artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
    t.insert("key", 42);
    pool.checkpoint(t.root_handle(), t.size());                 // persist root + carving state
-   t.detach();                                                 // tree lives in the file; skip teardown
+   t.detach();                                                 // tree lives on disk; skip teardown
 }
 // reopen — same process or a later one
 {
-   artpp::line_pool pool("store.artpp");                       // pool.restored() == true
+   artpp::line_pool pool("mystore");                           // pool.restored() == true
    artpp::map<std::string_view, uint64_t, artpp::mode::none, A>
        t{A{&pool}, artpp::attach, pool.root(), pool.count()};  // O(1) attach, no rebuild
    uint64_t v;

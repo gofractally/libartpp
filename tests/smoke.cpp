@@ -862,22 +862,24 @@ static void test_line_pool()
       map<std::string_view, uint64_t, mode::adaptive | mode::wide_stems, PA> t{PA(&pool)};
       handle_xcheck_body(t, 6);
    }
-   {  // file-backed: same engine over an mmap'd file; the file grows with the commits
-      char path[] = "/tmp/artpp_pool_smoke_XXXXXX";
-      int  fd     = mkstemp(path);
-      CHECK(fd >= 0);
-      ::close(fd);
+   {  // file-backed: same engine over a store DIRECTORY — one dense file per address region
+      char dir[] = "/tmp/artpp_pool_smoke_XXXXXX";
+      CHECK(mkdtemp(dir) != nullptr);
       {
-         artpp::line_pool pool(path);
+         artpp::line_pool pool(dir);
+         CHECK(!pool.restored());  // fresh store
          map<std::string_view, uint64_t, mode::none, PA> t{PA(&pool)};
          handle_xcheck_body(t, 777);
-         struct stat st{};
-         // two regions, fixed file offsets: terminals commit past the node cap, so the
-         // file is sparse and its logical size is the pool's file_extent()
-         CHECK(::stat(path, &st) == 0 && size_t(st.st_size) == pool.file_extent());
          CHECK(pool.committed() > 0 && pool.term_committed() > 0);
+         // each region is its OWN dense file (no sparse hole); the two sizes sum to file_extent()
+         struct stat ns{}, ts{};
+         const std::string np = std::string(dir) + "/nodes", tp = std::string(dir) + "/terms";
+         CHECK(::stat(np.c_str(), &ns) == 0 && ::stat(tp.c_str(), &ts) == 0);
+         CHECK(size_t(ns.st_size) + size_t(ts.st_size) == pool.file_extent());
       }
-      ::unlink(path);
+      ::unlink((std::string(dir) + "/nodes").c_str());
+      ::unlink((std::string(dir) + "/terms").c_str());
+      ::rmdir(dir);
    }
    {  // freelist reuse: clear() then rebuild the same content — the frontier must not move
       artpp::line_pool pool;
