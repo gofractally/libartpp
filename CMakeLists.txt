@@ -76,6 +76,7 @@ if(ARTPP_TESTS)
    # fault injection: -O1 keeps every allocation point distinct for the sweep
    artpp_test(exception_safety -O1 -g)
    artpp_test(wide_stems       -O3 -DNDEBUG)
+   artpp_test(persistence      -O2 -g)  # file-backed line_pool survives close + reopen
 
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)

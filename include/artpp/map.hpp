@@ -75,6 +75,11 @@ namespace artpp
       return (unsigned(set) & unsigned(flag)) != 0;
    }
 
+   // Tag for map's O(1) attach constructor — bind a map to an already-populated pool image
+   // (a reopened file) by adopting a persisted root handle + count instead of rebuilding.
+   struct attach_t { explicit attach_t() = default; };
+   inline constexpr attach_t attach{};
+
 namespace detail  // implementation types & node helpers — not part of the public API
 {
    // ── sparse router: 1 cacheline, byte[i] -> branch[i] (sorted) ───────────────
@@ -769,7 +774,32 @@ namespace detail  // implementation types & node helpers — not part of the pub
          o.count_ = 0;
          return *this;
       }
+      // Attach to an already-populated pool image (e.g. after line_pool reopened a file):
+      // adopt a persisted root handle + element count in O(1) — no walk, no rebuild. The pool's
+      // bytes already ARE the tree; offset handles resolve against the reopened base after
+      // rebase_(). Indexed handles only (a raw-pointer allocator's handles aren't stable across
+      // runs). Pair with line_pool::root()/count(); the pool must back exactly this map.
+      map(const Allocator& a, attach_t, uint64_t root_handle, size_type count) : alloc_(a), count_(count)
+      {
+         static_assert(indexed, "map attach is only for indexed (pool-backed) handles");
+         rebase_();
+         const uint32_t raw = uint32_t(root_handle);
+         std::memcpy(root_.b, &raw, sizeof(root_.b));  // line_ptr is 4 bytes: reconstruct the root
+      }
+
       ~map() { free_all_(root_); }  // walk the tree, destroy every T and free every node
+
+      // The root as a raw handle, for persisting via line_pool::checkpoint (indexed pools).
+      uint64_t root_handle() const noexcept { return root_.raw(); }
+      // Release the structure WITHOUT freeing it: the nodes stay live in the pool (for a
+      // file-backed pool, in the file). Use before destroying an attached, already-checkpointed
+      // map so close is O(1) instead of walking the whole tree. The map is left empty; the pool
+      // image is untouched. (Anonymous pools reclaim everything on munmap regardless.)
+      void detach() noexcept
+      {
+         root_  = packed_ptr::null();
+         count_ = 0;
+      }
 
       allocator_type get_allocator() const noexcept { return alloc_; }
 

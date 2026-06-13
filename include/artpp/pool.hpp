@@ -5,9 +5,13 @@
 // (base never moves); memory is committed in 4 MB steps as the frontier grows; freed nodes
 // recycle through exact-size free lists (sizes are line counts).
 //
-// NOTE: file backing is exactly that — backing storage (page eviction, >RAM data sets).
-// Durability/recovery (persisted root, WAL) is the next stage, not this one: the file is
-// truncated on open and its contents are not a self-describing image yet.
+// File backing is BOTH out-of-core storage (page eviction, >RAM data sets) AND a durable
+// store across a clean close/reopen: the file carries a self-describing superblock (geometry +
+// carving state + the tree's root/count), so line_pool(path) restores a prior image and the tree
+// round-trips with no relocation — offset handles need none. Call checkpoint(root, count) before
+// close to persist (see line_pool::checkpoint); a later line_pool(path) reopens it. Crash/reboot
+// durability (full data sync / WAL) is the next stage — checkpoint flushes the header, and data
+// pages ride the page cache across a clean reopen.
 //
 // MEASURED vs std::allocator (M5, 5M keys, artpp_pool_ab INTERLEAVED per rep): inserts
 // recover the malloc cost and more (uniform u64 0.81x, clustered 0.94x), queries are
@@ -100,7 +104,7 @@ namespace artpp
       line_pool& operator=(const line_pool&) = delete;
       ~line_pool()
       {
-         if (base_) ::munmap(base_, cap_);
+         if (mmap_base_) ::munmap(mmap_base_, cap_);
          if (fd_ >= 0) ::close(fd_);
       }
 
@@ -124,7 +128,41 @@ namespace artpp
       // the gap, but only written blocks occupy disk (APFS/ext4 et al).
       size_t file_extent() const noexcept
       {
-         return tcommitted_ ? ncap_ + tcommitted_ : committed_;
+         return sb_bytes_ + (tcommitted_ ? ncap_ + tcommitted_ : committed_);
+      }
+
+      // ── persistence (file-backed, clean-close durability) ────────────────────────
+      // checkpoint() stamps the current carving state + the tree's root handle and count
+      // into the superblock and flushes it, so a later line_pool(path) over the same file
+      // restores them and the tree round-trips with no relocation (offset handles). The
+      // data pages ride the page cache across a clean reopen; crash/reboot durability (a
+      // full data sync / WAL) is a further stage — see the file header. restored()/root()/
+      // count() report what a reopen recovered (false / 0 / 0 on a fresh file or anon pool).
+      bool     restored() const noexcept { return restored_; }
+      uint64_t root() const noexcept { return uroot_; }
+      uint64_t count() const noexcept { return ucount_; }
+      void     checkpoint(uint64_t root, uint64_t count) noexcept
+      {
+         uroot_ = root;
+         ucount_ = count;
+         if (sb_bytes_ == 0) return;  // anonymous pool: nothing to persist
+         auto* sb       = reinterpret_cast<superblock*>(mmap_base_);
+         sb->magic      = MAGIC;
+         sb->version    = VERSION;
+         sb->flags      = 0;
+         sb->ncap       = ncap_;
+         sb->tcap       = tcap_;
+         sb->frontier   = frontier_;
+         sb->tfrontier  = tfrontier_;
+         sb->committed  = committed_;
+         sb->tcommitted = tcommitted_;
+         sb->huge       = huge_;
+         sb->thuge      = thuge_;
+         sb->uroot      = root;
+         sb->ucount     = count;
+         std::memcpy(sb->free_heads, free_, sizeof(free_));
+         std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
+         ::msync(mmap_base_, sb_bytes_, MS_SYNC);  // header durable; data rides the page cache
       }
 
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
@@ -230,28 +268,98 @@ namespace artpp
       static constexpr size_t   FREE_MAX  = 1024;  // node lists cover up to 128 KB
       static constexpr size_t   TFREE_MAX = 4096;  // terminal lists cover up to 64 KB
 
+      // ── persistence: a self-describing superblock at file offset 0 ───────────────
+      // A file-backed pool reserves SB_BYTES at the front of the file for this header and
+      // shifts base_ past it, so every node/terminal offset stays base-relative — identical
+      // to an anonymous pool, so adopt() and every minted handle are unaffected. checkpoint()
+      // serializes the carving state (frontier + free-list heads; the chains themselves live
+      // inside freed blocks, already in-file) plus the tree's root handle + count here; a
+      // later line_pool(path) over the same file restores them. Offset handles need no
+      // relocation, so the bytes ARE the structure across a close/reopen.
+      static constexpr uint64_t MAGIC    = 0x6c6f6f7070747261ULL;  // "artppool" (little-endian)
+      static constexpr uint32_t VERSION  = 1;
+      static constexpr size_t   SB_BYTES = 32768;  // header reservation (>= sizeof(superblock))
+      struct superblock
+      {
+         uint64_t magic;
+         uint32_t version, flags;
+         uint64_t ncap, tcap, frontier, tfrontier, committed, tcommitted;
+         uint32_t huge, thuge;
+         uint64_t uroot, ucount;             // user metadata: tree root handle + element count
+         uint32_t free_heads[FREE_MAX + 1];  // exact-size free-list heads
+         uint32_t tfree_heads[TFREE_MAX + 1];
+      };
+      static_assert(sizeof(superblock) <= SB_BYTES, "superblock must fit its reservation");
+
+      void destroy_() noexcept  // unwind a partially-constructed pool
+      {
+         if (mmap_base_) ::munmap(mmap_base_, cap_);
+         if (fd_ >= 0) ::close(fd_);
+         mmap_base_ = base_ = tbase_ = nullptr;
+         fd_        = -1;
+      }
       void init_(const char* path, size_t cap)
       {
          ncap_ = std::min((cap + chunk_bytes - 1) / chunk_bytes * chunk_bytes, max_bytes);
          // terminal region rides the same reservation/file, after the node region;
          // sized at 1/8th of it (the 16/128 unit ratio), capped by its u32 offsets
-         tcap_ = std::min(std::max(ncap_ / 8, chunk_bytes), max_term_bytes);
-         cap_  = ncap_ + tcap_;
+         tcap_     = std::min(std::max(ncap_ / 8, chunk_bytes), max_term_bytes);
+         sb_bytes_ = path ? SB_BYTES : 0;  // file-backed pools carry a self-describing header
+         bool restore = false;
          if (path)
          {
-            fd_ = ::open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            fd_ = ::open(path, O_RDWR | O_CREAT, 0644);  // NO O_TRUNC: reopen-or-create
             if (fd_ < 0) throw std::bad_alloc();
+            struct stat st;
+            if (::fstat(fd_, &st) != 0) { ::close(fd_); fd_ = -1; throw std::bad_alloc(); }
+            if (st.st_size >= off_t(SB_BYTES))  // existing file: validate + adopt its geometry
+            {
+               struct { uint64_t magic; uint32_t version, flags; uint64_t ncap, tcap; } pk{};
+               if (::pread(fd_, &pk, sizeof pk, 0) == off_t(sizeof pk) && pk.magic == MAGIC &&
+                   pk.version == VERSION)
+               {
+                  restore = true;
+                  ncap_   = pk.ncap;  // offsets resolve against the file's geometry, not `cap`
+                  tcap_   = pk.tcap;
+               }
+               else { ::close(fd_); fd_ = -1; throw std::bad_alloc(); }  // foreign / corrupt file
+            }
          }
+         cap_    = sb_bytes_ + ncap_ + tcap_;
          void* r = ::mmap(nullptr, cap_, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-         if (r == MAP_FAILED)
+         if (r == MAP_FAILED) { if (fd_ >= 0) ::close(fd_); throw std::bad_alloc(); }
+         mmap_base_ = static_cast<std::byte*>(r);
+         base_      = mmap_base_ + sb_bytes_;
+         tbase_     = base_ + ncap_;
+         if (path)  // map the superblock header (file offset 0) read-write
          {
-            if (fd_ >= 0) ::close(fd_);
-            throw std::bad_alloc();
+            struct stat st;
+            if (::fstat(fd_, &st) != 0) { destroy_(); throw std::bad_alloc(); }
+            if (st.st_size < off_t(sb_bytes_) && ::ftruncate(fd_, off_t(sb_bytes_)) != 0)
+            { destroy_(); throw std::bad_alloc(); }
+            if (::mmap(mmap_base_, sb_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd_, 0) ==
+                MAP_FAILED)
+            { destroy_(); throw std::bad_alloc(); }
          }
-         base_  = static_cast<std::byte*>(r);
-         tbase_ = base_ + ncap_;
          std::memset(free_, 0xFF, sizeof(free_));   // every head = NIL (all-ones)
          std::memset(tfree_, 0xFF, sizeof(tfree_));
+         if (restore)
+         {
+            const superblock* sb = reinterpret_cast<const superblock*>(mmap_base_);
+            frontier_  = sb->frontier;
+            tfrontier_ = sb->tfrontier;
+            huge_      = sb->huge;
+            thuge_     = sb->thuge;
+            uroot_     = sb->uroot;
+            ucount_    = sb->ucount;
+            std::memcpy(free_, sb->free_heads, sizeof(free_));
+            std::memcpy(tfree_, sb->tfree_heads, sizeof(tfree_));
+            if (const size_t want = sb->committed) commit_(want);    // re-map written data regions
+            if (const size_t twant = sb->tcommitted) tcommit_(twant);
+            restored_ = true;
+         }
+         else if (path)
+            checkpoint(0, 0);  // stamp an initial empty image so a reopen is self-describing
       }
       // Commit [start, start+committed..target) of the reservation; file regions live at
       // the same offsets in the file (ftruncate grows it monotonically).
@@ -259,15 +367,15 @@ namespace artpp
       {
          const size_t target = (need + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
          if (target > regcap) throw std::bad_alloc();
-         if (fd_ >= 0)  // file: extend it, then map the new chunks over the reservation
-         {
-            const off_t fend = off_t(start + target);
+         if (fd_ >= 0)  // file: extend it, then map the new chunks over the reservation. The
+         {              // node/terminal regions sit past the superblock, so file offset += sb_bytes_
+            const off_t fend = off_t(sb_bytes_ + start + target);
             struct stat st;
             if (::fstat(fd_, &st) != 0) throw std::bad_alloc();
             if (st.st_size < fend && ::ftruncate(fd_, fend) != 0) throw std::bad_alloc();
             void* r = ::mmap(base_ + start + committed, target - committed,
                              PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd_,
-                             off_t(start + committed));
+                             off_t(sb_bytes_ + start + committed));
             if (r == MAP_FAILED) throw std::bad_alloc();
          }
          else if (::mprotect(base_ + start + committed, target - committed,
@@ -321,9 +429,14 @@ namespace artpp
          return nullptr;
       }
 
-      std::byte* base_       = nullptr;
+      std::byte* base_       = nullptr;  // node region start = mmap_base_ + sb_bytes_
       std::byte* tbase_      = nullptr;  // = base_ + ncap_, cached (Dan: don't recompute per use)
-      size_t     cap_        = 0;  // total reservation = ncap_ + tcap_
+      std::byte* mmap_base_  = nullptr;  // raw reservation start (superblock lives here, file-backed)
+      size_t     sb_bytes_   = 0;        // superblock reservation: SB_BYTES file-backed, 0 anonymous
+      uint64_t   uroot_      = 0;        // tree root handle restored from the superblock on reopen
+      uint64_t   ucount_     = 0;        // element count restored on reopen
+      bool       restored_   = false;    // this open restored an existing image (vs fresh)
+      size_t     cap_        = 0;  // total reservation = sb_bytes_ + ncap_ + tcap_
       size_t     ncap_       = 0;
       size_t     tcap_       = 0;
       size_t     committed_  = 0;

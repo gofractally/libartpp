@@ -371,15 +371,43 @@ file-backed**:
 
 ```c++
 artpp::line_pool                pool;                       // anonymous memory
-artpp::line_pool                disk("store.artpp");          // file-backed (mmap)
+artpp::line_pool                disk("store.artpp");          // file-backed (mmap; reopen-or-create)
 using A = artpp::pool_alloc<uint64_t>;
 artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
 ```
 
-File backing is backing storage only (page eviction, larger-than-RAM data):
-the file is truncated on open and is not a recoverable image. Durability —
-persisted roots, write-ahead logging, crash recovery — belongs to persistence
-layers built on this design downstream, out of scope for artpp itself.
+File backing is **two things at once**: out-of-core storage (page eviction,
+larger-than-RAM data sets) and a **durable store across a clean close/reopen**.
+The file carries a self-describing superblock — geometry, the carving state
+(frontier + free-list heads), and the tree's root handle + element count — so
+reopening restores the prior image with **no relocation**: handles are byte
+offsets, so the bytes already *are* the tree.
+
+```c++
+// write, then close
+{
+   artpp::line_pool pool("store.artpp");                       // reopen-or-create
+   artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
+   t.insert("key", 42);
+   pool.checkpoint(t.root_handle(), t.size());                 // persist root + carving state
+   t.detach();                                                 // tree lives in the file; skip teardown
+}
+// reopen — same process or a later one
+{
+   artpp::line_pool pool("store.artpp");                       // pool.restored() == true
+   artpp::map<std::string_view, uint64_t, artpp::mode::none, A>
+       t{A{&pool}, artpp::attach, pool.root(), pool.count()};  // O(1) attach, no rebuild
+   uint64_t v;
+   t.find("key", v);                                           // == 42
+}
+```
+
+`checkpoint(root, count)` stamps the superblock and flushes it; `attach`
+rebinds a map to the reopened image in O(1); `detach()` relinquishes the
+in-memory tree without freeing so close stays O(1). This is **clean-close**
+durability — crash/reboot durability (a full data sync + write-ahead log) is
+the next layer: `checkpoint` flushes the header, and data pages ride the page
+cache across a clean reopen.
 
 ## Limits and guarantees
 
