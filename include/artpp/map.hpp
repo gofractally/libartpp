@@ -1614,21 +1614,6 @@ namespace detail  // implementation types & node helpers — not part of the pub
             set_ptr_(leaf_val(L));
             if (maintain_) { key_.len = base; if (!full_str_) key_.append(sfx_, sfxlen_); }
          }
-         // True if `parent`'s child at stem `byte` is an inline leaf (then positions on it);
-         // else descends `child` normally. Used at every forward child-follow.
-         bool descend_branch_(packed_ptr parent, uint8_t byte, packed_ptr child, size_t base)
-         {
-            if (parent.tag() == K::setlist_u8)
-            {
-               const setlist* s = static_cast<const setlist*>(deref_(parent));
-               if (s->inl & 0x80)
-               {
-                  const int i = setlist_index(s, byte);
-                  if (i >= 0 && map::sl_is_inline(s, i)) { emit_inline_leaf_(s, i, base); return true; }
-               }
-            }
-            return descend_(child, base);
-         }
          // true → positioned at a terminal (sets val_ + suffix); false → pushed a frame.
          // `base` is the key length at this child's start; key_ is grown only when
          // maintain_ is on (the eager fast path), otherwise the path in stk_ suffices.
@@ -1697,9 +1682,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (f.cur == 0)
                   {
                      f.cur = 1;
-                     if (descend_(pn_next<Ptr>(static_cast<char*>(deref_(f.node))), f.cbase)) return;
+                     descend_min_(pn_next<Ptr>(static_cast<char*>(deref_(f.node))), f.cbase);
+                     return;  // descend_min_ always positions at the prefix child's leftmost
                   }
-                  else { if (maintain_) key_.len = f.plen; stk_.pop_back(); }
+                  if (maintain_) key_.len = f.plen;
+                  stk_.pop_back();
                   continue;
                }
                if constexpr (Buckets || Adaptive)  // bucket frames exist only under these modes
@@ -1741,7 +1728,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      ++f.cur;
                      if (maintain_)
                      { key_.len = f.cbase; key_.push(uint8_t(stem >> 8)); key_.push(uint8_t(stem & 0xFF)); }
-                     if (descend_(child, key_.len)) return;
+                     descend_min_(child, key_.len);  // tight drill to this stem's leftmost terminal
+                     return;
                   }
                   else { if (maintain_) key_.len = f.plen; stk_.pop_back(); }
                   continue;
@@ -1764,7 +1752,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   f.cur = bb + 1;
                   if (maintain_) { key_.len = f.cbase; key_.push(bb); }
-                  if (descend_branch_(f.node, bb, child, key_.len)) return;  // inline-aware
+                  // an inline leaf lives in the parent's line (needs parent context) → position directly;
+                  // otherwise drill to the child's leftmost terminal in one tight pass.
+                  if (f.node.tag() == K::setlist_u8)
+                  {
+                     const setlist* s = static_cast<const setlist*>(deref_(f.node));
+                     if (s->inl & 0x80)
+                     {
+                        const int i = setlist_index(s, bb);
+                        if (i >= 0 && map::sl_is_inline(s, i)) { emit_inline_leaf_(s, i, key_.len); return; }
+                     }
+                  }
+                  descend_min_(child, key_.len);
+                  return;
                }
                else { if (maintain_) key_.len = f.plen; stk_.pop_back(); }
             }
@@ -2017,6 +2017,131 @@ namespace detail  // implementation types & node helpers — not part of the pub
                         continue;
                      }
                      stk_.push_back(Frame{child, 0, uint32_t(base), cb});  // childless: term only
+                     sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
+                     emit_(rh->term);
+                     if (maintain_) key_.len = cb;
+                     return;
+                  }
+               }
+            }
+         }
+         // Position at the LEFTMOST terminal under `child` — the forward mirror of
+         // descend_max_. Order at a router is [term] < children-ascending, so the
+         // leftmost is the term when present, else the first child's leftmost. Frames
+         // are left in seek_'s consumed-cursor convention (cur = next branch to examine)
+         // so a subsequent operator++ resumes correctly. Always positions: every subtree
+         // holds a terminal. This is the tight counterpart to descend_() + the seek_()
+         // loop — one switch + one first-child probe per level, no frame pop/re-dispatch.
+         void descend_min_(packed_ptr child, size_t base)
+         {
+            for (;;)
+            {
+               switch (child.tag())
+               {
+                  case K::value_ptr:
+                  {
+                     const char* L = static_cast<const char*>(deref_term_(child));
+                     sfx_          = leaf_suf(L);
+                     sfxlen_       = leaf_slen(L);
+                     if (leaf_has_full(L)) { full_str_ = leaf_str(L); full_len_ = leaf_strlen(L); }
+                     else                    full_str_ = nullptr;
+                     set_ptr_(leaf_val(L));
+                     if (maintain_) { key_.len = base; if (!full_str_) key_.append(sfx_, sfxlen_); }
+                     return;
+                  }
+                  case K::value_inline:
+                     sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
+                     if constexpr (inlineable)
+                        unpack_inline(child, val_);
+                     if (maintain_) key_.len = base;
+                     return;
+                  case K::prefix_node:
+                  {
+                     const char* P  = static_cast<const char*>(deref_(child));
+                     uint32_t    cb = uint32_t(base);
+                     if (maintain_) { key_.len = base; key_.append(pn_pfx<Ptr>(P), pn_plen(P)); cb = uint32_t(key_.len); }
+                     stk_.push_back(Frame{child, 1, uint32_t(base), cb});  // single child consumed
+                     child = pn_next<Ptr>(const_cast<char*>(P));
+                     base  = cb;
+                     continue;
+                  }
+                  case K::bucket:
+                  {
+                     bucket* b = static_cast<bucket*>(deref_(child));
+                     stk_.push_back(Frame{child, 1, uint32_t(base), uint32_t(base)});  // entry 0 consumed
+                     const char* e = bkt_entry(b, 0);  // index order is suffix order: min = first
+                     sfx_      = bkt_suf(e);
+                     sfxlen_   = bkt_slen(e);
+                     full_str_ = nullptr;
+                     set_ptr_(bkt_val(e));
+                     if (maintain_) { key_.len = base; key_.append(sfx_, sfxlen_); }
+                     return;
+                  }
+                  case K::setlist_u16:
+                  {
+                     const setlist16* s  = static_cast<const setlist16*>(deref_(child));
+                     uint32_t         cb = uint32_t(base);
+                     if (maintain_) { key_.len = base; cb = uint32_t(key_.len); }
+                     if (!s->rh.term.is_null())  // term < stems
+                     {
+                        stk_.push_back(Frame{child, 0, uint32_t(base), cb});  // term consumed; stems remain
+                        sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
+                        emit_(s->rh.term);
+                        if (maintain_) key_.len = cb;
+                        return;
+                     }
+                     stk_.push_back(Frame{child, 1, uint32_t(base), cb});  // stem 0 consumed
+                     const uint16_t st = s->stems[0];
+                     if (maintain_)
+                     { key_.push(uint8_t(st >> 8)); key_.push(uint8_t(st & 0xFF)); }
+                     child = s->branch[0];
+                     base  = maintain_ ? size_t(key_.len) : size_t(cb) + 2;
+                     continue;
+                  }
+                  default:  // byte routers (setlist / c2 / c4 / c8 / node_full / pfxd)
+                  {
+                     const router_hdr* rh = static_cast<const router_hdr*>(deref_(child));
+                     uint32_t          cb = uint32_t(base);
+                     if (maintain_)
+                     {
+                        key_.len = base;
+                        if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
+                           key_.append(static_cast<const setlist*>(deref_(child))->prefix,
+                                       rh->hdr.prefix_len);
+                        else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
+                           key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+                        cb = uint32_t(key_.len);
+                     }
+                     if (!rh->term.is_null())  // term < children
+                     {
+                        stk_.push_back(Frame{child, 0, uint32_t(base), cb});  // term consumed; children remain
+                        sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
+                        emit_(rh->term);
+                        if (maintain_) key_.len = cb;
+                        return;
+                     }
+                     uint8_t    bb;
+                     packed_ptr nc;
+                     if (next_child_(child, 0, bb, nc))  // first child
+                     {
+                        stk_.push_back(Frame{child, int(bb) + 1, uint32_t(base), cb});
+                        if (maintain_) key_.push(bb);
+                        if (child.tag() == K::setlist_u8)  // leftmost child may be inline
+                        {
+                           const setlist* s = static_cast<const setlist*>(deref_(child));
+                           if (s->inl & 0x80)
+                           {
+                              const int i = setlist_index(s, bb);
+                              if (i >= 0 && map::sl_is_inline(s, i))
+                              { emit_inline_leaf_(s, i, maintain_ ? size_t(key_.len) : 0); return; }
+                           }
+                        }
+                        child = nc;
+                        base  = maintain_ ? size_t(key_.len) : size_t(cb) + 1;
+                        continue;
+                     }
+                     // termless AND childless — degenerate/unreachable; mirror descend_max_
+                     stk_.push_back(Frame{child, 0, uint32_t(base), cb});
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
                      emit_(rh->term);
                      if (maintain_) key_.len = cb;
@@ -4287,10 +4412,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // every byte through a find.
       static bool router_next(setlist* s, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
+         // bytes[] sorted ascending ⇒ "first index >= from" == "count of bytes < from".
+         // Counted (branchless) instead of a data-dependent early-exit scan: the original
+         // exit branch mispredicts hard on random `from` (it dominated lower_bound's unwind).
          const int n = s->rh.hdr.nbranch;
-         for (int i = 0; i < n; ++i)  // bytes[] sorted ascending
-            if (s->bytes[i] >= from) { ob = s->bytes[i]; oc = s->branch[i]; return true; }
-         return false;
+         int       i = 0;
+         for (int j = 0; j < n; ++j) i += (int(s->bytes[j]) < from);
+         if (i >= n) return false;
+         ob = s->bytes[i];
+         oc = s->branch[i];
+         return true;
       }
       template <int N>
       static bool router_next(cnode<N>* c, int from, uint8_t& ob, packed_ptr& oc) noexcept
@@ -4343,14 +4474,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
          return false;
       }
 
-      // Last child with byte <= from (reverse-iterator stepping) — exact mirrors of
-      // router_next: sorted-stem reverse scan, presence-bitmap clz, nset line skip.
+      // Last child with byte <= from (reverse-iterator stepping) — mirror of router_next:
+      // bytes[] sorted ascending ⇒ the last index <= from is (count of bytes <= from) - 1.
+      // Counted (branchless) for the same reason router_next is — no mispredicting exit.
       static bool router_prev(setlist* s, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
-         const int n = s->rh.hdr.nbranch;
-         for (int i = n - 1; i >= 0; --i)  // bytes[] sorted ascending
-            if (s->bytes[i] <= from) { ob = s->bytes[i]; oc = s->branch[i]; return true; }
-         return false;
+         const int n   = s->rh.hdr.nbranch;
+         int       cnt = 0;
+         for (int j = 0; j < n; ++j) cnt += (int(s->bytes[j]) <= from);
+         if (cnt == 0) return false;
+         const int i = cnt - 1;
+         ob = s->bytes[i];
+         oc = s->branch[i];
+         return true;
       }
       template <int N>
       static bool router_prev(cnode<N>* c, int from, uint8_t& ob, packed_ptr& oc) noexcept
