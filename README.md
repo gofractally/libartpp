@@ -117,8 +117,9 @@ target_link_libraries(your_target PRIVATE artpp::artpp)
 
 ```c++
 template <class Key, class T,
-          artpp::mode Mode      = artpp::mode::none,
-          class     Allocator = std::allocator<T>>
+          artpp::mode Mode         = artpp::mode::none,
+          class       Allocator    = std::allocator<T>,
+          std::size_t ExpectedSize = 0>
 class map;
 ```
 
@@ -128,6 +129,7 @@ class map;
 | `T` | The mapped type. Move-constructible required; copy/equality/default-constructibility are required only by the operations that use them. |
 | `Mode` | Structural policy flags, combinable with `\|` (below). |
 | `Allocator` | A standard allocator. Every node and every value is allocated and constructed through it ([Allocators](#allocators)). |
+| `ExpectedSize` | Optional capacity hint. When small (`0 < ExpectedSize ≤ ~3M`) it auto-selects the compact cnode density ladder — a perf-per-byte win for small maps (see [`compact_map`](#compact_map-capacity-hint)). `0` (unknown) leaves the fast flat default. |
 
 ### Modes
 
@@ -136,12 +138,35 @@ class map;
 | `mode::none` | Pure radix: leaves, prefix nodes, and routers that widen `setlist → node_full`. The fastest default for point lookups. |
 | `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary it runs point lookups ~1.16× faster than the default radix (77 vs 89 ns) and ordered scans ~2.9× faster (2.6 vs 7.4 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
 | `mode::adaptive` | Pure radix that watches its own descent: when leaf splits keep landing under deep, narrow paths, those split points collapse to buckets. A middle ground that keeps uniform data bucket-free. |
-| `mode::dense_tiers` | Enables the segmented-bitset `c2/c4/c8` routers between `setlist` and `node_full`: roughly half the bytes on moderate-fanout nodes in exchange for costlier inserts on those tiers. |
+| `mode::dense_tiers` | Forces the segmented-bitset cnode density ladder on (`setlist → c2 → c4 → node_full`): sparse fan-out routers stay compact cnodes instead of a sparse 14-line `node_full`. On the `line_pool` this is a **perf-per-byte win for small maps** — at ≤~2M keys ~40% less RAM and ~2× faster build — but the gain fades as the map grows (fan-out nodes densify toward `node_full` and leaves come to dominate the footprint), and past ~3M it only adds build churn + pool fragmentation. Usually reached via the `ExpectedSize` hint / [`compact_map`](#compact_map-capacity-hint) rather than set by hand. |
+| `mode::flat_full` | Forces the ladder **off** (`setlist → node_full` direct) even when a capacity hint would enable it — the plain-radix behavior, for find-only or large maps. Same as the default `mode::none`. |
+| `mode::ladder_c8` | Adds the `c8` rung to the ladder (`… → c4 → c8 → node_full`). Off by default — on bimodal data `c8` is ~never the final tier — and kept for testing adversarial mid-density-clustered fan-outs. Only meaningful combined with the ladder. |
 | `mode::wide_stems` | Sparse routers consume **two** key bytes per hop (`setlist_u16`), halving router-hop depth on deep sparse trees; nodes re-stride back to one-byte routers when they densify. |
 
 All modes share the same external semantics; the flags select internal
 representations only. Every mode is exercised against `std::map` by the test
 suite.
+
+### `compact_map` (capacity hint)
+
+```c++
+template <class Key, class T, std::size_t ExpectedN, class Allocator = std::allocator<T>>
+using compact_map = artpp::map<Key, T, artpp::mode::none, Allocator, ExpectedN>;
+
+artpp::compact_map<std::string_view, uint64_t, 500'000> small;  // → cnode density ladder
+```
+
+Declaring roughly how many keys you expect lets the map pick the better
+internal representation automatically. The default `map` widens sparse fan-out
+routers straight to a 14-line `node_full`; at small scale those nodes are
+genuinely sparse (~30 of 256 branches), so on the `line_pool` a `compact_map`
+stores them as 3–5-line cnodes instead — **~40% less RAM and ~2× faster to
+build below ~3M keys**, with point/ordered lookups within noise. Above the
+measured crossover the hint transparently falls back to the flat default
+(the ladder would only add build churn and pool fragmentation once fan-out
+nodes saturate toward `node_full` and leaf storage dominates the footprint).
+The crossover is a measured constant (`ladder_capacity_max`); for explicit
+control use `mode::dense_tiers` (force on) or `mode::flat_full` (force off).
 
 ## Key types and `key_codec`
 

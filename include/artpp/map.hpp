@@ -45,16 +45,28 @@
 namespace artpp
 {
    // Compile-time structural policy — a flag set, combinable with operator|:
-   //   map<T>                              plain adaptive-radix
+   //   map<T>                              plain adaptive-radix (setlist→node_full direct)
+   //   compact_map<T, ExpectedN>           capacity hint: auto-selects the cnode ladder when small
+   //   map<T, mode::dense_tiers>           force the cnode density ladder on (compact, small map)
    //   map<T, mode::buckets>               last-mile buckets from the root
-   //   map<T, mode::adaptive | mode::dense_tiers>
    enum class mode : unsigned
    {
-      none        = 0,
+      none        = 0,        // DEFAULT: plain adaptive radix (setlist→node_full direct). The
+                              //   cnode density ladder is OFF here — it is auto-selected for small
+                              //   maps via a capacity hint (see compact_map / the ExpectedSize
+                              //   template arg) or requested explicitly with mode::dense_tiers.
       buckets     = 1u << 0,  // terminals are last-mile buckets (collapse sparse/deep tails)
       adaptive    = 1u << 1,  // radix that collapses deep-narrow leaf-splits to buckets
-      dense_tiers = 1u << 2,  // allow the segmented-bitset cnode routers (setlist→cN→full)
+      dense_tiers = 1u << 2,  // force the segmented-bitset cnode ladder ON (setlist→c2→c4→full):
+                              //   compact sparse routers — a perf-per-byte win for SMALL maps
+                              //   (<=~3M). Past the crossover it converges to node_full and only
+                              //   adds build churn + pool fragmentation, so it is NOT the default.
       wide_stems  = 1u << 3,  // sparse routers consume 2 bytes/hop (setlist_u16); re-stride if dense
+      flat_full   = 1u << 4,  // force the ladder OFF even when a capacity hint would enable it
+                              //   (setlist→node_full direct) — for find-only or large maps
+      ladder_c8   = 1u << 5,  // add the c8 rung (setlist→c2→c4→c8→full); off by default (c8 is
+                              //   ~never the final tier on bimodal data), kept for testing. Only
+                              //   meaningful together with the ladder (mode::dense_tiers / a hint).
    };
    constexpr mode operator|(mode a, mode b) noexcept { return mode(unsigned(a) | unsigned(b)); }
    constexpr mode operator&(mode a, mode b) noexcept { return mode(unsigned(a) & unsigned(b)); }
@@ -466,10 +478,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
    struct handle_of<A, std::void_t<typename A::artpp_handle>> { using type = typename A::artpp_handle; };
 
    // Structural tuning is compile-time policy (zero runtime branch cost; dead modes are
-   // discarded). Defaults = plain adaptive-radix. Buckets: terminals are last-mile buckets
-   // from the root. Adaptive: radix that collapses deep-narrow leaf-splits to buckets.
-   // DenseTiers: allow the segmented-bitset cnode routers between setlist and node_full.
-   template <class Key, class T, mode Mode = mode::none, class Allocator = std::allocator<T>>
+   // discarded). Default = plain adaptive-radix (setlist→node_full). DenseTiers (the cnode
+   // density ladder) auto-engages from a small capacity hint (compact_map / ExpectedSize) or
+   // mode::dense_tiers — a perf-per-byte win for small maps. Buckets / Adaptive as before.
+   template <class Key, class T, mode Mode = mode::none, class Allocator = std::allocator<T>,
+             std::size_t ExpectedSize = 0>
    class map
    {
      public:
@@ -542,7 +555,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // The flag set unpacked into the if-constexpr gates used throughout.
       static constexpr bool Buckets    = has_mode(Mode, mode::buckets);
       static constexpr bool Adaptive   = has_mode(Mode, mode::adaptive);
-      static constexpr bool DenseTiers = has_mode(Mode, mode::dense_tiers);
+      // FLAT by default. The cnode density ladder engages when a capacity hint says the map is
+      // small enough to be a perf-per-byte win (0 < ExpectedSize <= ladder_capacity_max, the
+      // measured pool crossover) OR when requested explicitly (mode::dense_tiers); mode::flat_full
+      // forces it off even under a hint. Above the crossover the ladder converges to node_full
+      // and only adds build churn + pool fragmentation — so it is never auto-selected there.
+      static constexpr std::size_t ladder_capacity_max = 3'000'000;
+      static constexpr bool        DenseTiers =
+          !has_mode(Mode, mode::flat_full) &&
+          (has_mode(Mode, mode::dense_tiers) || (ExpectedSize != 0 && ExpectedSize <= ladder_capacity_max));
+      static constexpr bool LadderC8 = has_mode(Mode, mode::ladder_c8);  // add c8 rung (testing)
       static constexpr bool WideStems  = has_mode(Mode, mode::wide_stems);
 
      public:
@@ -3529,6 +3551,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // the predicted total router-hops removed if every eligible pair were fused.
          uint64_t router_hops = 0, collapsible = 0, collapse_saved = 0;
          uint64_t fullp = 0;  // node_full routers whose prefix is fused in-header (K::pfxd)
+         // Occupancy census of the direct-index tier (node_full + pfxd): how sparse are the
+         // fulls? Sparse fulls are mode::none's pathology (1792 B + far router_next scan for a
+         // handful of branches); dense fulls (>=192) are where direct-index actually wins.
+         // full_nbr_sum / (full+fullp) = mean fanout. cn_nbr_sum = branches living in cnodes.
+         uint64_t full_lt48 = 0, full_48_96 = 0, full_96_160 = 0, full_160_192 = 0, full_ge192 = 0;
+         uint64_t full_nbr_sum = 0, cn_nbr_sum = 0;
       };
       // Returns the number of terminals in cur's subtree (used to weight collapse_saved).
       // routers_above = routers already on the path; parent_noterm_router = the parent is a
@@ -3569,6 +3597,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
          const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
          const bool        noterm = rh->term.is_null();
+         {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode branches
+            const unsigned nb = rh->hdr.nbranch;
+            const K        kk = cur.tag();
+            if (kk == K::node_full || kk == K::pfxd)
+            {
+               d.full_nbr_sum += nb;
+               d.full_lt48 += (nb < 48);
+               d.full_48_96 += (nb >= 48 && nb < 96);
+               d.full_96_160 += (nb >= 96 && nb < 160);
+               d.full_160_192 += (nb >= 160 && nb < 192);
+               d.full_ge192 += (nb >= 192);
+            }
+            else if (kk == K::c2 || kk == K::c4 || kk == K::c8)
+               d.cn_nbr_sum += nb;
+         }
          if (parent_noterm_router) ++d.collapsible;
          uint64_t sub = dbg_walk(rh->term, d, depth + 1, routers_above + 1, false);
          router_for_each(cur, [&](uint8_t, packed_ptr br) {
@@ -4636,11 +4679,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
          with_router(cur, [&](auto* n) { router_for_each(n, f); });
       }
 
-      // Widen a full router. Default: setlist→node_full directly (the fast path —
-      // O(1) direct-index inserts, one rebuild). With dense tiers enabled, climb the
-      // memory-saving ladder setlist→c2→c4→c8→node_full instead: ~half the bytes on
-      // moderate-fanout nodes, but rank-dense inserts are O(n) and each rung is a
-      // rebuild, so it trades insert throughput for footprint. Pick per workload.
+      // Widen a full router. Default (flat): setlist→node_full directly. With the cnode density
+      // ladder on (mode::dense_tiers or a small capacity hint — a perf-per-byte win for small
+      // maps), climb setlist→c2→c4→node_full instead: sparse routers stay compact cnodes (less
+      // memory + tighter ordered iteration than a sparse full). Occupancy is bimodal — a router
+      // ends at ~30 branches or ~256, little between — so c4→full is the right jump and the c8
+      // rung is dead weight (skipped unless LadderC8, kept for adversarial mid-density clusters).
       packed_ptr widen(packed_ptr cur)
       {
          const K k = cur.tag();
@@ -4654,11 +4698,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
          const size_t os = node_size(k);
          packed_ptr   out;
          if constexpr (!DenseTiers)
-            out = build_wider<node_full>(cur, K::node_full);  // fast path: straight to full
+            out = build_wider<node_full>(cur, K::node_full);  // flat_full: straight to full
          else if (k == K::setlist_u8) out = build_wider<cnode<2>>(cur, K::c2);
          else if (k == K::c2)         out = build_wider<cnode<4>>(cur, K::c4);
-         else if (k == K::c4)         out = build_wider<cnode<8>>(cur, K::c8);
-         else if (k == K::c8)         out = build_wider<node_full>(cur, K::node_full);
+         else if (k == K::c4)
+         {
+            if constexpr (LadderC8) out = build_wider<cnode<8>>(cur, K::c8);
+            else                    out = build_wider<node_full>(cur, K::node_full);  // skip dead c8
+         }
+         else if (k == K::c8)         out = build_wider<node_full>(cur, K::node_full);  // only if LadderC8
          else { assert(false); __builtin_unreachable(); }
          node_free_(deref_(cur), os);
          return out;
@@ -5169,4 +5217,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
 }  // namespace detail
 
 using detail::map;  // re-export only the public class; impl stays in artpp::detail
+
+// Capacity-hint convenience. Declaring the expected element count auto-selects the cnode density
+// ladder when that count is small enough to be a perf-per-byte win — compact sparse routers, on
+// the line_pool ~40% less RAM and ~2x faster build below ~3M keys (vs the flat default). Above the
+// measured crossover it transparently stays flat, since the ladder would then only add build churn
+// and pool fragmentation. Ergonomic spelling of map<K, V, mode::none, Allocator, ExpectedN>; for
+// other modes (buckets, wide_stems, …) combine with mode::dense_tiers on the map<> template direct.
+template <class Key, class T, std::size_t ExpectedN, class Allocator = std::allocator<T>>
+using compact_map = detail::map<Key, T, mode::none, Allocator, ExpectedN>;
 }  // namespace artpp

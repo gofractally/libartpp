@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+using artpp::compact_map;
 using artpp::map;
 using artpp::mode;
 
@@ -588,7 +589,9 @@ static void test_equality()
    // (widens to node_full) and erases back to the same 14 — widen/shrink hysteresis
    // keeps B wide, so the node-by-node walk hits a representation mismatch and the
    // compare falls back to the canonical sequence. Equal content must compare equal
-   // through BOTH paths.
+   // through BOTH paths. Uses the default (flat) map → the direct-index node_full path
+   // (pfxd prefix-fusion + full→setlist de-widen); the cnode ladder's shapes are covered
+   // by the mode::dense_tiers divergence block below + the dense fuzz.
    {
       using T2 = map<std::string_view, uint64_t>;
       T2 s, w;
@@ -610,6 +613,67 @@ static void test_equality()
       for (char c = 'a' + 8; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }
       CHECK(w.debug_stats().full == 0 && w.debug_stats().fullp == 0);
       CHECK(s == w);
+   }
+   // Same content-equality-survives-shape-divergence check on the DEFAULT ladder: A stays a
+   // setlist; B widens into a cnode (20 clustered "k?" branches overflow c2 → c4) and erases
+   // back to 14 — hysteresis keeps it a c4 — so the node-by-node walk hits a setlist-vs-cnode
+   // representation mismatch and must still compare equal via the canonical-sequence fallback.
+   {
+      using T2 = map<std::string_view, uint64_t, mode::dense_tiers>;  // explicit cnode density ladder
+      T2 s, w;
+      auto key = [](char c) { return std::string("k") + c; };
+      for (char c = 'a'; c < 'a' + 14; ++c) s.insert(key(c), uint64_t(c));
+      for (char c = 'a'; c < 'a' + 20; ++c) w.insert(key(c), uint64_t(c));
+      for (char c = 'a' + 14; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);
+      const auto ds = s.debug_stats(), dw = w.debug_stats();
+      CHECK(ds.setlist == 1 && ds.full == 0 && ds.c4 == 0);  // A: plain setlist (14 <= CAP 16)
+      CHECK(dw.c4 == 1 && dw.full == 0 && dw.c2 == 0);        // B: setlist→c2→c4, hysteresis holds at 14
+      CHECK(s == w && w == s);                                // equal across setlist-vs-cnode shapes
+      w.update(key('c'), 999u);
+      CHECK(s != w);
+      w.update(key('c'), uint64_t('c'));
+      CHECK(s == w);
+      for (char c = 'a' + 8; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }  // → 8 branches
+      CHECK(w.debug_stats().setlist == 1 && w.debug_stats().c4 == 0);  // de-widened cnode→setlist
+      CHECK(s == w);
+   }
+   // c8 tier (mode::ladder_c8): a wide, evenly-spread fan-out climbs setlist→c2→c4→c8. The
+   // default ladder jumps c4→full (c8 is dead weight on bimodal data), but c8 is kept compiling,
+   // correct, and iterable behind the toggle until the suite can rule it out entirely.
+   {
+      using T8 = map<uint32_t, uint32_t, mode::dense_tiers | mode::ladder_c8>;
+      T8 t;
+      for (uint32_t i = 0; i < 100; ++i) t.insert((i * 2) << 24, i);  // top bytes 0,2,..,198: <=16 / 32-seg
+      CHECK(t.size() == 100);
+      CHECK(t.debug_stats().c8 == 1 && t.debug_stats().full == 0);  // 100 spread branches land in c8
+      std::vector<uint32_t> got;
+      t.for_each_value([&](const uint32_t& v) { got.push_back(v); });
+      bool ordered = got.size() == 100;
+      for (uint32_t i = 0; i < got.size(); ++i) ordered = ordered && got[i] == i;
+      CHECK(ordered);  // c8 router_next yields ascending key order
+      for (uint32_t i = 0; i < 100; ++i) { uint32_t o; CHECK(t.find((i * 2) << 24, o) && o == i); }
+      for (uint32_t i = 0; i < 50; ++i) CHECK(t.erase((i * 2) << 24) == 1);
+      CHECK(t.size() == 50);
+      for (uint32_t i = 50; i < 100; ++i) { uint32_t o; CHECK(t.find((i * 2) << 24, o) && o == i); }
+   }
+   // Capacity hint (compact_map / ExpectedSize): a SMALL hint auto-engages the cnode ladder, a
+   // LARGE hint stays flat — using the same 20 clustered "k?" branches that become a c4 vs a full.
+   {
+      auto fill = [](auto& m) { for (char c = 'a'; c < 'a' + 20; ++c) m.insert(std::string("k") + c, uint64_t(c)); };
+      compact_map<std::string_view, uint64_t, 1000>        small;  fill(small);
+      compact_map<std::string_view, uint64_t, 100'000'000> big;    fill(big);
+      const auto sds = small.debug_stats();
+      const auto bds = big.debug_stats();
+      CHECK(sds.c4 == 1 && sds.full + sds.fullp == 0);  // hint small → cnode ladder
+      CHECK(bds.full + bds.fullp == 1 && bds.c4 == 0);  // hint large → flat (k-prefix fuses → pfxd)
+      CHECK(small.size() == 20 && big.size() == 20);
+      for (char c = 'a'; c < 'a' + 20; ++c)
+      {
+         uint64_t o;
+         const auto k = std::string("k") + c;
+         CHECK(small.find(k, o) && o == uint64_t(c));
+         CHECK(big.find(k, o) && o == uint64_t(c));
+      }
    }
    // bucket entries compare by content, not storage (arrival) order
    {

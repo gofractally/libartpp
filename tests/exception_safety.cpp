@@ -185,7 +185,7 @@ int main()
 {
    using RefAlloc = throwing_alloc<std::pair<const std::string, counted>>;
    using RefMap   = std::map<std::string, counted, std::less<>, RefAlloc>;
-   using HkvRadix = map<std::string_view, counted, mode::none, throwing_alloc<counted>>;
+   using HkvRadix = map<std::string_view, counted, mode::none, throwing_alloc<counted>>;  // flat (default)
    using HkvBkt   = map<std::string_view, counted, mode::buckets, throwing_alloc<counted>>;
    using HkvAdp   = map<std::string_view, counted, mode::adaptive, throwing_alloc<counted>>;
    using HkvDense = map<std::string_view, counted, mode::adaptive | mode::dense_tiers, throwing_alloc<counted>>;

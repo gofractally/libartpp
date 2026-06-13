@@ -132,6 +132,14 @@ if(ARTPP_BENCHMARKS)
    target_compile_options(artpp_bench_buffer_array PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
    set_target_properties(artpp_bench_buffer_array PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+   # occupancy + perf-per-byte diagnostic — the data behind compact_map's capacity-hint crossover
+   # (flat vs the cnode density ladder: node-kind census, full-occupancy histogram, bytes/key over
+   # the line_pool, and a perf-per-byte composite). artpp-only; run alone for clean numbers.
+   add_executable(artpp_widen_probe bench/widen_probe.cpp)
+   target_link_libraries(artpp_widen_probe PRIVATE artpp)
+   target_compile_options(artpp_widen_probe PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_widen_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
    # memory footprint probe: bytes/key per contestant per distribution (run alone)
    add_executable(artpp_mem_probe bench/mem_probe.cpp)
    target_link_libraries(artpp_mem_probe PRIVATE artpp artpp_vendor_libart absl::btree)
