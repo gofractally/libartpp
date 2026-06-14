@@ -950,10 +950,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   bool inserted;
                   if constexpr (Adaptive)
-                     if (lowfan >= 2 &&  // deep-narrow leaf collision → bucket (both
-                         bkt_fits(key.size() - depth) &&  // suffixes must fit a page)
-                         (cur.tag() == K::value_inline ||
-                          bkt_fits(leaf_slen(static_cast<const char*>(deref_term_(cur))))))
+                     if (lowfan >= 2 &&  // deep-narrow leaf collision → bucket, iff BOTH the old
+                         bkt_fits2(cur.tag() == K::value_inline  // and new suffixes share one page
+                                       ? 0
+                                       : leaf_slen(static_cast<const char*>(deref_term_(cur))),
+                                   key.size() - depth))
                      {
                         *slot = collapse_to_bucket<Assign>(cur, key, depth, std::forward<VF>(v), inserted);
                         count_ += inserted;
@@ -2578,6 +2579,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Can a FRESH page hold one entry with this suffix (slot pair + entry bytes)?
       // Suffixes past this cap are stored as plain leaves instead (see make_bucket_branch).
       static bool bkt_fits(size_t slen) noexcept { return 4 + bkt_esize(slen) <= size_t(bucket::PAGE - 4); }
+      // Two entries collapsing into ONE fresh page (adaptive collapse): each pays its 4-byte
+      // index slot + rounded payload, and BOTH must fit — checking them individually is not
+      // enough (two suffixes that each fit alone can together overflow the page).
+      static bool bkt_fits2(size_t a, size_t b) noexcept
+      {
+         return (4 + bkt_esize(a)) + (4 + bkt_esize(b)) <= size_t(bucket::PAGE - 4);
+      }
       // first index with div >= q (count of div < q). Deliberately scalar: PAGE caps n at
       // a few dozen, and a lane-masked NEON count measured flat (buckets bench, 2M keys —
       // the page touch dominates), so the branchless 2-op loop stays.
@@ -2807,23 +2815,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::string_view fN(reinterpret_cast<const char*>(bkt_suf(eN)), bkt_slen(eN));
          const size_t     c = lcp(f0, fN);
          setlist*         r = new_setlist();
-         packed_ptr       top;
-         {
-            // common bytes from a stable copy (entries get freed when we drop b)
-            uint8_t cbuf[setlist::PREFIX_CAP > 8 ? setlist::PREFIX_CAP : 8];
-            const bool fits = c <= setlist::PREFIX_CAP;
-            if (fits && c) std::memcpy(cbuf, bkt_suf(e0), c);
-            // A short common prefix goes inline; a longer one is NOT wrapped here — the
-            // re-inserted full suffixes below re-form it naturally as prefix nodes.
-            top = fits ? apply_prefix(r, std::string_view(reinterpret_cast<char*>(cbuf), c))
-                       : pack_(r, K::setlist_u8);
-         }
+         packed_ptr       top = pack_(r, K::setlist_u8);
          // Destructive rebuild: values are MOVED out of b. Strong isn't achievable without
          // copying (T may be move-only), but basic-guarantee + leak-freedom is: guard the
          // partial `top` so a throw reclaims it, and DON'T destroy the moved-from originals
          // until the whole rebuild succeeds — on a throw, b keeps a full set of valid
          // (moved-from) values, so it stays consistent and is reclaimed normally at teardown.
-         build_guard g{this, &top};
+         build_guard g{this, &top};  // guards `top` across the (throwing) apply_prefix + rebuild
+         // The shared prefix of ALL entries becomes this subtree's prefix in ONE node: inline
+         // when it fits a setlist, else a prefix_node above it (apply_prefix picks). It MUST be
+         // wrapped here — re-inserting the full suffixes does NOT re-form a long run as a prefix
+         // node; each shared byte would spawn its own single-branch setlist (a deep-narrow chain
+         // that, past the remove window, can't be unwound). Read straight from e0's suffix: it is
+         // stable until b is freed below, and apply_prefix/make_prefix copy the bytes immediately.
+         if (c)
+            top = apply_prefix(r, std::string_view(reinterpret_cast<const char*>(bkt_suf(e0)), c));
          for (int i = 0; i < n; ++i)
          {
             char*            e = bkt_entry(b, i);
@@ -2919,10 +2925,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
                const int     i    = setlist_index(s, byte);
                if (i >= 0)
                {
+                  // An inline-leaf child must become a real leaf before descent: bkt_put (like
+                  // split_leaf below) treats the branch slot as an external value_ptr handle, so
+                  // an inline tail-offset would be mis-deref'd. Mirrors insert_'s setlist arm.
+                  if (sl_is_inline(s, i)) sl_externalize_(s, i);  // throws → strong: unchanged
                   s->branch[i] = bkt_put<Assign>(s->branch[i], key, depth + 1, std::forward<VF>(val), ins);
                   return node;
                }
-               ins              = true;
+               ins = true;
+               // setlist_set shifts branch[] and would desync the inl bits — flatten any inline
+               // children first (one-time; the setlist stays external thereafter). Mirrors insert_.
+               if (sl_inl_active(s)) sl_externalize_all_(s);  // throws → strong
                packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
                if (setlist_set(s, byte, child)) return node;
                build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
@@ -3758,10 +3771,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
                         else                    walk_v_(s->branch[i], f);
                      break;
                   }
+                  case K::setlist_u16:  // wide router (2 bytes/hop) — must be walked like any other
+                  {
+                     const setlist16* s = static_cast<const setlist16*>(deref_(cur));
+                     const int        n = s->rh.hdr.nbranch;
+                     for (int i = 0; i < n; ++i) walk_v_(s->branch[i], f);
+                     break;
+                  }
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
                   case K::c4: cnode_for_each(static_cast<const cnode<4>*>(deref_(cur)), recurse); break;
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
-                  default:
+                  default:  // node_full / pfxd (both deref to a node_full)
                   {
                      const node_full* fn = static_cast<const node_full*>(deref_(cur));
                      for (int byte = 0; byte < 256; ++byte)

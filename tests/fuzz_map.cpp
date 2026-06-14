@@ -26,7 +26,9 @@
 #include <cstring>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using artpp::map;
@@ -60,26 +62,40 @@ static int            g_cfg  = -1;
 // Adversarial key: half the time extend/mutate a recently-seen key (shared prefixes, prefix-of-
 // another, wide fan-out at a shared node); else a fresh short key over a tiny alphabet. Includes
 // the empty key, 0x00 and 0xFF bytes (boundary stems), and the occasional long key.
+// Debug knobs (env): ARTPP_FZ_STRICT=1 cross-checks after every op (pinpoints a corrupting op);
+// ARTPP_FZ_MAXLEN caps key length (bypass a known long-key bug to surface others).
+static const bool   g_strict = std::getenv("ARTPP_FZ_STRICT") != nullptr;
+static const bool   g_trace  = std::getenv("ARTPP_FZ_TRACE") != nullptr;  // log each op (debug)
+static const size_t g_maxlen =
+    std::getenv("ARTPP_FZ_MAXLEN") ? std::strtoull(std::getenv("ARTPP_FZ_MAXLEN"), nullptr, 10) : ~size_t(0);
+
 static const unsigned char ALPHABET[] = {0x00, 0x01, 0x02, 'a', 'b', 'c', 'd', 0x7f, 0xfe, 0xff};
-static std::string gen_key(Reader& r, std::vector<std::string>& pool)
+// `wide` selects the byte distribution: NARROW (a tiny alphabet) clusters keys into shared
+// prefixes and small fan-out (setlists, prefix nodes, inline leaves, buckets); WIDE (full 0..255)
+// gives the >16-distinct-byte fan-out that drives the widen ladder — setlist→cnode→node_full→c8
+// — and de-widen on erase. Per-run choice, so coverage-guided fuzzing explores both regimes.
+static std::string gen_key(Reader& r, std::vector<std::string>& pool, bool wide)
 {
-   std::string k;
+   auto byte = [&] { return wide ? char(r.u8()) : char(ALPHABET[r.u8() % sizeof ALPHABET]); };
+   std::string   k;
    const uint8_t mode_byte = r.u8();
    if (!pool.empty() && (mode_byte & 1))
    {
       k = pool[r.u32() % pool.size()];          // a prior key …
       const uint8_t op = (mode_byte >> 1) & 3;
       if (op == 0 && !k.empty()) k.pop_back();   // … truncated (prefix)
-      else if (op == 1) k.push_back(char(ALPHABET[r.u8() % sizeof ALPHABET]));  // … extended (deeper)
-      else if (op == 2 && !k.empty()) k[r.u8() % k.size()] = char(ALPHABET[r.u8() % sizeof ALPHABET]);
+      else if (op == 1) k.push_back(byte());     // … extended (deeper / wider fan-out)
+      else if (op == 2 && !k.empty()) k[r.u8() % k.size()] = byte();
       // op == 3: reuse verbatim (exercises the dup-key / overwrite paths)
    }
    else
    {
       int n = (mode_byte >> 1) % 12;             // mostly short; rarely longer for deep chains
       if ((mode_byte & 0x70) == 0x70) n += int(r.u8() % 64);
-      for (int j = 0; j < n; ++j) k.push_back(char(ALPHABET[r.u8() % sizeof ALPHABET]));
+      if ((mode_byte & 0xe0) == 0xe0) n += int(r.u32() % 4000);  // rare multi-KB key → multi-line terminal
+      for (int j = 0; j < n; ++j) k.push_back(byte());           // (capped well under max_key_bytes)
    }
+   if (k.size() > g_maxlen) k.resize(g_maxlen);  // optional cap (bypass a long-key bug to find others)
    if (pool.size() < 256) pool.push_back(k);
    else pool[r.u32() % pool.size()] = k;
    return k;
@@ -94,6 +110,8 @@ template <> std::string mkval<std::string>(Reader& r)
    return s;
 }
 
+// ARTPP_FZ_STRICT=1 cross-checks after EVERY op (vs the periodic default) — slow, but the full
+// walk then trips right after the op that corrupts the structure, pinpointing it for debugging.
 // Compare the full ordered contents (forward via ++, backward via --/--end()) and size.
 template <class Tree, class V>
 static void cross_check(const Tree& t, const std::map<std::string, V>& m, int op)
@@ -117,6 +135,13 @@ static void cross_check(const Tree& t, const std::map<std::string, V>& m, int op
       }
       FZCHECK(it == t.begin(), op);
    }
+   {  // value-only DFS (for_each_value) — a separate walk from the iterator; same values, key order
+      std::vector<V> fv;
+      t.for_each_value([&](const V& v) { fv.push_back(v); });
+      FZCHECK(fv.size() == m.size(), op);
+      std::size_t idx = 0;
+      for (auto& [mk, mv] : m) { FZCHECK(idx < fv.size() && fv[idx] == mv, op); ++idx; }
+   }
 }
 
 template <class Tree>
@@ -125,11 +150,15 @@ static void run_impl(Tree& t, Reader& r)
    using V = typename Tree::mapped_type;
    std::map<std::string, V> m;
    std::vector<std::string> pool;
-   int                      op = 0;
+   const bool               wide = r.u8() & 1;  // per-run: narrow (clustered) vs wide (fan-out) keys
+   int                      op   = 0;
    for (; !r.done(); ++op)
    {
-      const std::string k = gen_key(r, pool);
-      const uint8_t     choice = r.u8() % 7;
+      const std::string k      = gen_key(r, pool, wide);
+      const uint8_t     choice = r.u8() % 8;
+      if (g_trace)
+         std::fprintf(stderr, "op#%d choice=%d klen=%zu sz=%zu k0=%d\n", op, choice, k.size(),
+                      m.size(), k.empty() ? -1 : (int)(unsigned char)k[0]);
       switch (choice)
       {
          case 0: { V v = mkval<V>(r); FZCHECK(t.insert(k, v) == m.insert_or_assign(k, v).second, op); break; }
@@ -167,21 +196,45 @@ static void run_impl(Tree& t, Reader& r)
             FZCHECK(t.find_opt(k).has_value() == have, op);
             break;
          }
-         case 6:  // ordered queries
+         case 6:  // ordered queries — key AND value at each bound, plus equal_range consistency
          {
-            auto lo = t.lower_bound(k), ml_it = t.end();
+            auto lo = t.lower_bound(k);
             auto ml = m.lower_bound(k);
             FZCHECK((lo == t.end()) == (ml == m.end()), op);
-            if (ml != m.end()) FZCHECK(std::string(lo.key()) == ml->first, op);
+            if (ml != m.end()) FZCHECK(std::string(lo.key()) == ml->first && lo.value() == ml->second, op);
             auto hi = t.upper_bound(k);
             auto mu = m.upper_bound(k);
             FZCHECK((hi == t.end()) == (mu == m.end()), op);
-            if (mu != m.end()) FZCHECK(std::string(hi.key()) == mu->first, op);
-            (void)ml_it;
+            if (mu != m.end()) FZCHECK(std::string(hi.key()) == mu->first && hi.value() == mu->second, op);
+            auto er = t.equal_range(k);  // must coincide with [lower_bound, upper_bound)
+            FZCHECK(er.first == lo && er.second == hi, op);
+            break;
+         }
+         case 7:  // at(): value or throw, vs the oracle
+         {
+            bool threw = false;
+            V    tv{};
+            try { tv = t.at(k); } catch (const std::out_of_range&) { threw = true; }
+            const bool present = m.count(k) != 0;
+            FZCHECK(threw == !present, op);
+            if (!threw) FZCHECK(tv == m.at(k), op);
             break;
          }
       }
-      if ((op & 0x3f) == 0x3f) cross_check(t, m, op);  // periodic full-state agreement
+      if (g_strict) cross_check(t, m, op);  // pinpoint the corrupting op (ARTPP_FZ_STRICT=1)
+      if ((op & 0x3f) == 0x3f)
+      {
+         cross_check(t, m, op);  // periodic full-state agreement
+         // operator== over this config's node kinds: rebuild the same content in a fresh tree
+         // (same config ⇒ same shape) and require equality both ways. (std::allocator configs
+         // only — the pool config can't be default-constructed with a live pool.)
+         if constexpr (std::is_same_v<typename Tree::allocator_type, std::allocator<V>>)
+         {
+            Tree clone;
+            for (auto& [ck, cv] : m) clone.insert(ck, cv);
+            FZCHECK(clone == t && t == clone, op);
+         }
+      }
       if (r.u8() == 0) { t.clear(); m.clear(); }       // rare reset → exercises teardown + rebuild
    }
    cross_check(t, m, op);  // final agreement
@@ -252,6 +305,8 @@ int main(int argc, char** argv)
       if ((rng() & 0x1f) == 0) len += rng() % 8192;  // occasional long input → larger trees
       buf.resize(len);
       for (auto& b : buf) b = uint8_t(rng());
+      if (const char* dp = std::getenv("ARTPP_DUMP"))  // capture each input; last survivor = crasher
+      { if (FILE* f = std::fopen(dp, "wb")) { std::fwrite(buf.data(), 1, buf.size(), f); std::fclose(f); } }
       run_dispatch(buf.data(), buf.size());
    }
    std::printf("artpp_fuzz: ALL PASS (%zu inputs, seed %llu)\n", iters, (unsigned long long)seed);
