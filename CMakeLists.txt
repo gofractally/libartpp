@@ -80,6 +80,7 @@ if(ARTPP_TESTS)
    artpp_test(persistence      -O2 -g)  # file-backed line_pool survives close + reopen
    artpp_test(fuzz_map         -O2 -g)  # differential fuzzer vs std::map (standalone RNG runner)
    artpp_test(regression       -O2 -g)  # deterministic guards for fuzzer-caught (planted) bugs
+   artpp_test(v2_smoke         -O2 -g)  # artpp::v2 node-rewrite baseline (clone of v1, must match std::map)
 
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)
