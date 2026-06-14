@@ -81,6 +81,12 @@ if(ARTPP_TESTS)
    artpp_test(fuzz_map         -O2 -g)  # differential fuzzer vs std::map (standalone RNG runner)
    artpp_test(regression       -O2 -g)  # deterministic guards for fuzzer-caught (planted) bugs
    artpp_test(v2_smoke         -O2 -g)  # artpp::v2 node-rewrite baseline (clone of v1, must match std::map)
+   artpp_test(v2_node_addr     -O2 -g)  # v2 routing-kernel correctness (divider/popcount/direct index)
+   # v1 behavioral suite cloned onto artpp::v2 — the gate the node rewrite must keep green.
+   artpp_test(v2_conformance      -O2 -g)
+   artpp_test(v2_reverse_iter     -O2 -g)
+   artpp_test(v2_exception_safety -O1 -g)
+   artpp_test(v2_fuzz_map         -O2 -g)
 
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)
