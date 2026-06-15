@@ -595,6 +595,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // the rest of the class).
       static constexpr size_t inline_cap   = sizeof(Ptr) - 1;
       static constexpr bool   inlineable   = std::is_trivially_copyable_v<T> && sizeof(T) <= inline_cap;
+      // SET only (HasValue==false): a value_inline handle packs a short KEY SUFFIX instead
+      // of a value — up to sizeof(Ptr)-1 bytes (5 at the default 6-byte handle), with the
+      // length in byte0's high nibble (so cap<=7). Declared up front: the iterator's inline-
+      // suffix buffer sizes from it (parsed before the rest of the class).
+      static constexpr size_t inline_suffix_cap = sizeof(Ptr) - 1;
+      static_assert(HasValue || inline_suffix_cap <= 7,
+                    "set inline suffix length must fit byte0's high nibble (cap<=7)");
       // Clamped so pack/unpack are instantiation-safe even for non-inlineable T (dead
       // code under the runtime guard); == sizeof(T) on the path that actually inlines.
       static constexpr size_t inline_bytes = sizeof(T) <= inline_cap ? sizeof(T) : inline_cap;
@@ -966,7 +973,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if constexpr (Adaptive)
                      if (lowfan >= 2 &&  // deep-narrow leaf collision → bucket, iff BOTH the old
                          bkt_fits2(cur.tag() == K::value_inline  // and new suffixes share one page
-                                       ? 0
+                                       // map inline → empty suffix; set inline → packed suffix len
+                                       ? (HasValue ? size_t(0) : suffix_of_inline(cur).size())
                                        : leaf_slen(static_cast<const char*>(deref_term_(cur))),
                                    key.size() - depth))
                      {
@@ -1148,7 +1156,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
 #define ARTPP_TPTR(R) deref_term_raw_(R)  /* terminal (16B-region) resolution */
 #define ARTPP_NEXT(ND) { depth = (ND); continue; }
 #define ARTPP_BODY_VALUE_PTR    return op.leaf(ARTPP_TPTR(raw), kp + depth, klen - depth);
-#define ARTPP_BODY_VALUE_INLINE return op.inl(raw, depth == klen);
+/* value_inline carries a value (map, empty suffix) OR a packed key SUFFIX (set). Pass the
+   raw handle AND the remaining key bytes: the map inl ignores (rem,rlen) and tests at-end
+   via rlen==0; the set inl compares its packed suffix against (rem,rlen). */
+#define ARTPP_BODY_VALUE_INLINE return op.inl(raw, kp + depth, klen - depth);
 #define ARTPP_BODY_BUCKET       return op.bkt(reinterpret_cast<const bucket*>(ARTPP_PTR(raw)), kp + depth, klen - depth);
 #define ARTPP_BODY_PREFIX { \
    const char* p = ARTPP_PTR(raw); const uint16_t pl = pn_plen(p); \
@@ -1256,9 +1267,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                self->copy_value(*out, leaf_val(p));
                return true;
             }
-            bool inl(uint64_t raw, bool at_end) const
+            bool inl(uint64_t raw, const char* rem, size_t rl) const
             {
-               if (!at_end) return false;
+               if constexpr (!HasValue)  // SET: the handle packs a key suffix; compare it
+                  return suffix_of_inline(packed_ptr_from_raw_(raw)) == std::string_view(rem, rl);
+               if (rl != 0) return false;  // map: empty suffix → must be at key end
                if constexpr (inlineable)  // value_inline exists only for an inlineable T
                {
                   const uint64_t shifted = raw >> 8;
@@ -1296,7 +1309,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return std::string_view(reinterpret_cast<const char*>(leaf_suf(p)), leaf_slen(p)) ==
                       std::string_view(rem, rl);
             }
-            bool inl(uint64_t, bool at_end) const { return at_end; }
+            bool inl(uint64_t raw, const char* rem, size_t rl) const
+            {
+               if constexpr (!HasValue)  // SET: the handle packs a key suffix; compare it
+                  return suffix_of_inline(packed_ptr_from_raw_(raw)) == std::string_view(rem, rl);
+               (void)raw;
+               return rl == 0;  // map: empty-suffix terminal → present iff at key end
+            }
             bool bkt(const bucket* b, const char* rem, size_t rl) const
             {
                return bkt_locate(b, std::string_view(rem, rl)) != nullptr;
@@ -1641,6 +1660,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
          mutable bool               maintain_ = false;  // false → ++ skips key work; flips on first key()
          const uint8_t*             sfx_    = nullptr;   // current terminal suffix; null/0 = none
          uint32_t                   sfxlen_ = 0;
+         // SET only: an inline-suffix terminal's bytes live in a TRANSIENT handle (a register
+         // value or a node slot that the next ++ overwrites). Copy them here and point sfx_ at
+         // this buffer so the suffix survives until key() reads it. (Unused for HasValue.)
+         uint8_t                    inlsfx_[HasValue ? 1 : inline_suffix_cap];
+         // Position an inline-suffix terminal (set value_inline). Copies the packed suffix into
+         // the per-iterator buffer and points sfx_ at it — never at the transient handle bytes.
+         void emit_inline_suffix_(packed_ptr child, size_t base)
+         {
+            const std::string_view sv = suffix_of_inline(child);
+            for (size_t i = 0; i < sv.size(); ++i) inlsfx_[i] = uint8_t(sv[i]);
+            sfx_      = inlsfx_;
+            sfxlen_   = uint32_t(sv.size());
+            full_str_ = nullptr;
+            if (maintain_) { key_.len = base; key_.append(sfx_, sfxlen_); }
+         }
          const char*                full_str_ = nullptr;  // set at a full-key leaf → key() is zero-copy
          uint32_t                   full_len_ = 0;
          // Non-inline T: point at the real stored object (no copy → value() is a true
@@ -1648,6 +1682,55 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::conditional_t<inlineable, T, const T*> val_{};
          bool                                        end_ = true;
 
+         // The inline-suffix buffer is per-iterator: when sfx_ points into the SOURCE's
+         // inlsfx_ (set inline-suffix terminal), member-wise copy/move would leave it
+         // dangling at the source's (possibly destroyed) stack bytes. Re-seat it at OUR
+         // own inlsfx_ — the bytes were already member-copied. (No-op for HasValue.)
+         void rebind_inlsfx_(const const_iterator& src) noexcept
+         {
+            if constexpr (!HasValue)
+               if (sfx_ == src.inlsfx_) sfx_ = inlsfx_;
+         }
+
+        public:
+         const_iterator(const const_iterator& o)
+             : t_(o.t_), stk_(o.stk_), key_(o.key_), maintain_(o.maintain_), sfx_(o.sfx_),
+               sfxlen_(o.sfxlen_), full_str_(o.full_str_), full_len_(o.full_len_), val_(o.val_),
+               end_(o.end_)
+         {
+            std::memcpy(inlsfx_, o.inlsfx_, sizeof(inlsfx_));
+            rebind_inlsfx_(o);
+         }
+         const_iterator(const_iterator&& o) noexcept
+             : t_(o.t_), stk_(std::move(o.stk_)), key_(std::move(o.key_)), maintain_(o.maintain_),
+               sfx_(o.sfx_), sfxlen_(o.sfxlen_), full_str_(o.full_str_), full_len_(o.full_len_),
+               val_(std::move(o.val_)), end_(o.end_)
+         {
+            std::memcpy(inlsfx_, o.inlsfx_, sizeof(inlsfx_));
+            rebind_inlsfx_(o);
+         }
+         const_iterator& operator=(const const_iterator& o)
+         {
+            if (this == &o) return *this;
+            t_ = o.t_; stk_ = o.stk_; key_ = o.key_; maintain_ = o.maintain_; sfx_ = o.sfx_;
+            sfxlen_ = o.sfxlen_; full_str_ = o.full_str_; full_len_ = o.full_len_; val_ = o.val_;
+            end_ = o.end_;
+            std::memcpy(inlsfx_, o.inlsfx_, sizeof(inlsfx_));
+            rebind_inlsfx_(o);
+            return *this;
+         }
+         const_iterator& operator=(const_iterator&& o) noexcept
+         {
+            if (this == &o) return *this;
+            t_ = o.t_; stk_ = std::move(o.stk_); key_ = std::move(o.key_); maintain_ = o.maintain_;
+            sfx_ = o.sfx_; sfxlen_ = o.sfxlen_; full_str_ = o.full_str_; full_len_ = o.full_len_;
+            val_ = std::move(o.val_); end_ = o.end_;
+            std::memcpy(inlsfx_, o.inlsfx_, sizeof(inlsfx_));
+            rebind_inlsfx_(o);
+            return *this;
+         }
+
+        private:
          void set_ptr_(const T* p)
          {
             if constexpr (inlineable)
@@ -1709,6 +1792,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return true;
                }
                case K::value_inline:
+                  if constexpr (!HasValue) { emit_inline_suffix_(child, base); return true; }
                   sfx_      = nullptr;
                   sfxlen_   = 0;
                   full_str_ = nullptr;
@@ -1862,8 +1946,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             if (k == K::value_inline)
             {
-               // stored key == path (empty suffix). Qualifies only for lower_bound when the
-               // target ends here exactly (path == target).
+               if constexpr (!HasValue)  // SET: the handle packs a suffix; compare like a leaf
+               {
+                  const int cmp = suffix_of_inline(cur).compare(key.substr(depth));
+                  if (upper ? cmp > 0 : cmp >= 0) return descend_(cur, 0);  // qualifies → position
+                  return false;                                            // < target → seek_ from parent
+               }
+               // map: stored key == path (empty suffix). Qualifies only for lower_bound when
+               // the target ends here exactly (path == target).
                if (!upper && depth == key.size()) return descend_(cur, 0);
                return false;
             }
@@ -2006,6 +2096,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      return;
                   }
                   case K::value_inline:
+                     if constexpr (!HasValue) { emit_inline_suffix_(child, base); return; }
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
                      if constexpr (inlineable)
                         unpack_inline(child, val_);
@@ -2124,6 +2215,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      return;
                   }
                   case K::value_inline:
+                     if constexpr (!HasValue) { emit_inline_suffix_(child, base); return; }
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
                      if constexpr (inlineable)
                         unpack_inline(child, val_);
@@ -2692,10 +2784,22 @@ namespace detail  // implementation types & node helpers — not part of the pub
          bucket* b = new_bucket();
          if (cur.tag() == K::value_inline)
          {
-            T ov;
-            unpack_inline(cur, ov);
-            [[maybe_unused]] const int r0 = bkt_insert_entry(b, std::string_view{}, std::move(ov));
-            assert(r0 == 1);
+            if constexpr (!HasValue)  // SET: the inline handle carries a key suffix (not empty)
+            {
+               uint8_t          sbuf[inline_suffix_cap];
+               const std::string_view sv = suffix_of_inline(cur);
+               for (size_t i = 0; i < sv.size(); ++i) sbuf[i] = uint8_t(sv[i]);
+               [[maybe_unused]] const int r0 = bkt_insert_entry(
+                   b, std::string_view(reinterpret_cast<const char*>(sbuf), sv.size()), none_t{});
+               assert(r0 == 1);
+            }
+            else
+            {
+               T ov;
+               unpack_inline(cur, ov);
+               [[maybe_unused]] const int r0 = bkt_insert_entry(b, std::string_view{}, std::move(ov));
+               assert(r0 == 1);
+            }
          }
          else
          {
@@ -3259,8 +3363,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                }
                case K::value_inline:
                {
-                  if (depth != key.size())
-                     return false;  // inline terminal matches only at key end; nothing to free
+                  if constexpr (!HasValue)  // SET: the handle packs a suffix; it must match
+                  {
+                     if (suffix_of_inline(cur) != key.substr(depth)) return false;
+                  }
+                  else if (depth != key.size())
+                     return false;  // map: inline terminal matches only at key end; nothing to free
                   --count_;
                   if (n >= 2) rm_unwind_(path, n, n - 2);
                   else root_ = packed_ptr::null();
@@ -3439,7 +3547,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (r >= 0) return r == 1;
          auto ia = a.begin(), ib = b.begin();  // representations diverged: sequence compare
          for (; ia != a.end(); ++ia, ++ib)
-            if (ia.key_bytes() != ib.key_bytes() || !(ia.value() == ib.value())) return false;
+         {
+            if (ia.key_bytes() != ib.key_bytes()) return false;
+            if constexpr (HasValue)  // set: equal key sequence == equal sets (no value)
+               if (!(ia.value() == ib.value())) return false;
+         }
          return true;
       }
       friend bool operator!=(const map& a, const map& b) { return !(a == b); }
@@ -3451,7 +3563,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          if (a.is_null() || b.is_null()) return (a.is_null() == b.is_null()) ? 1 : 0;
          const bool ia = a.tag() == K::value_inline, ib = b.tag() == K::value_inline;
-         if constexpr (inlineable)
+         if constexpr (!HasValue)
+         {
+            // SET: a terminal's content is its key SUFFIX (inline-packed or in a leaf), no value.
+            // Equal iff the suffixes match — tolerant of the inline-vs-leaf representation pair.
+            uint8_t          ab[inline_suffix_cap], bb[inline_suffix_cap];
+            std::string_view sa, sb;
+            if (ia) { sa = suffix_of_inline(a); for (size_t i = 0; i < sa.size(); ++i) ab[i] = uint8_t(sa[i]); sa = {reinterpret_cast<const char*>(ab), sa.size()}; }
+            else { const char* L = static_cast<const char*>(deref_term_(a)); sa = {reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L)}; }
+            if (ib) { sb = suffix_of_inline(b); for (size_t i = 0; i < sb.size(); ++i) bb[i] = uint8_t(sb[i]); sb = {reinterpret_cast<const char*>(bb), sb.size()}; }
+            else { const char* L = static_cast<const char*>(tb.deref_term_(b)); sb = {reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L)}; }
+            return sa == sb ? 1 : 0;
+         }
+         else if constexpr (inlineable)
          {
             T x{}, y{};
             if (ia) unpack_inline(a, x);
@@ -3509,7 +3633,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (leaf_slen(A) != leaf_slen(B) ||
                    (leaf_slen(A) && std::memcmp(leaf_suf(A), leaf_suf(B), leaf_slen(A)) != 0))
                   return 0;  // suffixes are the semantic content; full-key form is derived
-               return (*leaf_val(A) == *leaf_val(B)) ? 1 : 0;
+               if constexpr (!HasValue) return 1;  // set: equal suffix == equal element
+               else return (*leaf_val(A) == *leaf_val(B)) ? 1 : 0;
             }
             case K::prefix_node:
             {
@@ -3595,7 +3720,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (bkt_slen(ea) != bkt_slen(eb) ||
                       (bkt_slen(ea) && std::memcmp(bkt_suf(ea), bkt_suf(eb), bkt_slen(ea)) != 0))
                      return 0;
-                  if (!(*bkt_val(ea) == *bkt_val(eb))) return 0;
+                  if constexpr (HasValue)
+                     if (!(*bkt_val(ea) == *bkt_val(eb))) return 0;  // set: equal suffix == equal element
                }
                return 1;
             }
@@ -3849,7 +3975,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             }
             case K::value_inline:
-               call_val_(key.view(), cur, f);  // empty suffix → key already complete
+               if constexpr (!HasValue)  // SET: append the packed suffix, then the key is complete
+               {
+                  const std::string_view sv = suffix_of_inline(cur);
+                  const size_t           b  = key.len;
+                  key.append(sv.data(), sv.size());
+                  call_val_(key.view(), cur, f);
+                  key.len = b;
+               }
+               else
+                  call_val_(key.view(), cur, f);  // map: empty suffix → key already complete
                return;
             case K::prefix_node:
             {
@@ -3908,6 +4043,20 @@ namespace detail  // implementation types & node helpers — not part of the pub
                         else recurse(s->bytes[i], s->branch[i]);
                      break;
                   }
+                  case K::setlist_u16:  // wide router (2 bytes/hop): push BOTH stem bytes per child
+                  {
+                     const setlist16* s = static_cast<const setlist16*>(deref_(cur));
+                     const int        n = s->rh.hdr.nbranch;
+                     for (int i = 0; i < n; ++i)  // stems sorted ascending == key order
+                     {
+                        const uint16_t st = s->stems[i];
+                        key.push(uint8_t(st >> 8));
+                        key.push(uint8_t(st & 0xFF));
+                        walk_(s->branch[i], key, f);
+                        key.len = cb;
+                     }
+                     break;
+                  }
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
                   case K::c4: cnode_for_each(static_cast<const cnode<4>*>(deref_(cur)), recurse); break;
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
@@ -3951,7 +4100,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return nullptr;
                return const_cast<T*>(leaf_val(p));
             }
-            T* inl(uint64_t, bool) const { return nullptr; }  // no addressable object
+            T* inl(uint64_t, const char*, size_t) const { return nullptr; }  // no addressable object
             T* bkt(const bucket* b, const char* rem, size_t rl) const
             {
                if constexpr (bucketable)
@@ -4041,6 +4190,40 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // Only ever called on a value_inline slot, which exists only for an inlineable T; the
          // `if constexpr` keeps the memcpy from instantiating for a non-inlineable T (dead here).
          if constexpr (inlineable) std::memcpy(&out, p.b + 1, inline_bytes);
+      }
+
+      // ── suffix-in-handle (SET only) ────────────────────────────────────────────────
+      // For !HasValue the value_inline handle has no value to carry, so it carries a SHORT
+      // KEY SUFFIX instead — a terminal whose remaining key bytes fit in the pointer needs
+      // NO leaf allocation at all. Layout: byte0 low nibble = K::value_inline (the tag),
+      // byte0 HIGH nibble = suffix length L, bytes[1..1+L) = the suffix, rest zero. L<=cap
+      // (cap = sizeof(Ptr)-1 = 5 at the default 6-byte handle) and cap fits the 4-bit length
+      // nibble (cap<=7), asserted at the inline_suffix_cap declaration up front.
+      static packed_ptr pack_inline_suffix(std::string_view suf) noexcept
+      {
+         packed_ptr p;
+         std::memset(p.b, 0, sizeof(Ptr));
+         const uint8_t L = uint8_t(suf.size());  // caller guarantees suf.size() <= cap
+         p.b[0]          = uint8_t(uint8_t(K::value_inline) | uint8_t(L << 4));
+         for (uint8_t i = 0; i < L; ++i) p.b[1 + i] = uint8_t(suf[i]);  // suffix in bytes [1..1+L)
+         return p;
+      }
+      // The packed suffix, viewed in place over the handle's own bytes. The view is valid only
+      // while the handle storage lives — a raw register handle is transient, so iterators COPY
+      // (see the inline arms); descent ops read it immediately against the key, so a view is fine.
+      static std::string_view suffix_of_inline(const packed_ptr& p) noexcept
+      {
+         const uint8_t L = uint8_t(p.b[0] >> 4);
+         return std::string_view(reinterpret_cast<const char*>(p.b + 1), L);
+      }
+      static unsigned inline_suffix_len(uint64_t raw) noexcept { return unsigned((raw >> 4) & 0xF); }
+      // Reconstruct a packed_ptr from a raw register value (the descend hot path keeps the
+      // handle in a uint64_t). Little-endian: the low sizeof(Ptr) bytes are the handle.
+      static packed_ptr packed_ptr_from_raw_(uint64_t raw) noexcept
+      {
+         packed_ptr p;
+         std::memcpy(p.b, &raw, sizeof(Ptr));
+         return p;
       }
       static void copy_value(T& out, const T* src)
       {
@@ -4257,7 +4440,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <class VF>
       packed_ptr make_value(std::string_view suf, VF&& val)
       {
-         if constexpr (inlineable)
+         if constexpr (!HasValue)  // SET: pack a short suffix into the handle (no leaf alloc)
+         {
+            if (suf.size() <= inline_suffix_cap) { (void)val; return pack_inline_suffix(suf); }
+         }
+         else if constexpr (inlineable)
             if (suf.empty())
                return pack_inline(vf_make(std::forward<VF>(val)));
          return make_leaf(suf, std::forward<VF>(val));
@@ -4270,7 +4457,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
       packed_ptr make_value_at(std::string_view key, size_t depth, VF&& val)
       {
          const std::string_view suf = key.substr(depth);
-         if constexpr (inlineable)
+         if constexpr (!HasValue)  // SET: pack a short suffix into the handle (no leaf alloc)
+         {
+            if (suf.size() <= inline_suffix_cap) { (void)val; return pack_inline_suffix(suf); }
+         }
+         else if constexpr (inlineable)
             if (suf.empty())
                return pack_inline(vf_make(std::forward<VF>(val)));
          const std::string_view pfx = key.substr(0, depth);
@@ -4891,10 +5082,40 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <bool Assign, class VF>
       packed_ptr split_leaf(packed_ptr cur, std::string_view key, size_t depth, VF&& val, bool& inserted)
       {
+         if constexpr (!HasValue)  // SET: a value_inline handle carries a key SUFFIX, not a value
+         {
+            if (cur.tag() == K::value_inline)
+            {
+               // Treat the packed suffix exactly like a leaf suffix: split against it. No
+               // allocation to free, and no value to relocate (set). suffix_of_inline views
+               // cur's own bytes; copy it out before building (the build doesn't touch cur,
+               // but cur is a value — keep the bytes stable explicitly for clarity/safety).
+               uint8_t          sbuf[inline_suffix_cap];
+               const std::string_view sv = suffix_of_inline(cur);
+               for (size_t i = 0; i < sv.size(); ++i) sbuf[i] = uint8_t(sv[i]);
+               const std::string_view S(reinterpret_cast<const char*>(sbuf), sv.size());
+               const std::string_view R = key.substr(depth);
+               if (S == R) { inserted = false; return cur; }  // exact key (set: no value to update)
+               const size_t c = lcp(S, R);
+               inserted        = true;
+               setlist*   r       = new_setlist();
+               packed_ptr partial = pack_(r, K::setlist_u8);
+               build_guard g{this, &partial};
+               if (c == R.size()) set_term(&r->rh, std::forward<VF>(val));  // new key ends here
+               else
+                  setlist_set(r, uint8_t(R[c]), make_value_at(key, depth + c + 1, std::forward<VF>(val)));
+               partial = apply_prefix(r, key.substr(depth, c));            // shared prefix (== S[0..c])
+               if (c == S.size()) set_term(&r->rh, none_t{});              // old key ends here
+               else               setlist_set(r, uint8_t(S[c]), make_value(S.substr(c + 1), none_t{}));
+               g.release();
+               sl_inline_compact_(r);
+               return partial;
+            }
+         }
          // `if constexpr`: a value_inline leaf only exists for an inlineable T, so this whole
          // branch is dead for non-inlineable T — eliding it avoids instantiating unpack_inline
          // (a memcpy into a possibly non-trivially-copyable T) that would never run.
-         if constexpr (inlineable)
+         else if constexpr (inlineable)
             if (cur.tag() == K::value_inline)
             {
                // Inline terminal: stored key ended here (empty suffix). No allocation to free.
