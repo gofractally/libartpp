@@ -465,6 +465,27 @@ dictionary (a radix splits more there). With the pool, builds beat
 `for_each` scans are ~3× iterator scans when cache-resident; value-only
 iteration (`for_each_value` or an un-keyed iterator walk) is cheaper still.
 
+### `artpp::set` — keys-only ordered set
+
+`artpp::set<Key>` is the map's value-free sibling — a thin facade over
+`map<Key, none_t>` that shares the radix core verbatim, elides the value path, and
+lets short keys ride entirely inside the routing handle (*suffix-in-handle*, no leaf
+allocation). Measured **separately** from the table above — its own methodology:
+2M keys, `std::allocator` / `operator new` (**not** `line_pool`), find = min-of-7
+over a shuffled all-present probe (`bench/ordered_bench.cpp`):
+
+| 2M keys | `artpp::set` find · B/key | `absl::btree_set` | `std::set` |
+|---|---|---|---|
+| random 16B | **63 ns** · 94 | 378 ns (6.0×) · 26 | 869 ns (13.7×) · 56 |
+| alnum 16B | **69 ns** · 41 | 376 ns (5.5×) · 26 | 884 ns (12.9×) · 56 |
+| short 3–7B | **61 ns** · 26 | 418 ns (6.9×) · 26 | 843 ns (13.9×) · 56 |
+
+`artpp::set` finds **5.5–6.9× faster than `absl::btree_set`** and ~13× faster than
+`std::set`. The trade is build cost and footprint: btree builds ~1.5× faster and
+stays denser on high-entropy keys (26 vs 94 B/key) — but `artpp::set` **ties** btree's
+bytes/key on short keys, where suffix-in-handle elides the leaf entirely. These use
+`operator new`; `line_pool` would widen the find lead further (node locality).
+
 ## Benchmark suite
 
 `-DARTPP_BENCHMARKS=ON` builds `artpp_bench`: **one templated engine**
