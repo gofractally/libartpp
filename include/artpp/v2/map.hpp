@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "artpp/v2/cnode.hpp"
+#include "artpp/v2/node_addr.hpp"
 #include "artpp/v2/key_codec.hpp"
 #include "artpp/v2/tagged_ptr.hpp"
 #include "artpp/v2/value_ops.hpp"
@@ -410,6 +411,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
    inline Ptr full_find(const node_full_t<Ptr>* f, uint16_t presence, uint8_t byte) noexcept
    {
       const unsigned sub = unsigned(byte) >> 4;
+      if (presence == 0xFFFFu)  // genuinely full: rank == sub — direct index, no presence test, no popcount
+         return full_range<Ptr>(f, sub)->ptr[byte & 0xF];
       if (!((presence >> sub) & 1u))
          return Ptr::null();
       return full_range<Ptr>(f, full_rank(presence, sub))->ptr[byte & 0xF];
@@ -449,6 +452,105 @@ namespace detail  // implementation types & node helpers — not part of the pub
          for (unsigned s = 0; s < 16; ++s) n += !ln->ptr[s].is_null();
       }
       return n;
+   }
+
+   // ── sdiv: divider-partitioned setlist router (the proven mid-tier) ──────────────
+   // L = line_count(tier, dividers) contiguous 128B LEAN setlist lines (no per-line
+   // router_hdr — the dividers ride in the parent handle's metadata, so child_line
+   // picks WHICH line to load BEFORE the read; a NEON scan of <=14 keys finds the byte
+   // in that line). Dense (~9 B/child) AND fast (one cacheline per hop, line index from
+   // the handle, no rank-after-load).
+   //
+   // Per LEAN line (matches bench/v2_compare.cpp make_setlist_router):
+   //   line[0]   = count (keys in this line, <= SL_CAP)
+   //   line[1]   = prefix_len (the node's common prefix, REPLICATED into every line — §2.2)
+   //   line[2 .. 2+count)         = the key bytes (unsorted at build; kept set, scanned
+   //                                in parallel — order within a line is re-sorted only
+   //                                at iteration, which never routes)
+   //   line[16 + i*sizeof(Ptr)]   = handle for key i (i in [0, count))
+   //   line[16 + count*W .. )     = the replicated common prefix (line[1] bytes), in the
+   //                                post-handle slack — the descent consumes it from the
+   //                                line it ALREADY loads (§2.2), so a fused prefix costs
+   //                                ZERO extra cachelines.
+   //
+   // COMMON-PREFIX POLICY (spec §2.2): a node-level shared run of <= SDIV_PREFIX_CAB bytes
+   // is REPLICATED into every line's post-handle slack (every line carries an identical
+   // copy in line[1] + the bytes after its handles), so whichever line the descent routes
+   // to already holds the prefix — still ONE cacheline per hop. A separate prefix_node hop
+   // is the bug this fixes; a run too long to replicate promotes the node to sparse_full
+   // (tail-prefix) instead. The replicated copies are kept identical on every structural
+   // change (the replication invariant, §7/N7).
+   //
+   // A term (a key ending exactly at this router) lives in ONE TAIL cacheline at offset
+   // L*128 (node_full_tail_t — the same mechanism K::pfxd uses), read ONLY when the key
+   // ends exactly here (the rare terminal case), NEVER on the routing hot path. The tail
+   // is ALWAYS materialized (its hdr.has_term flags whether a term is present): an indexed
+   // handle has no spare bit to track has_tail (unlike pfxd's two kinds), so deriving "tail
+   // present" from is_sdiv(k) keeps direct + indexed uniform. The tail no longer carries
+   // the prefix (that moved into the lines); tl->hdr.prefix_len stays 0. node_size = (L+1)*128.
+   static constexpr int SDIV_LINE = 128;  // one cacheline per partition
+   static constexpr int SL_CAP    = 14;   // branches per sdiv line (handles at 16 + i*W)
+   // The node-level common prefix replicated into each line's post-handle slack (§2.2,
+   // SDIV_PREFIX_CAP≈13). A line carrying `count` handles (W bytes each) at offset 16 has
+   // `128 - 16 - count*W` free bytes for the prefix; choose_sdiv_ keeps every line within
+   // `count*W + plen <= 112` so the prefix always fits the routed line. 13 is the spec cap;
+   // it never exceeds node_hdr.prefix_len's 6 bits (the split path stores it in a setlist).
+   static constexpr int SDIV_PREFIX_CAP = 13;
+   // The dividers (the parent handle's 16-bit metadata) decode per tier; child_line /
+   // line_count in node_addr.hpp do the routing. The Tier for a kind:
+   inline Tier sdiv_tier(K k) noexcept
+   {
+      return k == K::sdiv2 ? Tier::sdiv2 : k == K::sdiv3 ? Tier::sdiv3 : Tier::sdiv4;
+   }
+   // Lines per sdiv kind (independent of the divider values): 2/3/4.
+   inline unsigned sdiv_lines(K k) noexcept { return unsigned(k) - unsigned(K::sdiv2) + 2u; }
+   // The base of line `ln` (0-based) in an sdiv node.
+   inline char* sdiv_line(void* node, unsigned ln) noexcept
+   {
+      return static_cast<char*>(node) + size_t(ln) * SDIV_LINE;
+   }
+   inline const char* sdiv_line(const void* node, unsigned ln) noexcept
+   {
+      return static_cast<const char*>(node) + size_t(ln) * SDIV_LINE;
+   }
+   // The tail cacheline (always materialized): the cacheline after the L lean lines.
+   template <class Ptr>
+   inline node_full_tail_t<Ptr>* sdiv_tail(void* node, unsigned lines) noexcept
+   {
+      return reinterpret_cast<node_full_tail_t<Ptr>*>(static_cast<char*>(node) + size_t(lines) * SDIV_LINE);
+   }
+   template <class Ptr>
+   inline const node_full_tail_t<Ptr>* sdiv_tail(const void* node, unsigned lines) noexcept
+   {
+      return reinterpret_cast<const node_full_tail_t<Ptr>*>(static_cast<const char*>(node) +
+                                                            size_t(lines) * SDIV_LINE);
+   }
+   // node_size for an sdiv: L lean lines + the always-present tail cacheline.
+   inline size_t sdiv_node_bytes(K k) noexcept
+   {
+      return (size_t(sdiv_lines(k)) + 1u) * SDIV_LINE;
+   }
+   // Exact-match scan over the <=SL_CAP keys of one lean line (key bytes at line+2). SWAR
+   // find-byte over two u64 words — pure GPR, no SIMD. On the LATENCY-bound descent (a
+   // dependent pointer chain) this beats a NEON scan: it avoids the ~16-cycle SIMD→GPR
+   // (fmov) round-trip that would sit on the critical path every hop. (The prototype's NEON
+   // win was a throughput micro-bench where cross-iteration ILP hid that latency; the real
+   // descent cannot.) Mirrors v1's setlist_index: the i<cnt guard rejects a match landing in
+   // the post-key slack/handles (the key lanes are not 0xFF-padded in the lean line).
+   [[gnu::always_inline]] inline int sdiv_find(const char* keys, unsigned cnt, uint8_t byte) noexcept
+   {
+      constexpr uint64_t ONES = 0x0101010101010101ULL, HIGH = 0x8080808080808080ULL;
+      const uint64_t     target = uint64_t(byte) * ONES;
+      uint64_t           d, x, m;
+      std::memcpy(&d, keys, 8);
+      x = d ^ target;
+      m = (x - ONES) & ~x & HIGH;
+      if (m) { const unsigned i = unsigned(std::countr_zero(m)) >> 3; if (i < cnt) return int(i); }
+      std::memcpy(&d, keys + 8, 8);
+      x = d ^ target;
+      m = (x - ONES) & ~x & HIGH;
+      if (m) { const unsigned i = 8u + (unsigned(std::countr_zero(m)) >> 3); if (i < cnt) return int(i); }
+      return -1;
    }
 
    // ── bucket: the "last-mile" terminal — a flat, lexicographically-sorted set of
@@ -1032,19 +1134,34 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   char*          P  = static_cast<char*>(deref_(cur));
                   const uint16_t pl = pn_plen(P);
-                  // Lazy fusion: a prefix node sitting directly above a node_full/pfxd migrates
-                  // into the node's tail on the first write that touches it — the dedicated node
-                  // was only ever the overflow form. make_prefix grows/prepends the tail (it may
-                  // realloc node_full→pfxd, fine off the noexcept path), then re-dispatch.
-                  if (const packed_ptr nx = pn_next<Ptr>(P);
-                      (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
+                  // Lazy fusion (§2): a prefix node sitting directly above a router migrates INTO
+                  // that router on the first write that touches it — the dedicated node was only
+                  // ever the overflow form. node_full/pfxd take it in the header; an sdiv takes it
+                  // REPLICATED across its lean lines (§2.2) when the combined run fits
+                  // SDIV_PREFIX_CAP — so the common dict/text case never keeps a prefix_node hop.
+                  // make_prefix performs the migration (it may realloc / rebuild, fine off the
+                  // noexcept path), then we re-dispatch into the now-fused node.
+                  const packed_ptr nx     = pn_next<Ptr>(P);
+                  const unsigned   sdiv_pl = is_sdiv(nx.tag()) ? router_prefix_len_(nx) : 0;
+                  if ((nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
                       (nx.tag() == K::pfxd &&
-                       pl + pfxd_plen(static_cast<node_full*>(deref_(nx)), nx.meta()) <= node_full::PFX_CAP))
+                       pl + pfxd_plen(static_cast<node_full*>(deref_(nx)), nx.meta()) <= node_full::PFX_CAP) ||
+                      (is_sdiv(nx.tag()) && pl + sdiv_pl <= unsigned(SDIV_PREFIX_CAP)))
                   {
-                     *slot = make_prefix(
+                     packed_ptr fused = make_prefix(
                          std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
-                     node_free_(P, pn_size<Ptr>(pl));
-                     continue;  // *slot is now the fused node; the pfxd arm consumes
+                     // make_prefix returns the fused router (sdiv rebuilt / pfxd grown). On the
+                     // sdiv path it may STILL fail to fit a line (returns the old node via a
+                     // prefix_node) — guard by checking it actually fused before freeing P.
+                     if (fused.tag() != K::prefix_node)
+                     {
+                        *slot = fused;
+                        node_free_(P, pn_size<Ptr>(pl));
+                        continue;  // *slot is now the fused node; its arm consumes
+                     }
+                     // didn't fuse (line overflow): make_prefix built a NEW prefix_node over nx;
+                     // drop it and keep the original P (unchanged), falling through to the split path.
+                     node_free_(deref_(fused), pn_size<Ptr>(pn_plen(static_cast<char*>(deref_(fused)))));
                   }
                   std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
                   const size_t     c = lcp(PP, key.substr(depth));
@@ -1173,6 +1290,59 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   ++count_;
                   return true;
                }
+               case K::sdiv2:  // divider-partitioned setlist: line from the handle, then scan
+               case K::sdiv3:
+               case K::sdiv4:
+               {
+                  // A node-level prefix (if any) is REPLICATED across the lean lines (§2.2);
+                  // router_prefix reads it off line 0. Consume it (advance depth) or, if the
+                  // key diverges inside it, split it (split_sdiv_prefix re-stamps every line).
+                  {
+                     const uint8_t* pb;
+                     if (const unsigned pl = router_prefix(cur, pb))
+                     {
+                        const size_t c = lcp(std::string_view(reinterpret_cast<const char*>(pb), pl),
+                                             key.substr(depth));
+                        if (c < pl)  // fused prefix diverges → split it
+                        {
+                           *slot = split_sdiv_prefix(cur, key, depth, c, std::forward<VF>(v), [&](auto&& x) {
+                              return make_value_at(key, depth + c + 1, std::forward<decltype(x)>(x));
+                           });
+                           ++count_;
+                           return true;
+                        }
+                        depth += pl;
+                     }
+                  }
+                  if (depth == key.size())  // key ends here → add a term (may grow a tail)
+                  {
+                     bool ins;
+                     *slot = sdiv_set_or_update_term<Assign>(cur, std::forward<VF>(v), ins);
+                     count_ += ins;
+                     return ins;
+                  }
+                  const uint8_t byte = uint8_t(key[depth]);
+                  if (packed_ptr* cs = router_find_slot(cur, byte))  // existing child -> descend
+                  {
+                     if constexpr (WideStems) pslot = slot;
+                     slot  = cs;
+                     ++depth;
+                     continue;
+                  }
+                  // No child here: append in place if byte's line has room, else widen.
+                  packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
+                  build_guard glf{this, &lf};  // grow can throw; don't orphan the new value
+                  if (sdiv_try_set(cur, byte, lf))  // room in byte's line: set in place
+                  {
+                     glf.release();
+                     ++count_;
+                     return true;
+                  }
+                  grow_router_(slot, cur, byte, lf);  // re-anchors *slot across the widen ladder
+                  glf.release();
+                  ++count_;
+                  return true;
+               }
                // exhaustive (no default): node_full/bucket descend before the switch and
                // null inserts at the top of the loop, so these can't reach it — but a NEW
                // kind added to K must fail compilation here and get an explicit decision.
@@ -1240,6 +1410,39 @@ namespace detail  // implementation types & node helpers — not part of the pub
    const char* p = ARTPP_PTR(raw); \
    if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)->term); \
    raw = cnode_step(reinterpret_cast<const cnode<N>*>(p), uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
+/* sdiv (the proven mid-tier): the dividers ride in the handle metadata (raw>>META_SHIFT_).
+   child_line(tier, meta, byte) selects WHICH lean line to load FROM THE HANDLE, before any
+   read; a NEON scan of <=14 keys in that line resolves the byte — ONE cacheline per hop.
+   COMMON-PREFIX (§2.2): a node-level shared run is REPLICATED into every line's post-handle
+   slack (line[1]=plen, bytes at 16+count*W), so the routed line ALREADY carries the prefix —
+   no separate prefix_node hop. The NO-PREFIX path (line[1]==0, the overwhelming majority) is
+   exactly the old 1-line route with zero overhead: we route on key[depth], load the line, and
+   only THEN read line[1]. When a prefix IS present we mis-routed on the pre-prefix byte, so we
+   consume the (replicated) prefix off the loaded line, recompute the routing byte, and re-route
+   — a re-load that hits ONLY the rare prefixed sdiv, never the common case. The term (if any)
+   lives in the tail cacheline, read ONLY when the key ends EXACTLY here (depth==klen). */
+#define ARTPP_BODY_SDIV(N) { \
+   const char* node = ARTPP_PTR(raw); \
+   const uint16_t dvs = uint16_t(raw >> META_SHIFT_); \
+   if (depth != klen) { \
+      const char* line = sdiv_line(node, child_line(Tier::sdiv##N, dvs, uint8_t(kp[depth]))); \
+      if (line[1]) { /* replicated prefix on this node → consume it off the loaded line, re-route */ \
+         const unsigned pl_ = uint8_t(line[1]); \
+         if (klen - depth < pl_ || std::memcmp(sdiv_line_pfx(line), kp + depth, pl_) != 0) return op.miss(); \
+         depth += pl_; \
+         if (depth == klen) { const node_full_tail* tl = sdiv_tail<Ptr>(node, (N)); \
+            return tl->hdr.has_term ? op.term(tl->term) : op.miss(); } \
+         line = sdiv_line(node, child_line(Tier::sdiv##N, dvs, uint8_t(kp[depth]))); \
+      } \
+      const int sdi_ = sdiv_find(line + 2, uint8_t(line[0]), uint8_t(kp[depth])); \
+      if (sdi_ < 0) return op.miss(); \
+      std::memcpy(&raw, line + 16 + size_t(sdi_) * sizeof(Ptr), sizeof(Ptr)); ARTPP_NEXT(depth + 1); \
+   } \
+   /* key ends here: there may still be a prefix that the key falls short of → miss; else term */ \
+   { const char* l0 = sdiv_line(node, 0); \
+     if (l0[1]) return op.miss();  /* a non-empty prefix can't be matched by an exhausted key */ \
+     const node_full_tail* tl = sdiv_tail<Ptr>(node, (N)); \
+     return tl->hdr.has_term ? op.term(tl->term) : op.miss(); } }
 
       template <class Op>
       [[gnu::always_inline]] auto descend_read(std::string_view key, Op op) const -> decltype(op.miss())
@@ -1251,10 +1454,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
          size_t            depth = 0;
          for (;;)
          {
+#ifdef ARTPP_HOPS
+            ++detail::descent_hops_;  // diagnostic: one loop turn ≈ one cacheline touched
+#endif
             const unsigned kk = unsigned(raw & 0xF);
             if (kk == unsigned(K::node_full)) ARTPP_BODY_FULL
             if constexpr (!inlineable) { if (kk == unsigned(K::value_ptr)) ARTPP_BODY_VALUE_PTR }
             if (kk == unsigned(K::setlist_u8)) ARTPP_BODY_SETLIST
+            if (kk == unsigned(K::sdiv2)) ARTPP_BODY_SDIV(2)  // hoist the v2 mid-tiers ahead of the
+            if (kk == unsigned(K::sdiv3)) ARTPP_BODY_SDIV(3)  // jump table: predicted compares beat
+            if (kk == unsigned(K::sdiv4)) ARTPP_BODY_SDIV(4)  // the indirect-jump mispredict
             if (kk > K_max) return op.miss();
             switch (static_cast<K>(kk))  // exhaustive, no default → -Wswitch guards a new K
             {
@@ -1267,6 +1476,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::c2:           ARTPP_BODY_CN(2)
                case K::c4:           ARTPP_BODY_CN(4)
                case K::c8:           ARTPP_BODY_CN(8)
+               case K::sdiv2:        ARTPP_BODY_SDIV(2)
+               case K::sdiv3:        ARTPP_BODY_SDIV(3)
+               case K::sdiv4:        ARTPP_BODY_SDIV(4)
                case K::bucket:       ARTPP_BODY_BUCKET
                case K::setlist_u16:  ARTPP_BODY_SETLIST16
                case K::null:         return op.miss();
@@ -1285,6 +1497,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
 #undef ARTPP_BODY_FULL
 #undef ARTPP_BODY_PFXD
 #undef ARTPP_BODY_CN
+#undef ARTPP_BODY_SDIV
 #undef ARTPP_BODY_BUCKET
 
       // Copy-out lookup: writes the value into `out` and returns true if present.
@@ -1437,6 +1650,31 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   const uint8_t byte = uint8_t(key[depth]);
                   packed_ptr*   cs   = full_slot(f, pres, byte);
                   if (!cs || cs->is_null()) return op.miss();
+                  parent = cur; pbyte = byte; slot = cs; ++depth; continue;
+               }
+               case K::sdiv2: case K::sdiv3: case K::sdiv4:
+               {
+                  // HEADERLESS: dividers in the handle; the node-level prefix is REPLICATED into
+                  // every line (§2.2) — read it off line 0 (a canonical replica); the term lives
+                  // in the always-present tail, read only when the key ends exactly here.
+                  {
+                     const char*    l0 = sdiv_line(deref_(cur), 0);
+                     const unsigned pl = sdiv_line_plen(l0);
+                     if (pl)
+                     {
+                        if (key.size() - depth < pl || std::memcmp(sdiv_line_pfx(l0), key.data() + depth, pl) != 0)
+                           return op.miss();
+                        depth += pl;
+                     }
+                     if (depth == key.size())
+                     {
+                        node_full_tail* tl = sdiv_tail<Ptr>(deref_(cur), sdiv_lines(cur.tag()));
+                        return tl->hdr.has_term ? op.term(&tl->term) : op.miss();
+                     }
+                  }
+                  const uint8_t byte = uint8_t(key[depth]);
+                  packed_ptr*   cs   = sdiv_find_slot(cur, byte);
+                  if (!cs) return op.miss();
                   parent = cur; pbyte = byte; slot = cs; ++depth; continue;
                }
                case K::setlist_u8: case K::c2: case K::c4: case K::c8:
@@ -1738,12 +1976,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // once hid the lower_bound/u16 miss).
          packed_ptr router_child_(packed_ptr node, uint8_t byte) const
          {
+            if (is_sdiv(node.tag()))
+            {
+               packed_ptr* cs = t_->sdiv_find_slot(node, byte);
+               return cs ? *cs : packed_ptr::null();
+            }
             return t_->with_router(node, [byte](auto* n, uint16_t pres) noexcept { return router_find(n, pres, byte); });
          }
          bool next_child_(packed_ptr node, int from, uint8_t& ob, packed_ptr& oc) const
          {
             if (from > 255)
                return false;
+            if (is_sdiv(node.tag())) return t_->sdiv_next(node, from, ob, oc);
             return t_->with_router(node,
                                    [&](auto* n, uint16_t pres) noexcept { return router_next(n, pres, from, ob, oc); });
          }
@@ -2049,6 +2293,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          {
             if (from < 0)
                return false;
+            if (is_sdiv(node.tag())) return t_->sdiv_prev(node, from, ob, oc);
             return t_->with_router(node,
                                    [&](auto* n, uint16_t pres) noexcept { return router_prev(n, pres, from, ob, oc); });
          }
@@ -2515,6 +2760,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (fr.cur >= 1)
                   { const uint16_t st = s->stems[fr.cur - 1]; key_.push(uint8_t(st >> 8)); key_.push(uint8_t(st & 0xFF)); }
                }
+               else if (is_sdiv(k))  // node-level prefix (tail) then the edge byte, like pfxd
+               {
+                  const uint8_t* pb;
+                  if (const unsigned pl = t_->router_prefix(fr.node, pb)) key_.append(pb, pl);
+                  fr.cbase = uint32_t(key_.len);
+                  if (fr.cur >= 1) key_.push(uint8_t(fr.cur - 1));
+               }
                else  // bucket (no prefix/edge) or c2/c4/c8/node_full (edge only)
                {
                   fr.cbase = uint32_t(key_.len);
@@ -2958,7 +3210,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                char*          P  = static_cast<char*>(deref_(node));
                const uint16_t pl = pn_plen(P);
-               if (const packed_ptr nx = pn_next<Ptr>(P);  // lazy fusion, as in insert_
+               if (const packed_ptr nx = pn_next<Ptr>(P);  // lazy fusion, as in insert_ (not sdiv)
                    (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
                    (nx.tag() == K::pfxd &&
                     pl + pfxd_plen(static_cast<node_full*>(deref_(nx)), nx.meta()) <= node_full::PFX_CAP))
@@ -3072,6 +3324,46 @@ namespace detail  // implementation types & node helpers — not part of the pub
                gc.release();
                return w;
             }
+            case K::sdiv2:  // headerless sdiv: a term needs a tail; an absent line widens
+            case K::sdiv3:
+            case K::sdiv4:
+            {
+               // CONSUME the node-level REPLICATED prefix (§2.2) BEFORE routing — mirrors the
+               // pfxd arm above and insert_'s sdiv arm. Without this, a key that shares the
+               // prefix (or ends exactly at its boundary) is mis-routed on the pre-prefix byte:
+               // the term is dropped and a phantom branch corrupts the node (buckets-mode bug).
+               {
+                  const uint8_t* pb;
+                  if (const unsigned pl = router_prefix(node, pb))
+                  {
+                     const size_t c = lcp(std::string_view(reinterpret_cast<const char*>(pb), pl),
+                                          key.substr(depth));
+                     if (c < pl)  // fused prefix diverges → split it
+                     {
+                        ins = true;
+                        return split_sdiv_prefix(node, key, depth, c, std::forward<VF>(val), [&](auto&& x) {
+                           return make_bucket_branch(key, depth + c + 1, std::forward<decltype(x)>(x));
+                        });
+                     }
+                     depth += pl;
+                  }
+               }
+               if (depth == key.size())
+                  return sdiv_set_or_update_term<Assign>(node, std::forward<VF>(val), ins);
+               const uint8_t byte = uint8_t(key[depth]);
+               if (packed_ptr* cs = sdiv_find_slot(node, byte))
+               {
+                  *cs = bkt_put<Assign>(*cs, key, depth + 1, std::forward<VF>(val), ins);
+                  return node;
+               }
+               ins              = true;
+               packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
+               build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
+               if (sdiv_try_set(node, byte, child)) { gc.release(); return node; }  // line room
+               packed_ptr w     = widen_set_(node, byte, child);  // ladder + sparse_full grow
+               gc.release();
+               return w;
+            }
             default:  // c2 / c4 / c8 — no inline prefix, term lives in the router_hdr
             {
                router_hdr* rh = static_cast<router_hdr*>(deref_(node));
@@ -3149,13 +3441,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (k == K::prefix_node || !is_router(k))
                return false;
             const bool       isfull = (k == K::node_full || k == K::pfxd);
-            // HEADERLESS node_full/pfxd carry no router_hdr: nbranch is summed across the
-            // range lines, term/prefix come from the handle-located tail. Other tiers read
-            // their router_hdr directly. (`rh` is null for node_full/pfxd — never deref'd.)
-            router_hdr*    rh = isfull ? nullptr : static_cast<router_hdr*>(deref_(nd));
+            const bool       issdiv = is_sdiv(k);
+            // HEADERLESS node_full/pfxd/sdiv carry no router_hdr: nbranch is summed across the
+            // range/lean lines, term/prefix come from the handle-located tail. Other tiers read
+            // their router_hdr directly. (`rh` is null for headerless kinds — never deref'd.)
+            router_hdr*    rh = (isfull || issdiv) ? nullptr : static_cast<router_hdr*>(deref_(nd));
             node_full*     fn = isfull ? static_cast<node_full*>(deref_(nd)) : nullptr;
             const uint16_t pres = nd.meta();
-            const unsigned nb = isfull ? full_nbranch(fn, pres) : unsigned(rh->hdr.nbranch);
+            const unsigned nb = isfull ? full_nbranch(fn, pres)
+                                : issdiv ? sdiv_nbranch(nd)
+                                         : unsigned(rh->hdr.nbranch);
             const packed_ptr term = router_term(nd);
             const bool       tm   = !term.is_null();
             // The fused/inline prefix (node_full/pfxd via tail, setlist via inline).
@@ -3227,7 +3522,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return false;
             }
             if (nb <= unsigned(SHRINK_MAX) && k != K::setlist_u8 && k != K::setlist_u16 &&
-                !(k == K::pfxd && pfxl > setlist::PREFIX_CAP))  // prefix must ride
+                !((k == K::pfxd || issdiv) && pfxl > setlist::PREFIX_CAP))  // prefix must ride inline
             {
                try  // sparse dense node: de-widen back to one cacheline (best-effort)
                {
@@ -3408,9 +3703,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::c8:
                case K::node_full:
                case K::pfxd:
+               case K::sdiv2:
+               case K::sdiv3:
+               case K::sdiv4:
                {
                   const K ck = cur.tag();
-                  {  // kinds with an inline/fused prefix (setlist_u8 / pfxd)
+                  {  // kinds with an inline/fused prefix (setlist_u8 / pfxd / sdiv tail)
                      const uint8_t* pb;
                      if (const unsigned pl = router_prefix(cur, pb))
                      {
@@ -3461,6 +3759,23 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const K          k   = cur.tag();
             if (k == K::node_full)
                return false;  // headerless node_full carries no term
+            if (is_sdiv(k))  // term in the always-present tail
+            {
+               node_full_tail* tl = sdiv_tail<Ptr>(deref_(cur), sdiv_lines(k));
+               if (!tl->hdr.has_term)
+                  return false;
+               if (tl->term.tag() == K::value_ptr)  // leaf("",v); inline term frees nothing
+                  free_leaf(static_cast<char*>(deref_term_(tl->term)));
+               tl->term         = packed_ptr::null();
+               tl->hdr.has_term = 0;
+               --count_;
+               if (rm_shrink_(slot))
+               {
+                  if (n >= 2) rm_unwind_(path, n, n - 2);
+                  else root_ = packed_ptr::null();
+               }
+               return true;
+            }
             if (k == K::pfxd)
             {
                node_full_tail* tl = full_tail(static_cast<node_full*>(deref_(cur)), cur.meta());
@@ -3694,6 +4009,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                });
                return res;
             }
+            case K::sdiv2:
+            case K::sdiv3:
+            case K::sdiv4:
+               // Two sdivs may hold the SAME key set with different divider choices, so a
+               // structural match is unsound; defer to the canonical sequence compare.
+               return -1;
             case K::bucket:
             {
                const bucket* A = static_cast<const bucket*>(deref_(a));
@@ -3721,6 +4042,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
       struct dbg_counts
       {
          uint64_t leaf = 0, inl = 0, prefix = 0, setlist = 0, setlist16 = 0, c2 = 0, c4 = 0, c8 = 0, full = 0;
+         uint64_t sdiv2 = 0, sdiv3 = 0, sdiv4 = 0;  // divider-partitioned setlist tiers
+         uint64_t sdiv_nbr_sum = 0;                 // branches living in sdiv nodes
          uint64_t terminals = 0, sum_depth = 0;
          uint64_t pfx_le4 = 0, pfx_le8 = 0, pfx_le16 = 0, pfx_sum = 0;
          // Wide-stem opportunity. router_hops = sum over terminals of routers on its path
@@ -3736,6 +4059,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // full_nbr_sum / (full+fullp) = mean fanout. cn_nbr_sum = branches living in cnodes.
          uint64_t full_lt48 = 0, full_48_96 = 0, full_96_160 = 0, full_160_192 = 0, full_ge192 = 0;
          uint64_t full_nbr_sum = 0, cn_nbr_sum = 0;
+         // prefix_node audit: how many short (<=7B) prefixes, and what each prefix_node sits over
+         // (leaf / setlist / router / pn / other). Used by the prefix-fusion investigation.
+         uint64_t pn_le7 = 0, pn_over_leaf = 0, pn_le7_over_leaf = 0, pn_over_setlist = 0,
+                  pn_le7_over_setlist = 0, pn_over_router = 0, pn_over_pn = 0, pn_over_other = 0;
       };
       // Returns the number of terminals in cur's subtree (used to weight collapse_saved).
       // routers_above = routers already on the path; parent_noterm_router = the parent is a
@@ -3759,6 +4086,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
                d.pfx_le4 += (pl <= 4);
                d.pfx_le8 += (pl <= 8);
                d.pfx_le16 += (pl <= 16);
+               {  // TEMP AUDIT: classify the node this prefix_node sits above
+                  const packed_ptr nx2 = pn_next<Ptr>(static_cast<char*>(deref_(cur)));
+                  const K          nk   = nx2.tag();
+                  const bool       le7  = (pl <= 7);
+                  d.pn_le7 += le7;
+                  if (is_terminal(nk)) { ++d.pn_over_leaf; d.pn_le7_over_leaf += le7; }
+                  else if (nk == K::setlist_u8 || nk == K::setlist_u16)
+                  { ++d.pn_over_setlist; d.pn_le7_over_setlist += le7; }
+                  else if (is_router(nk) || nk == K::node_full || nk == K::pfxd) ++d.pn_over_router;
+                  else if (nk == K::prefix_node) ++d.pn_over_pn;
+                  else ++d.pn_over_other;
+               }
                // A prefix_node breaks a router→router chain (the child can't fuse into the
                // parent across a multi-byte prefix), so parent_noterm_router resets to false.
                return dbg_walk(pn_next<Ptr>(static_cast<char*>(deref_(cur))), d, depth + 1,
@@ -3771,16 +4110,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c8:           ++d.c8; break;
             case K::node_full:    ++d.full; break;
             case K::pfxd:         ++d.fullp; break;  // full router with a fused in-header prefix
+            case K::sdiv2:        ++d.sdiv2; break;
+            case K::sdiv3:        ++d.sdiv3; break;
+            case K::sdiv4:        ++d.sdiv4; break;
             case K::bucket:       return 0;  // census doesn't descend buckets
             case K::null:         return 0;  // exhaustive (no default)
          }
          const K          kk     = cur.tag();
          const bool       isfull = (kk == K::node_full || kk == K::pfxd);
+         const bool       issdiv = is_sdiv(kk);
          const packed_ptr term   = router_term(cur);
          const bool       noterm = term.is_null();
-         {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode branches
+         {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode/sdiv branches
             const unsigned nb = isfull ? full_nbranch(static_cast<const node_full*>(deref_(cur)), cur.meta())
-                                       : static_cast<const router_hdr*>(deref_(cur))->hdr.nbranch;
+                                : issdiv ? sdiv_nbranch(cur)
+                                         : static_cast<const router_hdr*>(deref_(cur))->hdr.nbranch;
             if (isfull)
             {
                d.full_nbr_sum += nb;
@@ -3792,6 +4136,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             else if (kk == K::c2 || kk == K::c4 || kk == K::c8)
                d.cn_nbr_sum += nb;
+            else if (issdiv)
+               d.sdiv_nbr_sum += nb;
          }
          if (parent_noterm_router) ++d.collapsible;
          uint64_t sub = dbg_walk(term, d, depth + 1, routers_above + 1, false);
@@ -3914,6 +4260,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
                   case K::c4: cnode_for_each(static_cast<const cnode<4>*>(deref_(cur)), recurse); break;
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
+                  case K::sdiv2: case K::sdiv3: case K::sdiv4:
+                     sdiv_for_each(cur, recurse);
+                     break;
                   default:  // node_full / pfxd (both deref to a headerless node_full)
                   {
                      const node_full* fn   = static_cast<const node_full*>(deref_(cur));
@@ -4015,6 +4364,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
                   case K::c4: cnode_for_each(static_cast<const cnode<4>*>(deref_(cur)), recurse); break;
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
+                  case K::sdiv2: case K::sdiv3: case K::sdiv4:
+                     sdiv_for_each(cur, recurse);  // (byte, child) ascending
+                     break;
                   default:
                   {
                      const node_full* fn   = static_cast<const node_full*>(deref_(cur));
@@ -4461,6 +4813,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return next;  // already tagged K::pfxd with presence meta + has_tail
             }
          }
+         // sdiv: FUSE the prefix by REPLICATING it into every lean line (§2.2) — the routed
+         // line then already carries the prefix, so the descent consumes it off the line it
+         // already loads (ZERO extra cachelines, no prefix_node hop). build_sdiv rebuilds the
+         // node with `extra` prepended to its common prefix; it returns null when the combined
+         // prefix exceeds SDIV_PREFIX_CAP or a line would overflow — then we fall through to a
+         // dedicated prefix_node (the genuinely-too-long case, §2.3 territory).
+         if (is_sdiv(nk))
+         {
+            packed_ptr fused = build_sdiv(next, -1, pfx);  // throws → unchanged; null → too long
+            if (!fused.is_null())
+            {
+               node_free_(deref_(next), node_bytes_(next));  // old sdiv replaced by the fused one
+               return fused;
+            }
+         }
          char*    p  = static_cast<char*>(node_alloc_(pn_size<Ptr>(pfx.size())));
          uint16_t pl = uint16_t(pfx.size());
          std::memcpy(p, &pl, 2);
@@ -4661,8 +5028,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c2:          return sizeof(cnode<2>);
             case K::c4:          return sizeof(cnode<4>);
             case K::c8:          return sizeof(cnode<8>);
-            // node_full / pfxd are variable-sized: route them through node_bytes_(handle).
+            // node_full / pfxd / sdiv are variable-sized: route through node_bytes_(handle).
             case K::pfxd: case K::node_full:
+            case K::sdiv2: case K::sdiv3: case K::sdiv4:
             case K::value_ptr: case K::value_inline: case K::prefix_node:
             case K::bucket: case K::null:
                assert(false && "fixed-size kinds only — use node_bytes_(handle)");
@@ -4670,20 +5038,181 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
       }
       // Allocation byte count for ANY router handle — per-node for sparse_full/pfxd
-      // (128 + popcount(presence)*128), fixed for the rest. Every free site that can see
-      // a node_full sizes through here, never node_size(tag).
+      // (128 + popcount(presence)*128) and sdiv ((L + has_tail)*128), fixed for the rest.
+      // Every free site that can see a variable-sized node sizes through here.
       size_t node_bytes_(packed_ptr nd) const noexcept
       {
          const K k = nd.tag();
          if (k == K::node_full || k == K::pfxd)
             return full_node_bytes(nd.meta(), k == K::pfxd);
+         if (is_sdiv(k))
+            return sdiv_node_bytes(k);
          return node_size(k);
+      }
+      // ── sdiv node primitives (lean lines; routing metadata in the handle) ───────
+      // The lean line's count/handle accessors. A handle is sizeof(Ptr) bytes at offset
+      // 16 + i*sizeof(Ptr) (unaligned-safe via memcpy). Keys are at line+2.
+      static uint8_t  sdiv_line_count(const char* line) noexcept { return uint8_t(line[0]); }
+      static packed_ptr sdiv_line_branch(const char* line, int i) noexcept
+      {
+         packed_ptr p;
+         std::memcpy(p.b, line + 16 + size_t(i) * sizeof(Ptr), sizeof(Ptr));
+         return p;
+      }
+      static void sdiv_line_set_branch(char* line, int i, packed_ptr p) noexcept
+      {
+         std::memcpy(line + 16 + size_t(i) * sizeof(Ptr), p.b, sizeof(Ptr));
+      }
+      // ── per-line replicated prefix (§2.2) — the prefix sits in the post-handle slack ──
+      // Located from line[0] (the count the descent reads anyway): prefix bytes start at
+      // 16 + count*W and run for line[1] bytes. So a line carrying `c` handles has room for
+      // up to 128 - 16 - c*W prefix bytes. Replicated identically across every line.
+      static uint8_t sdiv_line_plen(const char* line) noexcept { return uint8_t(line[1]); }
+      static int     sdiv_line_pfx_off(unsigned count) noexcept { return 16 + int(count) * int(sizeof(Ptr)); }
+      static const uint8_t* sdiv_line_pfx(const char* line) noexcept
+      {
+         return reinterpret_cast<const uint8_t*>(line + sdiv_line_pfx_off(uint8_t(line[0])));
+      }
+      // Bytes free for the prefix in a line already holding `count` handles.
+      static int sdiv_line_pfx_room(unsigned count) noexcept { return SDIV_LINE - sdiv_line_pfx_off(count); }
+      // Can the line accept ONE more handle while keeping its replicated prefix? (The handle
+      // takes slot [16+count*W .. +W); the prefix must still fit AFTER the new slot.) Mirrors
+      // sdiv_line_append's room test — the widen ladder uses it so a "break to set" never fails.
+      static bool sdiv_line_has_room(const char* line) noexcept
+      {
+         const uint8_t c  = uint8_t(line[0]);
+         const uint8_t pl = uint8_t(line[1]);
+         return c < SL_CAP && sdiv_line_pfx_off(c + 1u) + int(pl) <= SDIV_LINE;
+      }
+      // Append (key=byte, child=p) to a lean line; returns false if the line is full OR the
+      // new handle would not leave room for the line's replicated prefix. A handle goes at
+      // offset 16+count*W — which is where the prefix currently starts — so when a prefix is
+      // present it is shifted up to 16+(count+1)*W first (kept replicated, byte-identical).
+      static bool sdiv_line_append(char* line, uint8_t byte, packed_ptr p) noexcept
+      {
+         const uint8_t c  = uint8_t(line[0]);
+         const uint8_t pl = uint8_t(line[1]);
+         if (c >= SL_CAP) return false;
+         if (sdiv_line_pfx_off(c + 1u) + int(pl) > SDIV_LINE) return false;  // no room for handle+prefix
+         if (pl)  // move the prefix up past the new handle slot, then write the handle
+            std::memmove(line + sdiv_line_pfx_off(c + 1u), line + sdiv_line_pfx_off(c), pl);
+         line[2 + c] = char(byte);
+         sdiv_line_set_branch(line, c, p);
+         line[0] = char(c + 1);
+         return true;
+      }
+      // Stamp the replicated prefix into one line (the bytes already past the current
+      // handles). The caller guarantees room (choose_sdiv_ / build_sdiv reserve it).
+      static void sdiv_line_set_pfx(char* line, const uint8_t* pfx, unsigned plen) noexcept
+      {
+         const uint8_t c = uint8_t(line[0]);
+         assert(sdiv_line_pfx_off(c) + int(plen) <= SDIV_LINE && "sdiv line: no room for prefix");
+         line[1] = char(uint8_t(plen));
+         if (plen) std::memcpy(line + sdiv_line_pfx_off(c), pfx, plen);
+      }
+      // The (writable) slot holding `byte`'s child in `cur`, or nullptr if absent.
+      packed_ptr* sdiv_find_slot(packed_ptr cur, uint8_t byte) const noexcept
+      {
+         char* node     = static_cast<char*>(deref_(cur));
+         char* line     = sdiv_line(node, child_line(sdiv_tier(cur.tag()), cur.meta(), byte));
+         const int i    = sdiv_find(line + 2, sdiv_line_count(line), byte);
+         if (i < 0) return nullptr;
+         return reinterpret_cast<packed_ptr*>(line + 16 + size_t(i) * sizeof(Ptr));
+      }
+      // Set byte->p in cur IN PLACE (existing key overwritten, else appended). Returns
+      // false only when byte's line is full (the widen signal). The sub-range is always
+      // routable (sdiv covers all 256 bytes), so this never fails for an absent line.
+      bool sdiv_try_set(packed_ptr cur, uint8_t byte, packed_ptr p) const noexcept
+      {
+         char*     node = static_cast<char*>(deref_(cur));
+         char*     line = sdiv_line(node, child_line(sdiv_tier(cur.tag()), cur.meta(), byte));
+         const int i    = sdiv_find(line + 2, sdiv_line_count(line), byte);
+         if (i >= 0) { sdiv_line_set_branch(line, i, p); return true; }
+         return sdiv_line_append(line, byte, p);
+      }
+      // Sum of branch counts across all L lines.
+      unsigned sdiv_nbranch(packed_ptr cur) const noexcept
+      {
+         const char*    node = static_cast<const char*>(deref_(cur));
+         const unsigned L    = sdiv_lines(cur.tag());
+         unsigned       n    = 0;
+         for (unsigned ln = 0; ln < L; ++ln) n += sdiv_line_count(sdiv_line(node, ln));
+         return n;
+      }
+      // Visit (byte, branch) in ASCENDING key order: lines are in divider order, so
+      // concatenating each line's keys (each line sorted) yields global key order. We
+      // sort each line's small key set at visit time (iteration never routes, so the
+      // stored order within a line is free to be unsorted — see build_sdiv).
+      template <class F>
+      void sdiv_for_each(packed_ptr cur, F&& f) const
+      {
+         const char*    node = static_cast<const char*>(deref_(cur));
+         const unsigned L    = sdiv_lines(cur.tag());
+         for (unsigned ln = 0; ln < L; ++ln)
+         {
+            const char*   line = sdiv_line(node, ln);
+            const unsigned c   = sdiv_line_count(line);
+            int order[SL_CAP];
+            for (unsigned i = 0; i < c; ++i) order[i] = int(i);
+            std::sort(order, order + c, [&](int a, int b) {
+               return uint8_t(line[2 + a]) < uint8_t(line[2 + b]);
+            });
+            for (unsigned i = 0; i < c; ++i)
+               f(uint8_t(line[2 + order[i]]), sdiv_line_branch(line, order[i]));
+         }
+      }
+      // First child with byte >= from (iterator stepping). Lines are in divider order, so
+      // the smallest qualifying byte may be in any line — scan all, keep the minimum.
+      bool sdiv_next(packed_ptr cur, int from, uint8_t& ob, packed_ptr& oc) const noexcept
+      {
+         const char*    node = static_cast<const char*>(deref_(cur));
+         const unsigned L    = sdiv_lines(cur.tag());
+         int            best = 256;
+         packed_ptr     bc   = packed_ptr::null();
+         for (unsigned ln = 0; ln < L; ++ln)
+         {
+            const char*   line = sdiv_line(node, ln);
+            const unsigned c   = sdiv_line_count(line);
+            for (unsigned i = 0; i < c; ++i)
+            {
+               const int b = uint8_t(line[2 + i]);
+               if (b >= from && b < best) { best = b; bc = sdiv_line_branch(line, int(i)); }
+            }
+         }
+         if (best == 256) return false;
+         ob = uint8_t(best);
+         oc = bc;
+         return true;
+      }
+      // Last child with byte <= from (reverse-iterator stepping) — mirror of sdiv_next.
+      bool sdiv_prev(packed_ptr cur, int from, uint8_t& ob, packed_ptr& oc) const noexcept
+      {
+         const char*    node = static_cast<const char*>(deref_(cur));
+         const unsigned L    = sdiv_lines(cur.tag());
+         int            best = -1;
+         packed_ptr     bc   = packed_ptr::null();
+         for (unsigned ln = 0; ln < L; ++ln)
+         {
+            const char*   line = sdiv_line(node, ln);
+            const unsigned c   = sdiv_line_count(line);
+            for (unsigned i = 0; i < c; ++i)
+            {
+               const int b = uint8_t(line[2 + i]);
+               if (b <= from && b > best) { best = b; bc = sdiv_line_branch(line, int(i)); }
+            }
+         }
+         if (best < 0) return false;
+         ob = uint8_t(best);
+         oc = bc;
+         return true;
       }
       // ONE typed visitor for the byte-router family: switch on the tag once, hand the TYPED
       // node AND its presence (the handle's metadata — needed by the headerless node_full /
       // pfxd; ignored by the others) to f. Every byte-router dispatcher below is a packed_ptr
       // -> typed-overload one-liner over this, so tag exhaustiveness lives in exactly one
       // switch (u16 is not a byte router; the callers that can see one handle it first).
+      // sdiv is NOT routed here — its line-based routing has no typed-node+presence form; the
+      // packed_ptr-level dispatchers handle sdiv before delegating to with_router.
       // always_inline + noexcept propagation: the typed switch must dissolve into each
       // dispatcher exactly as the hand-written switches did — an outlined call (or a
       // may-throw edge inside the noexcept dispatchers) would bloat every caller with
@@ -4704,8 +5233,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::node_full:  return f(static_cast<node_full*>(deref_(cur)), pres);
             // exhaustive (no default): a new K must be decided here — and only here.
             case K::value_ptr: case K::value_inline: case K::prefix_node:
-            case K::setlist_u16: case K::bucket: case K::null:
-               assert(false && "byte-routers only"); __builtin_unreachable();
+            case K::setlist_u16: case K::sdiv2: case K::sdiv3: case K::sdiv4:
+            case K::bucket: case K::null:
+               assert(false && "byte-routers only (sdiv handled before with_router)"); __builtin_unreachable();
          }
       }
 
@@ -4723,10 +5253,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const node_full_tail* tl = full_tail(static_cast<const node_full*>(deref_(cur)), cur.meta());
             return tl->hdr.has_term ? tl->term : packed_ptr::null();
          }
+         if (is_sdiv(k))  // term in the always-present tail, like pfxd
+         {
+            const node_full_tail* tl = sdiv_tail<Ptr>(deref_(cur), sdiv_lines(k));
+            return tl->hdr.has_term ? tl->term : packed_ptr::null();
+         }
          return static_cast<const router_hdr*>(deref_(cur))->term;
       }
       // The fused/inline prefix of a router (length 0 for kinds that carry none). pb points at
-      // the bytes, valid while the node lives. setlist_u8 → inline prefix; pfxd → tail prefix.
+      // the bytes, valid while the node lives. setlist_u8 → inline prefix; pfxd / sdiv → tail.
       unsigned router_prefix(packed_ptr cur, const uint8_t*& pb) const noexcept
       {
          const K k = cur.tag();
@@ -4741,6 +5276,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const node_full* f = static_cast<const node_full*>(deref_(cur));
             pb                 = pfxd_pfx(f, cur.meta());
             return pfxd_plen(f, cur.meta());
+         }
+         if (is_sdiv(k))  // node-level prefix REPLICATED in every line — read line 0 (§2.2)
+         {
+            const char* line = sdiv_line(deref_(cur), 0);
+            pb               = sdiv_line_pfx(line);
+            return sdiv_line_plen(line);
          }
          pb = nullptr;
          return 0;
@@ -4897,6 +5438,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       packed_ptr* router_find_slot(packed_ptr cur, uint8_t byte) const noexcept
       {
+         if (is_sdiv(cur.tag())) return sdiv_find_slot(cur, byte);
          return with_router(cur, [byte](auto* n, uint16_t pres) noexcept { return router_find_slot(n, pres, byte); });
       }
 
@@ -4915,6 +5457,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       bool router_try_set(packed_ptr cur, uint8_t byte, packed_ptr p) const noexcept
       {
+         if (is_sdiv(cur.tag())) return sdiv_try_set(cur, byte, p);
          return with_router(cur, [&](auto* n, uint16_t pres) noexcept { return router_try_set(n, pres, byte, p); });
       }
 
@@ -4942,6 +5485,26 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (i >= 0) sl_remove_branch_(s, i);
                return;
             }
+         }
+         if (is_sdiv(cur.tag()))  // compact the lean line (shift keys + handles down)
+         {
+            char*     node = static_cast<char*>(deref_(cur));
+            char*     line = sdiv_line(node, child_line(sdiv_tier(cur.tag()), cur.meta(), byte));
+            const int i    = sdiv_find(line + 2, sdiv_line_count(line), byte);
+            if (i < 0) return;
+            const int     c  = sdiv_line_count(line);
+            const uint8_t pl = sdiv_line_plen(line);
+            // The replicated prefix rides AFTER the handles (offset 16+count*W); dropping a
+            // handle moves the prefix down with it, else sdiv_line_pfx (which reads at the new,
+            // smaller count) would land on stale bytes. Capture it before the shift, re-stamp after.
+            uint8_t pfx[SDIV_PREFIX_CAP];
+            if (pl) std::memcpy(pfx, sdiv_line_pfx(line), pl);
+            std::memmove(line + 2 + i, line + 2 + i + 1, size_t(c - 1 - i));
+            std::memmove(line + 16 + size_t(i) * sizeof(Ptr), line + 16 + size_t(i + 1) * sizeof(Ptr),
+                         size_t(c - 1 - i) * sizeof(Ptr));
+            line[0] = char(c - 1);
+            if (pl) std::memcpy(line + sdiv_line_pfx_off(c - 1), pfx, pl);  // re-stamp at the new offset
+            return;
          }
          with_router(cur, [byte](auto* n, uint16_t pres) noexcept { router_remove(n, pres, byte); });
       }
@@ -4985,41 +5548,57 @@ namespace detail  // implementation types & node helpers — not part of the pub
             for (int i = 0; i < s->rh.hdr.nbranch; ++i) f(uint8_t(s->stems[i] >> 8), s->branch[i]);
             return;
          }
+         if (is_sdiv(cur.tag())) { sdiv_for_each(cur, std::forward<F>(f)); return; }
          with_router(cur, [&](auto* n, uint16_t pres) { router_for_each(n, pres, f); });
       }
 
-      // Widen a full router. Default (flat): setlist→node_full directly. With the cnode density
-      // ladder on (mode::dense_tiers or a small capacity hint — a perf-per-byte win for small
-      // maps), climb setlist→c2→c4→node_full instead: sparse routers stay compact cnodes (less
-      // memory + tighter ordered iteration than a sparse full). Occupancy is bimodal — a router
-      // ends at ~30 branches or ~256, little between — so c4→full is the right jump and the c8
-      // rung is dead weight (skipped unless LadderC8, kept for adversarial mid-density clusters).
-      // `reserve_sub` (0..15, or -1): when widening TO a sparse_full, materialize this
-      // sub-range too, so the caller's subsequent set never needs a second alloc (grow)
-      // after widen already freed the source — closing the dangling-pointer/leak window.
-      packed_ptr widen(packed_ptr cur, int reserve_sub = -1)
+      // Widen a full router by ONE rung. Default ladder: setlist_u8 → sdiv2 → sdiv3 → sdiv4
+      // → sparse_full/full — the divider-partitioned setlist (sdiv) is dense (~9 B/child) and
+      // fast (one cacheline/hop, line index from the handle, no rank-after-load). A node that
+      // overflows sdiv4 (a line would exceed SL_CAP) widens to sparse_full/full. With the cnode
+      // density ladder on (mode::dense_tiers / small capacity hint), climb setlist→c2→c4→full
+      // instead (kept compiling, OFF the default). `reserve_byte` (0..255, or -1): the byte
+      // about to be inserted — reserved so the caller's subsequent set fits in place (an sdiv
+      // line / a sparse_full sub-range) with no second alloc after widen freed the source.
+      packed_ptr widen(packed_ptr cur, int reserve_byte = -1)
       {
          const K k = cur.tag();
-         // cN / node_full have no inline region: a setlist's inline leaves must become
+         const int reserve_sub = reserve_byte >= 0 ? (reserve_byte >> 4) : -1;
+         // cN / node_full / sdiv have no inline region: a setlist's inline leaves must become
          // real terminal leaves before the rebuild copies its branches.
          if (k == K::setlist_u8)
          {
             setlist* s = static_cast<setlist*>(deref_(cur));
             if (sl_inl_active(s)) sl_externalize_all_(s);  // throws bad_alloc → caller's guard
          }
-         const size_t os = node_size(k);
+         const size_t os = is_sdiv(k) ? node_bytes_(cur) : node_size(k);
          packed_ptr   out;
-         if constexpr (!DenseTiers)
-            out = build_full(cur, K::node_full, reserve_sub);  // flat_full: straight to full
-         else if (k == K::setlist_u8) out = build_wider<cnode<2>>(cur, K::c2);
-         else if (k == K::c2)         out = build_wider<cnode<4>>(cur, K::c4);
-         else if (k == K::c4)
+         if constexpr (DenseTiers)
          {
-            if constexpr (LadderC8) out = build_wider<cnode<8>>(cur, K::c8);
-            else                    out = build_full(cur, K::node_full, reserve_sub);  // skip dead c8
+            if (k == K::setlist_u8) out = build_wider<cnode<2>>(cur, K::c2);
+            else if (k == K::c2)    out = build_wider<cnode<4>>(cur, K::c4);
+            else if (k == K::c4)
+            {
+               if constexpr (LadderC8) out = build_wider<cnode<8>>(cur, K::c8);
+               else                    out = build_full(cur, K::node_full, reserve_sub);  // skip dead c8
+            }
+            else if (k == K::c8)    out = build_full(cur, K::node_full, reserve_sub);  // only if LadderC8
+            else { assert(false); __builtin_unreachable(); }
          }
-         else if (k == K::c8)         out = build_full(cur, K::node_full, reserve_sub);  // only if LadderC8
-         else { assert(false); __builtin_unreachable(); }
+         else
+         {
+            // The sdiv ladder. setlist / sdiv2 / sdiv3 climb to the next sdiv tier if one
+            // fits the whole branch set (+ the reserved byte); otherwise jump straight to a
+            // dense sparse_full/full. sdiv4 always jumps to full. build_sdiv considers ALL
+            // branches at once (the dividers are recomputed), so a single step suffices.
+            if (k == K::setlist_u8 || k == K::sdiv2 || k == K::sdiv3)
+            {
+               out = build_sdiv(cur, reserve_byte);                 // null when no sdiv tier fits
+               if (out.is_null()) out = build_full(cur, K::node_full, reserve_sub);
+            }
+            else if (k == K::sdiv4) out = build_full(cur, K::node_full, reserve_sub);
+            else { assert(false); __builtin_unreachable(); }
+         }
          node_free_(deref_(cur), os);
          return out;
       }
@@ -5051,20 +5630,172 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          uint16_t presence = reserve_sub >= 0 ? uint16_t(1u << reserve_sub) : 0;
          router_for_each(src, [&](uint8_t b, packed_ptr) { presence |= uint16_t(1u << (b >> 4)); });
-         const unsigned    nr   = unsigned(std::popcount(presence));
-         const router_hdr* srh  = static_cast<const router_hdr*>(deref_(src));
-         const bool        pfxd = srh->hdr.has_term;  // a term needs a tail → pfxd
-         node_full*        n    = ::new (node_alloc_(full_node_bytes(presence, pfxd))) node_full;
+         const unsigned   nr    = unsigned(std::popcount(presence));
+         const packed_ptr sterm = router_term(src);  // sdiv-aware: term via the handle/tail
+         const uint8_t*   spfx  = nullptr;            // src's node-level prefix (sdiv tail)
+         const unsigned   spl   = router_prefix(src, spfx);
+         const bool       pfxd  = !sterm.is_null() || spl;  // a term/prefix needs a tail → pfxd
+         node_full*       n     = ::new (node_alloc_(full_node_bytes(presence, pfxd))) node_full;
          for (unsigned r = 0; r < nr; ++r)  // null every materialized slot
             std::memset(full_range<Ptr>(n, r)->ptr, 0xFF, sizeof(cline_direct_t<Ptr>::ptr));
          if (pfxd)
          {
             node_full_tail* tl = full_tail(n, presence);
-            tl->hdr            = node_hdr{1, 0, 0};  // has_term, no prefix
-            tl->term           = srh->term;
+            tl->hdr            = node_hdr{sterm.is_null() ? uint16_t(0) : uint16_t(1), 0, uint16_t(spl & 0x3F)};
+            tl->term           = sterm;
+            if (spl) std::memcpy(tl->prefix, spfx, spl);
          }
          router_for_each(src, [&](uint8_t b, packed_ptr br) { full_set_present(n, presence, b, br); });
          return pack_(n, pfxd ? K::pfxd : K::node_full).with_meta(presence).with_tail(pfxd);
+      }
+
+      // Choose the smallest sdiv tier (and its dividers) that keeps every lean line
+      // <= SL_CAP for the byte set `bytes[0..nb)` (the prototype build()'s tier choice).
+      // Returns the kind (K::sdiv2/3/4) and writes the dividers to `out_meta`; returns
+      // K::null when even sdiv4 would overflow a line (caller goes dense). `bytes` MUST be
+      // sorted ascending (build_sdiv sorts a scratch copy first).
+      static K choose_sdiv_(const uint8_t* bytes, unsigned nb, uint16_t& out_meta, unsigned plen = 0) noexcept
+      {
+         // A line carrying `cnt` handles AND a replicated `plen`-byte prefix needs
+         // 16 + cnt*W + plen <= 128 (§2.2). So the per-line cap shrinks when a prefix rides:
+         // line_cap = min(SL_CAP, (128 - 16 - plen)/W). With plen==0 this is plain SL_CAP.
+         const unsigned line_cap =
+             std::min(unsigned(SL_CAP), unsigned((SDIV_LINE - 16 - int(plen)) / int(sizeof(Ptr))));
+         auto fits = [&](Tier t, uint16_t meta) {
+            unsigned cnt[4] = {0, 0, 0, 0};
+            for (unsigned i = 0; i < nb; ++i) ++cnt[child_line(t, meta, bytes[i])];
+            for (unsigned k = 0; k < line_count(t, meta); ++k)
+               if (cnt[k] > line_cap) return false;
+            return true;
+         };
+         const uint16_t m2 = bytes[nb / 2];
+         if (fits(Tier::sdiv2, m2)) { out_meta = m2; return K::sdiv2; }
+         const uint16_t m3 = uint16_t(bytes[nb / 3] | (bytes[2 * nb / 3] << 8));
+         if (fits(Tier::sdiv3, m3)) { out_meta = m3; return K::sdiv3; }
+         // sdiv4: implicit divider at 128 + a median divider in each half.
+         uint8_t lo[256], hi[256];
+         unsigned nlo = 0, nhi = 0;
+         for (unsigned i = 0; i < nb; ++i) (bytes[i] < 128 ? lo[nlo++] : hi[nhi++]) = bytes[i];
+         const uint8_t  d0 = nlo ? lo[nlo / 2] : 0;
+         const uint8_t  d1 = nhi ? hi[nhi / 2] : 128;
+         const uint16_t m4 = uint16_t(d0 | (d1 << 8));
+         if (fits(Tier::sdiv4, m4)) { out_meta = m4; return K::sdiv4; }
+         return K::null;  // no sdiv tier fits → caller goes dense (sparse_full/full)
+      }
+      // Build an sdiv router from a narrower router `src` (a setlist or a smaller sdiv),
+      // optionally reserving a slot for `reserve_byte` (the byte about to be inserted, or
+      // -1) and PREPENDING `extra` to the node-level common prefix (a prefix being fused in
+      // by make_prefix / a widen-under-prefix). Returns the sdiv handle (dividers in the meta,
+      // has_tail always set — the tail is always materialized for the term), or a K::null
+      // handle when no sdiv tier fits OR the combined prefix exceeds SDIV_PREFIX_CAP (caller
+      // falls through to build_full / keeps the prefix_node). The node-level common prefix
+      // (`extra` ++ src's own) is REPLICATED into every lean line (§2.2) — NOT the tail; the
+      // tail carries only the term. `src` is freed by the caller (widen). The reserved byte's
+      // slot is left for the caller to set.
+      packed_ptr build_sdiv(packed_ptr src, int reserve_byte = -1, std::string_view extra = {})
+      {
+         // Gather src's branch bytes (+ the reserved byte) sorted, to choose the tier.
+         uint8_t    bytes[256];
+         packed_ptr brs[256];
+         unsigned   nb = 0;
+         router_for_each(src, [&](uint8_t b, packed_ptr br) { bytes[nb] = b; brs[nb] = br; ++nb; });
+         uint8_t sorted[256];
+         std::memcpy(sorted, bytes, nb);
+         unsigned ns = nb;
+         if (reserve_byte >= 0) sorted[ns++] = uint8_t(reserve_byte);
+         std::sort(sorted, sorted + ns);
+         // The combined node-level prefix to replicate: `extra` (prepended) ++ src's own.
+         const uint8_t* spfx = nullptr;
+         const unsigned spl  = router_prefix(src, spfx);
+         const unsigned plen = unsigned(extra.size()) + spl;
+         if (plen > unsigned(SDIV_PREFIX_CAP)) return packed_ptr::null();  // too long → caller keeps prefix_node
+         uint8_t pfx[SDIV_PREFIX_CAP];
+         if (!extra.empty()) std::memcpy(pfx, extra.data(), extra.size());
+         if (spl) std::memcpy(pfx + extra.size(), spfx, spl);  // (spfx points into src — still live)
+         uint16_t meta = 0;
+         const K  k    = choose_sdiv_(sorted, ns, meta, plen);
+         if (k == K::null) return packed_ptr::null();  // signal: go dense
+         const unsigned   L    = sdiv_lines(k);
+         const Tier       t    = sdiv_tier(k);
+         const packed_ptr term = router_term(src);
+         const bool       tm   = !term.is_null();
+         char* node = static_cast<char*>(node_alloc_(sdiv_node_bytes(k)));
+         std::memset(node, 0, sdiv_node_bytes(k));  // count=0 / prefix_len=0 per line; tail zeroed
+         node_full_tail* tl = sdiv_tail<Ptr>(node, L);  // tail is always present (term only now)
+         tl->hdr            = node_hdr{tm ? uint16_t(1) : uint16_t(0), 0, 0};
+         tl->term           = tm ? term : packed_ptr::null();
+         for (unsigned i = 0; i < nb; ++i)
+         {
+            char*      line = sdiv_line(node, child_line(t, meta, bytes[i]));
+            const bool ok   = sdiv_line_append(line, bytes[i], brs[i]);
+            assert(ok && "build_sdiv: chosen tier guarantees each line <= SL_CAP");
+            (void)ok;
+         }
+         if (plen)  // REPLICATE the common prefix into every line's post-handle slack (§2.2)
+            for (unsigned ln = 0; ln < L; ++ln) sdiv_line_set_pfx(sdiv_line(node, ln), pfx, plen);
+         return pack_(node, k).with_meta(meta).with_tail(true);
+      }
+      // Insert-or-update an sdiv term — HEADERLESS: the term lives in the always-present
+      // tail, so this is a pure in-place write (no realloc / re-anchor). `ins` set true iff
+      // a NEW term was added. Strong exception safety: the value is built first.
+      template <bool Assign, class VF>
+      packed_ptr sdiv_set_or_update_term(packed_ptr cur, VF&& val, bool& ins)
+      {
+         node_full_tail* tl = sdiv_tail<Ptr>(deref_(cur), sdiv_lines(cur.tag()));
+         if (tl->hdr.has_term)  // present: overwrite (insert) or leave (emplace)
+         {
+            if constexpr (Assign)
+            {
+               if (tl->term.tag() == K::value_inline)
+                  tl->term = pack_inline(vf_make(std::forward<VF>(val)));
+               else
+                  vf_assign(std::forward<VF>(val), leaf_val(static_cast<char*>(deref_term_(tl->term))));
+            }
+            ins = false;
+            return cur;
+         }
+         tl->term         = make_value(std::string_view{}, std::forward<VF>(val));  // throws → unchanged
+         tl->hdr.has_term = 1;
+         ins              = true;
+         return cur;
+      }
+      // Split an sdiv's node-level REPLICATED prefix (§2.2) diverging from the key at c
+      // (< plen): same shape as split_pfxd_prefix — a new parent setlist takes the shared
+      // part [0..c), routes the new value's branch, and routes the old continuation byte
+      // (prefix[c]) back to this node, whose prefix shortens to [c+1..). The shortened prefix
+      // is re-stamped into EVERY line (the replication invariant), shrinking only — so the
+      // room it occupies never overflows.
+      template <class MakeBranch, class VF>
+      packed_ptr split_sdiv_prefix(packed_ptr cur, std::string_view key, size_t depth,
+                                   size_t c, VF&& val, MakeBranch&& make_branch)
+      {
+         char*          node = static_cast<char*>(deref_(cur));
+         const unsigned L    = sdiv_lines(cur.tag());
+         const char*    l0   = sdiv_line(node, 0);
+         const unsigned pl   = sdiv_line_plen(l0);
+         uint8_t        common[SDIV_PREFIX_CAP];
+         std::memcpy(common, sdiv_line_pfx(l0), c);  // shared part [0..c)  (read, no mutation)
+         uint8_t        full_pfx[SDIV_PREFIX_CAP];
+         std::memcpy(full_pfx, sdiv_line_pfx(l0), pl);  // capture the whole prefix before mutating
+         const uint8_t  oldbyte = full_pfx[c];          // byte leading back to this node
+         const unsigned newpl   = pl - unsigned(c) - 1;
+         setlist*        r       = new_setlist();
+         packed_ptr      partial = pack_(r, K::setlist_u8);
+         build_guard     g{this, &partial};
+         std::string_view R = key.substr(depth);
+         if (c == R.size())
+            set_term(&r->rh, std::forward<VF>(val));  // the new key ends inside the prefix
+         else
+            setlist_set(r, uint8_t(R[c]), make_branch(std::forward<VF>(val)));
+         partial = apply_prefix(r, std::string_view(reinterpret_cast<char*>(common), c));
+         // commit (non-throwing): re-stamp the shortened prefix [c+1..) into EVERY line, then
+         // graft the node back. Shrinking only — each line still has room (it held a longer one).
+         for (unsigned ln = 0; ln < L; ++ln)
+            sdiv_line_set_pfx(sdiv_line(node, ln), full_pfx + c + 1, newpl);
+         setlist_set(r, oldbyte, cur);  // cur stays K::sdivN with its dividers + has_tail
+         g.release();
+         sl_inline_compact_(r);
+         return partial;
       }
       // Insert byte->child into a sparse_full at *slot (cur == *slot). If byte's
       // sub-range is present, set in place; else grow (re-anchoring *slot to the new
@@ -5135,60 +5866,77 @@ namespace detail  // implementation types & node helpers — not part of the pub
                full_set_present(static_cast<node_full*>(deref_(node)), node.meta(), byte, child);
                return node;
             }
-            if (router_try_set(node, byte, child)) return node;  // setlist/cN: set in place
-            node = widen(node, int(byte) >> 4);  // widen→full reserves byte's sub-range (no grow)
+            if (router_try_set(node, byte, child)) return node;  // setlist/cN/sdiv: set in place
+            node = widen(node, int(byte));  // reserve byte (sdiv line / full sub-range)
          }
       }
       // Grow the router at *slot until byte->child fits, then leave the result in *slot. The
       // widen ladder (setlist→c2→c4→c8→full under dense tiers) can take MULTIPLE steps, and the
       // first widen frees the original node — so we re-anchor *slot after EVERY widen: a later
       // widen throwing then leaves *slot pointing at a valid (wider) node, never a freed one,
-      // and the key set is unchanged (the new child simply wasn't added). A setlist's inline
-      // prefix is first lifted into a prefix_node so re-anchoring through the ladder can't drop
-      // it. `child` must be guarded by the caller (a throw here orphans it).
+      // and the key set is unchanged (the new child simply wasn't added). `child` must be guarded
+      // by the caller (a throw here orphans it).
+      //
+      // PREFIX HANDLING (§2.2): the DEFAULT sdiv ladder carries a setlist's inline prefix
+      // natively — build_sdiv REPLICATES it into the lean lines (or build_full into the pfxd
+      // tail), so NO prefix_node is ever spawned for the common dict/text case. Only the
+      // cnode density ladder (DenseTiers) needs the old lift: a cN node has no prefix slot, so
+      // we hoist the setlist's prefix into a prefix_node, widen under it, then fuse it back
+      // into the resulting node_full/pfxd at the end.
       void grow_router_(packed_ptr* slot, packed_ptr cur, uint8_t byte, packed_ptr child)
       {
          char* pn = nullptr;  // when set, re-anchor target is this prefix_node's next field
-         if (cur.tag() == K::setlist_u8)
-         {
-            setlist*       s  = static_cast<setlist*>(deref_(cur));
-            const unsigned pl = s->rh.hdr.prefix_len;
-            if (pl)
+         if constexpr (DenseTiers)
+            if (cur.tag() == K::setlist_u8)
             {
-               uint8_t pfx[setlist::PREFIX_CAP];
-               std::memcpy(pfx, s->prefix, pl);
-               packed_ptr pnp = make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), cur);  // throws → unchanged
-               s->rh.hdr.prefix_len = 0;  // prefix now carried by pnp above the (to-be-widened) router
-               *slot = pnp;
-               pn    = static_cast<char*>(deref_(pnp));
+               setlist*       s  = static_cast<setlist*>(deref_(cur));
+               const unsigned pl = s->rh.hdr.prefix_len;
+               if (pl)
+               {
+                  uint8_t pfx[setlist::PREFIX_CAP];
+                  std::memcpy(pfx, s->prefix, pl);
+                  packed_ptr pnp = make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), cur);  // throws → unchanged
+                  s->rh.hdr.prefix_len = 0;  // prefix now carried by pnp above the (to-be-widened) router
+                  *slot = pnp;
+                  pn    = static_cast<char*>(deref_(pnp));
+               }
             }
-         }
          packed_ptr node = cur;
          // The slot that HOLDS the router being widened: *slot directly, or the lifted
          // prefix node's next field when a setlist prefix was hoisted above it.
          packed_ptr* rslot = pn ? reinterpret_cast<packed_ptr*>(pn + 2) : slot;
-         // Drive the ladder until byte->child fits in place. widen(.., byte>>4) reserves
-         // byte's sub-range when it builds the sparse_full, so the full arm sets in place
-         // (no post-widen grow). *rslot is re-anchored after EVERY widen so a later widen
-         // throwing leaves *rslot on a live (wider) node, never a freed one.
+         // Drive the ladder until byte's slot fits the current tier WITHOUT setting child yet:
+         // a lifted prefix may still need to be fused back (which can REALLOCATE / throw), and
+         // the caller's guard frees child on any throw — so child must not be linked into a node
+         // until after the last throw. The widen step reserves byte (an sdiv line slot / a full
+         // sub-range), so once a tier admits byte its setter below cannot fail. *rslot is
+         // re-anchored after EVERY widen so a later widen throwing leaves *rslot on a live node.
          for (;;)
          {
-            // Top tier: a node_full (byte's sub-range was reserved by widen) OR a pfxd (when
-            // the widened router carried a term → build_full made a tail). At the top tier we
-            // do NOT set child yet: a lifted prefix may still need to be fused back (which can
-            // REALLOCATE node_full→pfxd, a throwing op), and the caller's guard frees child on
-            // any throw — so child must not be linked into a node until after the last throw.
-            if (node.tag() == K::node_full || node.tag() == K::pfxd)
+            const K nk = node.tag();
+            // node_full/pfxd reserved byte's sub-range when widen built them → set in place.
+            if (nk == K::node_full || nk == K::pfxd)
                break;
+            // sdiv: byte's line has room iff it isn't already full (build_sdiv reserved a slot
+            // for byte). If full, widen one more rung; else break to set below.
+            if (is_sdiv(nk))
+            {
+               char* line = sdiv_line(deref_(node), child_line(sdiv_tier(nk), node.meta(), byte));
+               if (sdiv_line_has_room(line)) break;  // room for handle + the replicated prefix
+               node   = widen(node, int(byte));
+               *rslot = node;
+               continue;
+            }
             if (router_try_set(node, byte, child)) return;  // setlist/cN: set in place, done
-            node    = widen(node, int(byte) >> 4);  // reserve byte's sub-range in the new full
+            node    = widen(node, int(byte));  // reserve byte (sdiv line / full sub-range)
             *rslot  = node;
          }
-         // The ladder reached the full tier. If the lifted prefix sits above it, fuse it back
-         // into the node's tail (this realloc may THROW — child isn't linked yet, so the
-         // caller's guard cleanly frees child and the tree is unchanged). prefix_node is the
-         // overflow form, not the home (a setlist prefix is <= 8, always fits the tail).
-         if (pn)
+         // The ladder reached a tier admitting byte. A lifted prefix (`pn`) only exists on the
+         // DenseTiers cnode ladder, which always lands on a node_full/pfxd — fuse the prefix
+         // back into the node's header here (this may THROW — child isn't linked yet, so the
+         // caller's guard cleanly frees child and the tree is unchanged). The default sdiv
+         // ladder never lifts: build_sdiv replicates the prefix into the lines directly (§2.2).
+         if (pn && (node.tag() == K::node_full || node.tag() == K::pfxd))
          {
             const uint16_t pl     = pn_plen(pn);
             const unsigned cur_pl =
@@ -5203,7 +5951,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
          }
          // Last: link child in place (non-throwing) — every reallocation is behind us.
-         full_set_present(static_cast<node_full*>(deref_(node)), node.meta(), byte, child);
+         if (is_sdiv(node.tag()))
+         {
+            const bool ok = sdiv_try_set(node, byte, child);
+            assert(ok && "grow_router_: byte's sdiv line was reserved");
+            (void)ok;
+         }
+         else
+            full_set_present(static_cast<node_full*>(deref_(node)), node.meta(), byte, child);
+      }
+      // The length of a router's fused/inline prefix (0 for kinds with none) — the writable
+      // sibling of router_prefix, used where only the length matters.
+      unsigned router_prefix_len_(packed_ptr cur) const noexcept
+      {
+         const uint8_t* pb;
+         return router_prefix(cur, pb);
       }
 
       template <bool Assign, class VF>
@@ -5463,6 +6225,42 @@ namespace detail  // implementation types & node helpers — not part of the pub
          g.release();
          return dp;
       }
+      // Clone an sdiv: copy the WHOLE per-node block (L lean lines + the optional tail) so
+      // the dividers, line layout, term-flag carry verbatim; then re-point each branch slot
+      // — and the tail term — at its cloned child. Dividers ride the source handle metadata.
+      packed_ptr clone_sdiv_(const map& src, packed_ptr s)
+      {
+         const K        k    = s.tag();
+         const uint16_t meta = s.meta();
+         const unsigned L    = sdiv_lines(k);
+         const size_t   sz   = sdiv_node_bytes(k);
+         const char*    S    = static_cast<const char*>(src.deref_(s));
+         char*          D    = static_cast<char*>(node_alloc_(sz));
+         std::memcpy(D, S, sz);
+         // Null every branch slot (and the tail term) before any throwing recursion.
+         for (unsigned ln = 0; ln < L; ++ln)
+         {
+            char*          line = sdiv_line(D, ln);
+            const unsigned c    = sdiv_line_count(line);
+            for (unsigned i = 0; i < c; ++i) sdiv_line_set_branch(line, int(i), packed_ptr::null());
+         }
+         node_full_tail* dtl = sdiv_tail<Ptr>(D, L);  // tail always present
+         if (dtl->hdr.has_term) dtl->term = packed_ptr::null();
+         packed_ptr  dp = pack_(D, k).with_meta(meta).with_tail(true);  // sdiv tail always materialized
+         build_guard g{this, &dp};
+         if (dtl->hdr.has_term)
+            dtl->term = clone_walk_(src, sdiv_tail<Ptr>(S, L)->term);
+         for (unsigned ln = 0; ln < L; ++ln)  // re-point each branch at its clone (index-by-index)
+         {
+            const char* sline = sdiv_line(S, ln);
+            char*       dline = sdiv_line(D, ln);
+            const unsigned c  = sdiv_line_count(dline);
+            for (unsigned i = 0; i < c; ++i)
+               sdiv_line_set_branch(dline, int(i), clone_walk_(src, sdiv_line_branch(sline, int(i))));
+         }
+         g.release();
+         return dp;
+      }
       packed_ptr clone_walk_(const map& src, packed_ptr s)
       {
          switch (s.tag())
@@ -5543,6 +6341,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return clone_router_(src, static_cast<const cnode<8>*>(src.deref_(s)), K::c8);
             case K::node_full:
                return clone_full_(src, s, K::node_full);
+            case K::sdiv2:
+            case K::sdiv3:
+            case K::sdiv4:
+               return clone_sdiv_(src, s);
             case K::bucket:
             {
                const bucket* B = static_cast<const bucket*>(src.deref_(s));
@@ -5611,10 +6413,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c8:
             case K::node_full:
             case K::pfxd:
+            case K::sdiv2:
+            case K::sdiv3:
+            case K::sdiv4:
             {
-               free_all_(router_term(cur));  // headerless full/pfxd: term from tail (or none)
+               free_all_(router_term(cur));  // headerless full/pfxd/sdiv: term from tail (or none)
                router_for_each(cur, [&](uint8_t, packed_ptr br) { free_all_(br); });
-               node_free_(deref_(cur), node_bytes_(cur));  // per-node for sparse_full/pfxd
+               node_free_(deref_(cur), node_bytes_(cur));  // per-node for sparse_full/pfxd/sdiv
                return;
             }
             case K::bucket:

@@ -36,7 +36,10 @@ namespace artpp::v2::detail
       c4           = 7,  // 4x64  segmented bitset router (skip CL0, rank)
       c8           = 8,  // 8x32  segmented bitset router (skip CL0, rank)
       setlist_u16  = 9,  // wide sparse router: 2-byte stems, 1 cacheline (R1)
-      bucket       = 10, // sorted (suffix,value) collector — the "last mile" terminal
+      sdiv2        = 10, // divider-partitioned setlist: 2 lean lines, line from the handle
+      sdiv3        = 11, //   3 lean lines (2 dividers in the handle metadata)
+      sdiv4        = 12, //   4 lean lines (2 dividers + implicit 128, balanced)
+      bucket       = 13, // sorted (suffix,value) collector — the "last mile" terminal
       null         = 0xF,
    };
    // 4-bit tag contract: null is the all-ones nibble (an all-0xFF handle reads as null),
@@ -51,9 +54,11 @@ namespace artpp::v2::detail
 
    constexpr bool is_terminal(K k) noexcept { return k == K::value_ptr || k == K::value_inline; }
    static_assert(uint8_t(K::setlist_u16) == uint8_t(K::c8) + 1 &&
-                     uint8_t(K::pfxd) == uint8_t(K::node_full) + 1,
-                 "router tags are contiguous: setlist_u8..setlist_u16 is one range check");
-   constexpr bool is_router(K k) noexcept { return k >= K::setlist_u8 && k <= K::setlist_u16; }
+                     uint8_t(K::pfxd) == uint8_t(K::node_full) + 1 &&
+                     uint8_t(K::sdiv4) == uint8_t(K::sdiv2) + 2,
+                 "router tags are contiguous: setlist_u8..sdiv4 is one range check");
+   constexpr bool is_router(K k) noexcept { return k >= K::setlist_u8 && k <= K::sdiv4; }
+   constexpr bool is_sdiv(K k) noexcept { return k >= K::sdiv2 && k <= K::sdiv4; }
 
    // NOTE: we tried XOR-masking stored pointers to hide them from Apple's DMP
    // (the "rarely-dereferenced pointer" trick from dan/hive.blog). It REGRESSED artpp
@@ -263,6 +268,13 @@ namespace artpp::v2::detail
       Ptr      term;  // value when a key ends here (value_ptr -> leaf, suffix "")
    };
    using router_hdr = router_hdr_t<packed_ptr>;
+
+   // Descent hop counter (diagnostic): each iteration of descend_read's loop ≈ one cacheline
+   // touched per descent level, so this measures the per-lookup cacheline count — the exact
+   // quantity the §2 prefix-fusion policy reduces (a fused prefix no longer costs a separate
+   // prefix_node hop). Incremented ONLY when ARTPP_HOPS is defined (a no-op otherwise); a bench
+   // resets it, runs a lookup pass, and reads the total. inline ⇒ one definition across TUs.
+   inline unsigned long long descent_hops_ = 0;
 }  // namespace artpp::v2::detail
 
 namespace artpp::v2

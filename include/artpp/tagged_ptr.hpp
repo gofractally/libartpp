@@ -171,6 +171,11 @@ namespace artpp::detail
       Ptr      term;  // value when a key ends here (value_ptr -> leaf, suffix "")
    };
    using router_hdr = router_hdr_t<packed_ptr>;
+
+   // Descent hop counter (diagnostic): each iteration of descend_read's loop ≈ one cacheline
+   // touched per descent level — the per-lookup cacheline count. Incremented ONLY when
+   // ARTPP_HOPS is defined (a no-op otherwise). inline ⇒ one definition across TUs.
+   inline unsigned long long descent_hops_ = 0;
 }  // namespace artpp::detail
 
 namespace artpp

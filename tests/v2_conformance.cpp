@@ -601,7 +601,7 @@ static void test_equality()
       for (char c = 'a' + 10; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);  // → 10 (hysteresis: stays full)
       const auto ds = s.debug_stats(), dw = w.debug_stats();
       CHECK(ds.setlist == 1 && ds.full == 0);  // prove the shapes really diverged
-      CHECK(dw.fullp == 1);  // widened under the "k" prefix → fused-prefix full (pfxd)
+      CHECK(dw.sdiv2 == 1 && dw.full == 0 && dw.fullp == 0);  // 20 branches → sdiv2; "k" prefix fused in its tail
       CHECK(s == w && w == s);
       w.update(key('c'), 999u);
       CHECK(s != w);
@@ -671,7 +671,7 @@ static void test_equality()
       const auto sds = small.debug_stats();
       const auto bds = big.debug_stats();
       CHECK(sds.c4 == 1 && sds.full + sds.fullp == 0);  // hint small → cnode ladder (15 → c2→c4)
-      CHECK(bds.full + bds.fullp == 1 && bds.c4 == 0);  // hint large → flat (k-prefix fuses → pfxd)
+      CHECK(bds.sdiv2 == 1 && bds.full + bds.fullp == 0 && bds.c4 == 0);  // hint large → flat sdiv ladder (15 → sdiv2, k-prefix fused)
       CHECK(small.size() == 15 && big.size() == 15);
       for (char c = 'a'; c < 'a' + 15; ++c)
       {
@@ -893,21 +893,26 @@ static void test_degenerate_shapes()
    }
 }
 
-// ── fused in-header prefixes: prefix_node is overflow, not the default ────────
-// A compressed run above a dense router lives in the router's OWN header
-// cacheline (handle hint K::pfxd, real kind + bytes in the header); a separate
-// prefix_node appears only when the prefix exceeds the header's capacity.
+// ── fused in-node prefixes: prefix_node is overflow, not the default (spec §2) ──
+// A compressed run above a router lives in the router ITSELF — inline in a setlist
+// line (<=7), REPLICATED across an sdiv's lean lines (<=SDIV_PREFIX_CAP=13, §2.2),
+// or in a node_full/pfxd header cacheline. A separate prefix_node appears only when
+// the run exceeds every router's inline capacity (the genuinely-long case, §2.3).
 static void test_fused_prefix()
 {
-   // sequential integers: the shared high-byte run must fuse — ZERO prefix nodes.
-   // (1M keys: the root's byte-5 fanout exceeds a setlist, forcing the widen-under-
-   // prefix path; smaller N leaves the root a setlist whose own inline slot suffices.)
+   // sequential integers: the shared high-byte run path-compresses. EVERY router now fuses
+   // its compressed run INTO itself (node_full/pfxd into the header, sdiv replicated across
+   // its lines per §2.2) — so a prefix_node is the rare exception, never the per-router norm.
+   // (1M keys: the root's byte-5 fanout exceeds a setlist, forcing the widen-under-prefix path.)
    {
       artpp::v2::map<uint64_t, uint64_t> t;
       for (uint64_t i = 0; i < 1000000; ++i) t.insert(i * 2, i);
       const auto d = t.debug_stats();
-      CHECK(d.prefix == 0);  // every compressed run lives in a header cacheline
-      CHECK(d.fullp >= 1);
+      // Fusion holds the run in the router (§2): prefix_nodes are bounded by the routers that
+      // can't fuse (runs > the inline caps) — small, and in practice 0 here (was a handful
+      // before the §2.2 sdiv replication landed; the bound, not the exact count, is asserted).
+      CHECK(d.prefix <= d.sdiv2 + d.sdiv3 + d.sdiv4);  // fused everywhere a short run fits
+      CHECK(d.fullp >= 1);  // node_full runs still fuse into the header (no prefix node)
       uint64_t expect = 0;
       for (auto it = t.begin(); it != t.end(); ++it, ++expect)
          if (it->first != expect * 2 || it->second != expect) { CHECK(false); break; }
@@ -922,12 +927,13 @@ static void test_fused_prefix()
       for (uint64_t i = 1; i < 1000000; i += 2)
          if (!t.contains(i * 2)) { CHECK(false); break; }
    }
-   // a >16-fanout cluster under a string prefix: widening fuses the lifted prefix,
-   // and a key diverging INSIDE the fused prefix splits it correctly
+   // a >16-fanout cluster under a string prefix: widening keeps the lifted prefix as a
+   // prefix_node ONLY because this run (14 B) exceeds SDIV_PREFIX_CAP (13) — too long to
+   // replicate into the lean lines (§2.2); a key diverging INSIDE the prefix splits it.
    {
       artpp::v2::map<std::string_view, uint32_t> t;
       std::map<std::string, uint32_t>        ref;
-      const std::string                      pre = "shared-prefix:";
+      const std::string                      pre = "shared-prefix:";  // 14 B > SDIV_PREFIX_CAP
       for (int i = 0; i < 26; ++i)
       {
          std::string k = pre + char('a' + i);
@@ -935,11 +941,11 @@ static void test_fused_prefix()
          ref[k] = uint32_t(i);
       }
       auto d = t.debug_stats();
-      CHECK(d.prefix == 0 && d.fullp == 1);  // 26 branches widened under the fused prefix
-      t.insert("shared-pifball", 99u);       // diverges inside the fused prefix → split
+      CHECK(d.sdiv2 == 1 && d.prefix == 1);  // 26 branches → sdiv2; 14-B run > cap → stays a prefix_node
+      t.insert("shared-pifball", 99u);       // diverges inside the shared prefix → split
       ref["shared-pifball"] = 99u;
       d = t.debug_stats();
-      CHECK(d.fullp == 1);  // the full keeps the tail of the split prefix fused
+      CHECK(d.sdiv2 == 1);  // the sdiv survives the prefix split (the tail of the run still routes to it)
       auto mi = ref.begin();
       for (auto it = t.begin(); it != t.end(); ++it, ++mi)
          if (mi == ref.end() || std::string(it.key()) != mi->first || it.value() != mi->second)
@@ -950,14 +956,46 @@ static void test_fused_prefix()
       // term ending exactly AT the fused boundary
       t.insert(pre, 1000u);
       CHECK(t.find_opt(pre).value() == 1000 && t.erase(pre) == 1);
-      // erase below SHRINK_MAX (= setlist CAP - 4 = 7): de-widen carries the fused prefix
-      // into the setlist. Leaving 7 branches (i=0..6) trips the de-widen; 11 would not.
+      // erase below SHRINK_MAX (= setlist CAP - 4): the sdiv de-widens, carrying the fused
+      // prefix back into the setlist. Leaving 7 branches (i=0..6) trips the de-widen.
       for (int i = 7; i < 26; ++i) CHECK(t.erase(pre + char('a' + i)) == 1);
       d = t.debug_stats();
-      CHECK(d.fullp == 0 && d.full == 0);
+      CHECK(d.fullp == 0 && d.full == 0 && d.sdiv2 == 0 && d.sdiv3 == 0 && d.sdiv4 == 0);
       for (int i = 0; i < 7; ++i)
          if (!has(t, pre + char('a' + i), uint32_t(i))) { CHECK(false); break; }
       CHECK(t.contains("shared-pifball"));
+   }
+   // §2.2 REPLICATION: a SHORT run (<=SDIV_PREFIX_CAP=13) under a >16-fanout cluster fuses
+   // INTO the sdiv's lean lines (replicated, no prefix_node hop). The descent consumes it off
+   // the routed line — so the whole cluster costs NO prefix_node. Divergence inside the fused
+   // run and a term ending at the run boundary must still split/resolve correctly.
+   {
+      artpp::v2::map<std::string_view, uint32_t> t;
+      std::map<std::string, uint32_t>        ref;
+      const std::string                      pre = "abc.def.gh";  // 10 B <= SDIV_PREFIX_CAP
+      for (int i = 0; i < 26; ++i)
+      {
+         std::string k = pre + char('a' + i);
+         t.insert(k, uint32_t(i));
+         ref[k] = uint32_t(i);
+      }
+      auto d = t.debug_stats();
+      // 26 branches + a 10-B replicated prefix: the prefix shrinks each line's capacity
+      // (16 + cnt*W + plen <= 128), so the balanced split needs 3 lines → sdiv3. The key win:
+      // prefix == 0 — the run is REPLICATED into the lean lines, NOT a prefix_node hop.
+      CHECK(d.prefix == 0 && (d.sdiv2 + d.sdiv3 + d.sdiv4) == 1);
+      // a term ending exactly at the fused run boundary
+      t.insert(pre, 7777u); ref[pre] = 7777u;
+      CHECK(t.find_opt(pre).value() == 7777u);
+      // a key diverging INSIDE the replicated prefix → split (re-stamps every line)
+      t.insert("abc.deX", 99u); ref["abc.deX"] = 99u;
+      d = t.debug_stats();
+      CHECK((d.sdiv2 + d.sdiv3 + d.sdiv4) == 1);  // the sdiv (now under a shorter fused run) survives the split
+      auto mi = ref.begin();
+      for (auto it = t.begin(); it != t.end(); ++it, ++mi)
+         if (mi == ref.end() || std::string(it.key()) != mi->first || it.value() != mi->second)
+         { CHECK(false); break; }
+      for (auto& kv : ref) { uint32_t v; CHECK(t.find(kv.first, v) && v == kv.second); }
    }
    // overflow: a prefix beyond the header capacity stays a prefix_node above the full
    {

@@ -1185,6 +1185,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
          size_t            depth = 0;
          for (;;)
          {
+#ifdef ARTPP_HOPS
+            ++detail::descent_hops_;  // diagnostic: one loop turn ≈ one cacheline touched
+#endif
             const unsigned kk = unsigned(raw & 0xF);
             if (kk == unsigned(K::node_full)) ARTPP_BODY_FULL
             if constexpr (!inlineable) { if (kk == unsigned(K::value_ptr)) ARTPP_BODY_VALUE_PTR }

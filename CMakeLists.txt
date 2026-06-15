@@ -87,6 +87,7 @@ if(ARTPP_TESTS)
    artpp_test(v2_reverse_iter     -O2 -g)
    artpp_test(v2_exception_safety -O1 -g)
    artpp_test(v2_fuzz_map         -O2 -g)
+   artpp_test(v2_sdiv_adversarial -O1 -g)  # targeted sdiv prefix-fusion stress vs std::map
 
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)
