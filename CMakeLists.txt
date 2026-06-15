@@ -32,7 +32,7 @@ add_library(artpp::artpp ALIAS artpp)
 target_include_directories(artpp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_features(artpp INTERFACE cxx_std_23)
+target_compile_features(artpp INTERFACE cxx_std_20)
 
 include(GNUInstallDirs)
 install(DIRECTORY include/artpp TYPE INCLUDE)

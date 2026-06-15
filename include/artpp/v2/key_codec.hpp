@@ -81,7 +81,18 @@ namespace artpp::v2
       };
       static constexpr U to_be(U u) noexcept  // host -> big-endian
       {
-         if constexpr (std::endian::native == std::endian::little) u = std::byteswap(u);
+         if constexpr (std::endian::native == std::endian::little)
+         {
+#if defined(__cpp_lib_byteswap)
+            u = std::byteswap(u);  // C++23
+#else  // C++20 fallback: compiler byte-reverse intrinsics (same codegen)
+            if constexpr (sizeof(U) == 2) u = U(__builtin_bswap16(uint16_t(u)));
+            else if constexpr (sizeof(U) == 4) u = U(__builtin_bswap32(uint32_t(u)));
+            else if constexpr (sizeof(U) == 8) u = U(__builtin_bswap64(uint64_t(u)));
+            else if constexpr (sizeof(U) > 1)  // exotic widths (e.g. __int128): manual reverse
+            { U r = 0; for (unsigned i = 0; i < sizeof(U); ++i) { r = U(r << 8) | U(u & 0xFFu); u = U(u >> 8); } u = r; }
+#endif
+         }
          return u;
       }
       static std::string_view encode(I k, scratch& s) noexcept
