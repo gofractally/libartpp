@@ -192,4 +192,11 @@ if(ARTPP_BENCHMARKS)
    target_link_libraries(artpp_set_bench PRIVATE artpp)
    target_compile_options(artpp_set_bench PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
    set_target_properties(artpp_set_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+   # artpp::set vs absl::btree_set vs std::set (ordered): find/insert ns + bytes/key, three
+   # workloads, counting allocator. The headline ordered comparison.
+   add_executable(artpp_ordered_bench bench/ordered_bench.cpp)
+   target_link_libraries(artpp_ordered_bench PRIVATE artpp absl::btree)
+   target_compile_options(artpp_ordered_bench PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_ordered_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
