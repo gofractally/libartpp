@@ -1251,7 +1251,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
 
       // Copy-out lookup: writes the value into `out` and returns true if present.
       // (Copy-out, not pointer, because a small value can live INLINE in the pointer bits.)
+      // VALUE API — constrained OFF for a set (HasValue==false): a set stores no value, so
+      // a value copy-out is meaningless; use contains()/the iterator-returning find() instead.
       bool find(key_param k, T& out) const
+         requires(HasValue)
       {
          scratch_t        ks_;
          std::string_view key = enc_(k, ks_);
@@ -1292,6 +1295,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Convenience: copy-out as an optional (artpp extension; STL find() below returns an
       // iterator). Named distinctly to avoid clashing with the iterator-returning find.
       std::optional<T> find_opt(key_param k) const
+         requires(HasValue)
       {
          T v;
          return find(k, v) ? std::optional<T>(std::move(v)) : std::nullopt;
@@ -2494,7 +2498,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
             --(*this);
             return tmp;
          }
+         // VALUE API — off for a set (HasValue==false): a set element has no value (the
+         // facade's iterator yields the key alone). key()/key_bytes() remain available.
          const T&        value() const noexcept
+            requires(HasValue)
          {
             if constexpr (inlineable)
                return val_;
@@ -2557,8 +2564,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
             maintain_ = true;
             return key_.view();
          }
-         reference  operator*() const { return reference{key(), value()}; }
-         arrow_proxy operator->() const { return arrow_proxy{operator*()}; }
+         // map: * yields (key, const value&). For a set the facade's own iterator yields the
+         // key alone — these (key,value)-pair operators are off (no value to pair with).
+         reference  operator*() const
+            requires(HasValue)
+         { return reference{key(), value()}; }
+         arrow_proxy operator->() const
+            requires(HasValue)
+         { return arrow_proxy{operator*()}; }
       };
 
       using iterator = const_iterator;  // read-only container (no element-mutating iterator)
@@ -2644,8 +2657,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Ordered value-only scan: visits each value in ascending key order WITHOUT
       // building keys. Calls f(const T&). Doubles as a diagnostic: the gap vs for_each
       // is the key-reconstruction cost; what's left is the raw node walk.
+      // VALUE API — off for a set (HasValue==false): there is no value to scan.
       template <class F>
       void for_each_value(F&& f) const
+         requires(HasValue)
       {
          if (!root_.is_null()) walk_v_(root_, f);
       }
@@ -5609,6 +5624,18 @@ namespace detail
       set& operator=(set&&) noexcept(noexcept(std::declval<impl_t&>() =
                                                   std::declval<impl_t&&>())) = default;
       allocator_type get_allocator() const noexcept { return allocator_type(impl_.get_allocator()); }
+
+      // Attach to an already-populated pool image (line_pool reopened a file): O(1), adopts a
+      // persisted root handle + element count — no walk, no rebuild. Pair with the pool's
+      // root()/count(); see root_handle()/detach() below (indexed pool-backed handles only).
+      set(const Allocator& a, attach_t, uint64_t root_handle, size_type count)
+          : impl_(value_alloc(a), attach, root_handle, count)
+      {
+      }
+      // Persist/release helpers (indexed pools): the root as a raw handle for checkpoint, and
+      // detach() to release the structure WITHOUT freeing it (the nodes stay live in the file).
+      uint64_t root_handle() const noexcept { return impl_.root_handle(); }
+      void     detach() noexcept { impl_.detach(); }
 
       // ── modifiers ─────────────────────────────────────────────────────────────────
       // insert(k): std::set returns {iterator, bool}. inserted == the map insert result;

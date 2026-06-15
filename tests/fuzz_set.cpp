@@ -175,16 +175,33 @@ static void run_dispatch(const uint8_t* data, size_t size)
 {
    g_data = data; g_size = size;
    Reader    r{data, data + size};
-   const int cfg = (g_cfg = r.u8() % 6);
+   const int cfg = (g_cfg = r.u8() % 9);
    using sv  = std::string_view;
    switch (cfg)
    {
-      case 0: { set<sv> s;                                      run_impl(s, r); break; }
-      case 1: { set<sv, mode::dense_tiers> s;                   run_impl(s, r); break; }
-      case 2: { set<sv, mode::dense_tiers | mode::ladder_c8> s; run_impl(s, r); break; }
-      case 3: { set<sv, mode::wide_stems> s;                    run_impl(s, r); break; }
-      case 4: { set<sv, mode::buckets> s;                       run_impl(s, r); break; }
-      case 5: { set<sv, mode::adaptive> s;                      run_impl(s, r); break; }
+      case 0: { set<sv> s;                                       run_impl(s, r); break; }
+      case 1: { set<sv, mode::dense_tiers> s;                    run_impl(s, r); break; }
+      case 2: { set<sv, mode::dense_tiers | mode::ladder_c8> s;  run_impl(s, r); break; }
+      case 3: { set<sv, mode::wide_stems> s;                     run_impl(s, r); break; }
+      case 4: { set<sv, mode::buckets> s;                        run_impl(s, r); break; }
+      case 5: { set<sv, mode::adaptive> s;                       run_impl(s, r); break; }
+      case 6: { set<sv, mode::buckets | mode::adaptive> s;       run_impl(s, r); break; }
+      case 7:  // the line_pool allocator (indexed handles) — set over a pool
+      {
+         using A = artpp::pool_alloc<sv>;
+         artpp::line_pool                  pool;
+         set<sv, mode::none, A>            s{A{&pool}};
+         run_impl(s, r);
+         break;
+      }
+      case 8:  // line_pool + buckets + adaptive
+      {
+         using A = artpp::pool_alloc<sv>;
+         artpp::line_pool                              pool;
+         set<sv, mode::buckets | mode::adaptive, A>    s{A{&pool}};
+         run_impl(s, r);
+         break;
+      }
    }
 }
 
