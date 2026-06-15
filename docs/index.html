@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>libart++ — the adaptive radix tree map for modern C++</title>
-<meta name="description" content="artpp::map — a header-only adaptive radix tree map for C++23. std::map's interface, O(key-length) operations, point lookups up to 4× faster than absl::btree_map and 7× faster than std::map.">
+<meta name="description" content="artpp::map — a header-only adaptive radix tree map for C++20. std::map's interface, O(key-length) operations, point lookups up to 4× faster than absl::btree_map and 7× faster than std::map.">
 <meta property="og:title" content="libart++ — the adaptive radix tree map for modern C++">
-<meta property="og:description" content="Header-only C++23. O(key length), no comparisons, no rebalancing. Point lookups ~2× faster than absl::btree_map.">
+<meta property="og:description" content="Header-only C++20. O(key length), no comparisons, no rebalancing. Point lookups ~2× faster than absl::btree_map.">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -38,7 +38,7 @@
     key's bytes — never by your data's size.</p>
     <div class="badges">
       <span class="badge hl">header-only</span>
-      <span class="badge hl">C++23</span>
+      <span class="badge hl">C++20</span>
       <span class="badge">zero dependencies</span>
       <span class="badge">allocator-aware · PMR</span>
       <span class="badge">fuzzed vs std::map</span>
@@ -436,7 +436,7 @@ target_link_libraries(your_target PRIVATE artpp::artpp)</code></pre>
 git clone https://github.com/gofractally/libartpp && cd libartpp
 cmake -B build && cmake --build build -j && ctest --test-dir build
 cmake -B build -DARTPP_BENCHMARKS=ON      <span class="c"># the compare suite from this page</span></code></pre>
-  <p style="color:var(--muted);font-size:14.5px">Requirements: a C++23 compiler, little-endian
+  <p style="color:var(--muted);font-size:14.5px">Requirements: a C++20 compiler, little-endian
   target (ARM64/x86-64; NEON and SSE2 paths included). Nothing else.
   Full API reference and contracts:
   <a href="https://github.com/gofractally/libartpp#readme">the README</a>.</p>

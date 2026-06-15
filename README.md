@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.svg" width="140" alt="libart++"></p>
 
-# libart++ — `artpp::map`, a header-only adaptive radix tree map for C++23
+# libart++ — `artpp::map`, a header-only adaptive radix tree map for C++20
 
 **[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
 with the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
@@ -104,7 +104,7 @@ target_link_libraries(your_target PRIVATE artpp::artpp)
 
 ## Requirements
 
-- C++23 (`std::byteswap`, `requires`-clauses, `if constexpr`).
+- C++20 (`<bit>`, `requires`-clauses, `if constexpr`; `std::byteswap` when available, else a `__builtin_bswap` shim).
 - A little-endian target (statically asserted) with 48-bit virtual addresses for
   the default 6-byte handle; an allocator can select 8-byte handles to lift the
   VA assumption ([Allocators](#allocators)).

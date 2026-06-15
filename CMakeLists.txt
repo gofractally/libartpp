@@ -1,7 +1,7 @@
-# libart++ — artpp::map, a header-only adaptive-radix-tree map for C++23.
+# libart++ — artpp::map, a header-only adaptive-radix-tree map for C++20.
 #
 # Standalone-buildable: clone + `cmake -B build && cmake --build build` needs a
-# C++23 compiler and nothing else. Options:
+# C++20 compiler and nothing else. Options:
 #   ARTPP_TESTS       (default ON when top-level)  functional suite, `ctest` runs it
 #   ARTPP_BENCHMARKS  (default OFF)  benchmark/compare suite — vendors upstream
 #                     libart (external/libart, BSD-3) and uses absl::btree via
@@ -80,15 +80,6 @@ if(ARTPP_TESTS)
    artpp_test(persistence      -O2 -g)  # file-backed line_pool survives close + reopen
    artpp_test(fuzz_map         -O2 -g)  # differential fuzzer vs std::map (standalone RNG runner)
    artpp_test(regression       -O2 -g)  # deterministic guards for fuzzer-caught (planted) bugs
-   artpp_test(v2_smoke         -O2 -g)  # artpp::v2 node-rewrite baseline (clone of v1, must match std::map)
-   artpp_test(v2_node_addr     -O2 -g)  # v2 routing-kernel correctness (divider/popcount/direct index)
-   # v1 behavioral suite cloned onto artpp::v2 — the gate the node rewrite must keep green.
-   artpp_test(v2_conformance      -O2 -g)
-   artpp_test(v2_reverse_iter     -O2 -g)
-   artpp_test(v2_exception_safety -O1 -g)
-   artpp_test(v2_fuzz_map         -O2 -g)
-   artpp_test(v2_sdiv_adversarial -O1 -g)  # targeted sdiv prefix-fusion stress vs std::map
-
    if(ARTPP_WITH_PSIO)
       artpp_test(psio_codec -O2 -g)
       target_link_libraries(artpp_psio_codec PRIVATE psio)

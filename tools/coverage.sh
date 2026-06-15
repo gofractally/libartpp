@@ -27,7 +27,7 @@ OUT=${ARTPP_COV_OUT:-/tmp/artpp_cov}
 FUZZ_ITERS=${ARTPP_FUZZ_ITERS:-200000}
 mkdir -p "$OUT"
 rm -f "$OUT"/*.profraw "$OUT"/*.profdata
-FLAGS=(-std=c++23 -O1 -g -fprofile-instr-generate -fcoverage-mapping -Iinclude)
+FLAGS=(-std=c++20 -O1 -g -fprofile-instr-generate -fcoverage-mapping -Iinclude)
 
 # Test TUs that need no external deps (psio_codec needs ARTPP_WITH_PSIO; excluded here).
 TESTS=(smoke conformance reverse_iter exception_safety wide_stems persistence fuzz_map)
