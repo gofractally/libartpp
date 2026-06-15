@@ -87,8 +87,8 @@ static void row(const char* name, const std::vector<std::string>& keys, std::mt1
    std::shuffle(order.begin(), order.end(), rng);
 
    // ── artpp::set<string_view> over a counting allocator ──
-   double aps_ns, sps_ns;
-   double aps_bpk, sps_bpk;
+   double aps_ns, sps_ns, apm_ns;
+   double aps_bpk, sps_bpk, apm_bpk;
    {
       counter ctr;
       artpp::set<std::string_view, artpp::mode::none, count_alloc<std::string_view>> s{
@@ -97,6 +97,17 @@ static void row(const char* name, const std::vector<std::string>& keys, std::mt1
       aps_bpk = double(ctr.live) / double(N);
       aps_ns  = ns_per(
           [&] { std::size_t hit = 0; for (auto i : order) hit += s.contains(keys[i]); return hit; },
+          7, N);
+   }
+   // ── artpp::map<string_view, bool> — the "naive set" (a dummy 1-byte value, no suffix-in-handle) ──
+   {
+      counter ctr;
+      artpp::map<std::string_view, bool, artpp::mode::none, count_alloc<std::string_view>> m{
+          count_alloc<std::string_view>{&ctr}};
+      for (auto& k : keys) m.insert_or_assign(k, true);
+      apm_bpk = double(ctr.live) / double(N);
+      apm_ns  = ns_per(
+          [&] { std::size_t hit = 0; for (auto i : order) hit += m.contains(keys[i]); return hit; },
           7, N);
    }
    // ── std::set<string> over a counting allocator ──
@@ -110,8 +121,8 @@ static void row(const char* name, const std::vector<std::string>& keys, std::mt1
           [&] { std::size_t hit = 0; for (auto i : order) hit += (s.find(keys[i]) != s.end()); return hit; },
           7, N);
    }
-   std::printf("%-22s  artpp: %6.1f ns/op  %6.1f B/key   |   std::set: %6.1f ns/op  %6.1f B/key\n",
-               name, aps_ns, aps_bpk, sps_ns, sps_bpk);
+   std::printf("%-18s set:%6.1f ns %5.1f B/k | map<bool>:%6.1f ns %5.1f B/k | std::set:%6.1f ns %5.1f B/k\n",
+               name, aps_ns, aps_bpk, apm_ns, apm_bpk, sps_ns, sps_bpk);
 }
 
 int main(int argc, char** argv)
