@@ -2569,7 +2569,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Entry layout in the tail: [ T value | u16 suffix_len | suffix bytes ], with the
       // entry START aligned to alignof(T) (T placement-new'd in place — non-POD safe).
       // Sizes are alignof(T)-rounded so the tail stays aligned as it grows downward.
-      static constexpr size_t TALIGN = alignof(T);
+      // SET (HasValue==false): no value field — the entry is [ u16 suffix_len | suffix ],
+      // 2-byte aligned (just the length field), so the bucket packs key suffixes alone.
+      static constexpr size_t bkt_val_bytes = HasValue ? sizeof(T) : 0;
+      static constexpr size_t TALIGN        = HasValue ? alignof(T) : alignof(uint16_t);
       static size_t bkt_round(size_t x) noexcept { return (x + TALIGN - 1) & ~(TALIGN - 1); }
       static uint16_t bkt_stem2(std::string_view s) noexcept
       {
@@ -2590,9 +2593,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       static T*             bkt_val(char* e) noexcept { return reinterpret_cast<T*>(e); }            // aligned
       static const T*       bkt_val(const char* e) noexcept { return reinterpret_cast<const T*>(e); }
-      static uint16_t       bkt_slen(const char* e) noexcept { uint16_t v; std::memcpy(&v, e + sizeof(T), 2); return v; }
-      static const uint8_t* bkt_suf(const char* e) noexcept { return reinterpret_cast<const uint8_t*>(e + sizeof(T) + 2); }
-      static size_t         bkt_esize(size_t slen) noexcept { return bkt_round(sizeof(T) + 2 + slen); }
+      static uint16_t       bkt_slen(const char* e) noexcept { uint16_t v; std::memcpy(&v, e + bkt_val_bytes, 2); return v; }
+      static const uint8_t* bkt_suf(const char* e) noexcept { return reinterpret_cast<const uint8_t*>(e + bkt_val_bytes + 2); }
+      static size_t         bkt_esize(size_t slen) noexcept { return bkt_round(bkt_val_bytes + 2 + slen); }
       // Can a FRESH page hold one entry with this suffix (slot pair + entry bytes)?
       // Suffixes past this cap are stored as plain leaves instead (see make_bucket_branch).
       static bool bkt_fits(size_t slen) noexcept { return 4 + bkt_esize(slen) <= size_t(bucket::PAGE - 4); }
@@ -2732,7 +2735,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (c == 0)
             {
                if constexpr (Assign)  // update value in place (key/suffix unchanged)
-                  vf_assign(std::forward<V>(val), bkt_val(bkt_entry(b, pos)));
+                  if constexpr (HasValue) vf_assign(std::forward<V>(val), bkt_val(bkt_entry(b, pos)));
                return 0;
             }
             if (c > 0) break;
@@ -2742,10 +2745,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (freeb < 4 + esz) return -1;  // page full
          b->tail_used += uint16_t(esz);
          char* e = reinterpret_cast<char*>(b->data) + (bucket::PAGE - 4) - b->tail_used;  // aligned
-         vf_construct(std::forward<V>(val), bkt_val(e));  // construct at the entry (non-POD safe)
+         if constexpr (HasValue) vf_construct(std::forward<V>(val), bkt_val(e));  // construct at the entry (non-POD safe)
+         else                    (void)val;  // set: entry is the key suffix only
          const uint16_t sl = uint16_t(suf.size());
-         std::memcpy(e + sizeof(T), &sl, 2);
-         std::memcpy(e + sizeof(T) + 2, suf.data(), suf.size());
+         std::memcpy(e + bkt_val_bytes, &sl, 2);
+         std::memcpy(e + bkt_val_bytes + 2, suf.data(), suf.size());
          const uint16_t off = b->tail_used;
          d                  = bkt_div(b);
          uint16_t* so       = d + b->nent;      // old slot base
@@ -3697,12 +3701,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // key as a zero-copy string_view (same cacheline as the value). leaf_suf() points at
       // the suffix in both forms, so point lookup is identical.
       static constexpr uint16_t LEAF_FULL = 0x8000;
-      static constexpr size_t   leaf_value_off() noexcept
+      // Bytes the value occupies in a leaf: sizeof(T) for a map, ZERO for a set (HasValue==false)
+      // — a set leaf is [u16 slen][u16 pfxfield][key bytes] with no value field and no alignment
+      // pad (there is no T to align). The map path keeps the alignof(T)-rounded value offset.
+      static constexpr size_t leaf_val_bytes = HasValue ? sizeof(T) : 0;
+      static constexpr size_t leaf_value_off() noexcept
       {
+         if constexpr (!HasValue)
+            return 2 * sizeof(uint16_t);  // no value → key bytes abut the header (no pad)
          constexpr size_t a = alignof(T);
          return (2 * sizeof(uint16_t) + a - 1) / a * a;
       }
-      static size_t leaf_size(size_t strlen) noexcept { return leaf_value_off() + sizeof(T) + strlen; }
+      static size_t leaf_size(size_t strlen) noexcept { return leaf_value_off() + leaf_val_bytes + strlen; }
       static uint16_t leaf_slen(const char* p) noexcept { uint16_t v; std::memcpy(&v, p, 2); return v; }
       static uint16_t leaf_pfxfield(const char* p) noexcept { uint16_t v; std::memcpy(&v, p + 2, 2); return v; }
       static bool     leaf_has_full(const char* p) noexcept { return leaf_pfxfield(p) & LEAF_FULL; }
@@ -3718,8 +3728,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          return reinterpret_cast<const T*>(p + leaf_value_off());
       }
-      static char*       leaf_str(char* p) noexcept { return p + leaf_value_off() + sizeof(T); }
-      static const char* leaf_str(const char* p) noexcept { return p + leaf_value_off() + sizeof(T); }
+      static char*       leaf_str(char* p) noexcept { return p + leaf_value_off() + leaf_val_bytes; }
+      static const char* leaf_str(const char* p) noexcept { return p + leaf_value_off() + leaf_val_bytes; }
       // Full key as a contiguous view — valid ONLY when leaf_has_full(p).
       static std::string_view leaf_fullview(const char* p) noexcept
       {
@@ -4227,7 +4237,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
          char* p = static_cast<char*>(term_alloc_(leaf_size(suf.size())));
          leaf_set_hdr(p, uint16_t(suf.size()), 0);
          std::memcpy(leaf_str(p), suf.data(), suf.size());
-         vf_construct(std::forward<VF>(val), leaf_val(p));
+         if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
+         else                    (void)val;  // set: a leaf is the key bytes only, no value
          return pack_term_(p, K::value_ptr);
       }
       template <class VF>
@@ -4237,7 +4248,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
          leaf_set_hdr(p, uint16_t(suf.size()), uint16_t(LEAF_FULL | pfx.size()));
          std::memcpy(leaf_str(p), pfx.data(), pfx.size());
          std::memcpy(leaf_str(p) + pfx.size(), suf.data(), suf.size());
-         vf_construct(std::forward<VF>(val), leaf_val(p));
+         if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
+         else                    (void)val;  // set: a leaf is the key bytes only, no value
          return pack_term_(p, K::value_ptr);
       }
       // A terminal value with key suffix `suf`: inline in the pointer when the suffix
