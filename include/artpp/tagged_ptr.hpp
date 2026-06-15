@@ -11,9 +11,20 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace artpp::detail
 {
+   // The "no value" mapped type: a map<Key, none_t> is a SET. One byte, empty, trivially
+   // copyable — so map<Key, none_t> compiles through every node layout unchanged (Stage A),
+   // and the value/T touchpoints are then elided under `if constexpr (HasValue)` (Stages B+).
+   // detail-only; the public spelling is artpp::set (a facade over map<Key, none_t>).
+   struct none_t
+   {
+   };
+   static_assert(sizeof(none_t) == 1 && std::is_trivially_copyable_v<none_t>,
+                 "none_t is a 1-byte trivially-copyable tag");
+
    // The concrete node/value kind, stored in the low 4 bits of every branch handle.
    // (design4 splits the tag into shape[2:0] + fmt[6:3]; with this v1 taxonomy a
    // flat enum is enough — `shape_of` derives the descent class where needed.)

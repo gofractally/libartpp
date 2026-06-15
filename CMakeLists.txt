@@ -72,6 +72,7 @@ if(ARTPP_TESTS)
    endfunction()
 
    artpp_test(smoke            -O2 -g)
+   artpp_test(set_smoke        -O2 -g)  # artpp::set facade over map<Key, none_t>
    artpp_test(conformance      -O2 -g)
    artpp_test(reverse_iter     -O2 -g)
    # fault injection: -O1 keeps every allocation point distinct for the sweep

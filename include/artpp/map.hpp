@@ -499,6 +499,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
       using allocator_type  = Allocator;
       static constexpr mode policy = Mode;
 
+      // VALUE-OPTIONAL: a map<Key, detail::none_t> is a SET — it stores no value, only the
+      // key set. Every value/T touchpoint (leaf value field, bucket value, inline value,
+      // copy/construct/destroy of T) is gated on HasValue; with HasValue==true the code is
+      // textually the production map. The public artpp::set is a facade over this.
+      static constexpr bool HasValue = !std::is_same_v<T, detail::none_t>;
+
       // Hard limit on the ENCODED key length: every length field in the node formats
       // (leaf suffix/prefix, prefix-node) is 16 bits. Mutating operations throw
       // std::length_error past it; lookups of longer keys simply miss (no stored key
@@ -540,6 +546,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
       using key_param = std::conditional_t<
           sv_key_, std::string_view,
           std::conditional_t<std::is_trivially_copyable_v<Key> && sizeof(Key) <= 16, Key, const Key&>>;
+
+     public:
+      // The codec-chosen key parameter type, exposed so the artpp::set facade takes the
+      // same hot-path-friendly key parameter (string_view for string keys, by-value for
+      // small trivially-copyable keys, const& otherwise) as the underlying map.
+      using map_key_param = key_param;
+
+     private:
       struct no_scratch_ {};
       // Serializing codecs may bring their own scratch type (fixed-width codecs use a plain
       // char buffer — no std::string machinery per encode); default is std::string.
@@ -5292,4 +5306,154 @@ using detail::map;  // re-export only the public class; impl stays in artpp::det
 // other modes (buckets, wide_stems, …) combine with mode::dense_tiers on the map<> template direct.
 template <class Key, class T, std::size_t ExpectedN, class Allocator = std::allocator<T>>
 using compact_map = detail::map<Key, T, mode::none, Allocator, ExpectedN>;
+
+namespace detail
+{
+   // ── artpp::set<Key> — a thin std::set-shaped FACADE over map<Key, none_t> ─────────
+   // The radix core (routing, descent, every tier, the handle, iteration, the key codec)
+   // is shared VERBATIM with the production map: a set is just map<Key, none_t> with the
+   // value path elided (see HasValue). The facade exposes the value-free std::set surface
+   // and adapts the iterator (which yields a (key, none_t) pair) to yield the KEY alone.
+   template <class Key, mode Mode = mode::none, class Allocator = std::allocator<Key>,
+             std::size_t ExpectedSize = 0>
+   class set
+   {
+      using value_alloc = typename std::allocator_traits<Allocator>::template rebind_alloc<none_t>;
+      using impl_t      = map<Key, none_t, Mode, value_alloc, ExpectedSize>;
+      impl_t impl_;
+
+     public:
+      using key_type        = Key;
+      using value_type      = Key;  // std::set: value_type == key_type
+      using size_type       = std::size_t;
+      using difference_type = std::ptrdiff_t;
+      using allocator_type  = Allocator;
+      static constexpr mode        policy        = Mode;
+      static constexpr size_type   max_key_bytes = impl_t::max_key_bytes;
+      using key_param = typename impl_t::map_key_param;  // the codec-chosen parameter type
+
+      // ── iterator: wraps the map iterator, * yields the KEY (no value pair) ─────────
+      class const_iterator
+      {
+         friend class set;
+         typename impl_t::const_iterator it_;
+         explicit const_iterator(typename impl_t::const_iterator it) : it_(std::move(it)) {}
+
+        public:
+         using iterator_category = std::bidirectional_iterator_tag;
+         using value_type        = Key;
+         using reference         = Key;  // proxy: the key is decoded by value (see key_codec)
+         using difference_type   = std::ptrdiff_t;
+         struct arrow_proxy
+         {
+            Key        k;
+            const Key* operator->() const noexcept { return &k; }
+         };
+         using pointer = arrow_proxy;
+
+         const_iterator() = default;
+         Key              key() const { return it_.key(); }
+         std::string_view key_bytes() const { return it_.key_bytes(); }
+         reference        operator*() const { return it_.key(); }
+         arrow_proxy      operator->() const { return arrow_proxy{it_.key()}; }
+         const_iterator&  operator++() { ++it_; return *this; }
+         const_iterator   operator++(int) { auto t = *this; ++it_; return t; }
+         const_iterator&  operator--() { --it_; return *this; }
+         const_iterator   operator--(int) { auto t = *this; --it_; return t; }
+         bool operator==(const const_iterator& o) const noexcept { return it_ == o.it_; }
+         bool operator!=(const const_iterator& o) const noexcept { return it_ != o.it_; }
+      };
+      using iterator               = const_iterator;
+      using reverse_iterator       = std::reverse_iterator<const_iterator>;
+      using const_reverse_iterator = reverse_iterator;
+
+      // ── construction / allocator / move ───────────────────────────────────────────
+      set() = default;
+      explicit set(const Allocator& a) : impl_(value_alloc(a)) {}
+      set(const set&)            = delete;
+      set& operator=(const set&) = delete;
+      set(set&&) noexcept(std::is_nothrow_move_constructible_v<impl_t>) = default;
+      set& operator=(set&&) noexcept(noexcept(std::declval<impl_t&>() =
+                                                  std::declval<impl_t&&>())) = default;
+      allocator_type get_allocator() const noexcept { return allocator_type(impl_.get_allocator()); }
+
+      // ── modifiers ─────────────────────────────────────────────────────────────────
+      // insert(k): std::set returns {iterator, bool}. inserted == the map insert result;
+      // the iterator is re-sought (the key is now stable). emplace builds the key from args.
+      std::pair<iterator, bool> insert(key_param k)
+      {
+         const bool ins = impl_.emplace(k);
+         return {iterator(const_iterator(impl_.find(k))), ins};
+      }
+      template <class... Args>
+      std::pair<iterator, bool> emplace(Args&&... args)
+      {
+         Key k(std::forward<Args>(args)...);
+         return insert(k);
+      }
+      size_type erase(key_param k) { return impl_.erase(k); }
+      iterator  erase(const_iterator pos) { return iterator(const_iterator(impl_.erase(pos.it_))); }
+      void      clear() noexcept { impl_.clear(); }
+      void swap(set& o) noexcept(noexcept(std::declval<impl_t&>().swap(std::declval<impl_t&>())))
+      {
+         impl_.swap(o.impl_);
+      }
+      friend void swap(set& a, set& b) noexcept(noexcept(a.swap(b))) { a.swap(b); }
+
+      // ── lookup ────────────────────────────────────────────────────────────────────
+      bool      contains(key_param k) const { return impl_.contains(k); }
+      size_type count(key_param k) const { return impl_.count(k); }
+      iterator  find(key_param k) const { return iterator(const_iterator(impl_.find(k))); }
+      iterator  lower_bound(key_param k) const
+      {
+         return iterator(const_iterator(impl_.lower_bound(k)));
+      }
+      iterator upper_bound(key_param k) const
+      {
+         return iterator(const_iterator(impl_.upper_bound(k)));
+      }
+      std::pair<iterator, iterator> equal_range(key_param k) const
+      {
+         auto er = impl_.equal_range(k);
+         return {iterator(const_iterator(er.first)), iterator(const_iterator(er.second))};
+      }
+
+      // ── iteration ─────────────────────────────────────────────────────────────────
+      iterator begin() const { return iterator(const_iterator(impl_.begin())); }
+      iterator end() const { return iterator(const_iterator(impl_.end())); }
+      iterator cbegin() const { return begin(); }
+      iterator cend() const { return end(); }
+      reverse_iterator rbegin() const { return reverse_iterator(end()); }
+      reverse_iterator rend() const { return reverse_iterator(begin()); }
+      reverse_iterator crbegin() const { return rbegin(); }
+      reverse_iterator crend() const { return rend(); }
+      // Fast ordered key-only scan (the for_each model): calls f(std::string_view key_bytes)
+      // OR f(Key) per element in ascending order. Here we hand back the decoded key.
+      template <class F>
+      void for_each(F&& f) const
+      {
+         impl_.for_each([&](std::string_view kb, const none_t&)
+                        { f(key_codec<Key>::decode(kb)); });
+      }
+
+      // ── capacity ──────────────────────────────────────────────────────────────────
+      size_type size() const noexcept { return impl_.size(); }
+      bool      empty() const noexcept { return impl_.empty(); }
+      size_type max_size() const noexcept { return impl_.max_size(); }
+
+      // ── whole-set ops ─────────────────────────────────────────────────────────────
+      // compact_set: present for API parity with compact_map (the capacity hint is a
+      // template arg; this is a no-op accessor kept for symmetry / future shrink hooks).
+      void compact_set() noexcept {}
+      friend bool operator==(const set& a, const set& b) { return a.impl_ == b.impl_; }
+      friend bool operator!=(const set& a, const set& b) { return !(a == b); }
+   };
+}  // namespace detail
+
+using detail::set;  // public spelling of the set facade
+
+// Capacity-hint convenience for sets (mirrors compact_map): a small expected size auto-selects
+// the cnode density ladder (a perf-per-byte win) and stays flat above the crossover.
+template <class Key, std::size_t ExpectedN, class Allocator = std::allocator<Key>>
+using compact_set = detail::set<Key, mode::none, Allocator, ExpectedN>;
 }  // namespace artpp
