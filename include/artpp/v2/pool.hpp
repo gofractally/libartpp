@@ -43,18 +43,28 @@ namespace artpp::v2
 {
    namespace detail
    {
-      // 4-byte indexed branch handle: [28-bit line index][4-bit tag], little-endian — the
-      // same byte-array shape as packed_ptr_t (memcpy load/store, unaligned-safe inside
-      // packed node arrays), but the payload is a line index resolved against a pool base.
+      // 6-byte indexed meta-handle (node_addr's handle_t<6>): [28-bit line index | 4-bit tag
+      // : 4 bytes][routing metadata : 2 bytes], little-endian. Same byte-array shape as the
+      // direct meta_ptr (memcpy load/store, unaligned-safe inside packed node arrays), but the
+      // address payload is a line INDEX resolved against a pool base. The 2 metadata bytes
+      // carry the headerless routing vector (presence / dividers) the CHILD's tier reads — so
+      // a pool-backed tree is headerless exactly like a direct one.
+      //
+      // Unlike a 128-aligned pointer, an index has no 7-bit alignment hole, so the 4-byte
+      // field is fully spent on index+tag with NO room for a has_tail bit. For indexed handles
+      // the KIND (node_full vs pfxd) is the sole source of truth for "is there a tail" — the
+      // descent already dispatches on the tag — so with_tail() is a no-op and has_tail() is
+      // never read on this handle (it tracks the tag, asserted at the call sites via the kind).
       struct line_ptr
       {
-         static constexpr bool indexed = true;
-         uint8_t               b[4];
+         static constexpr bool     indexed = true;
+         static constexpr unsigned ABYTES  = 4;  // index/tag field width; metadata in bytes 4-5
+         uint8_t                   b[6];
 
          static line_ptr null() noexcept
          {
             line_ptr p;
-            std::memset(p.b, 0xFF, 4);  // tag nibble becomes 0xF == K::null
+            std::memset(p.b, 0xFF, 6);  // tag nibble becomes 0xF == K::null
             return p;
          }
          // Encode a byte offset from the pool's NODE base (line-aligned, < 32 GB).
@@ -65,12 +75,13 @@ namespace artpp::v2
             line_ptr       p;
             const uint32_t raw = uint32_t(byte_off >> 3) | uint8_t(k);  // (off>>7)<<4 == off>>3
             std::memcpy(p.b, &raw, 4);
+            p.b[4] = p.b[5] = 0;  // metadata defaults to 0
             return p;
          }
          // Encode a byte offset from the pool's TERMINAL base (16-byte units, < 4 GB).
          // The tag disambiguates the two index spaces, so terminals get their own full
          // 28-bit range; 16-byte alignment leaves the low nibble free for the tag, so
-         // the stored u32 IS the byte offset (no shift on deref).
+         // the stored u32 IS the byte offset (no shift on deref). has_tail stays 0.
          static line_ptr from_toff(size_t byte_off, K k) noexcept
          {
             assert((byte_off & 0xF) == 0 && "artpp: terminal offsets are 16-byte aligned");
@@ -78,19 +89,38 @@ namespace artpp::v2
             line_ptr       p;
             const uint32_t raw = uint32_t(byte_off) | uint8_t(k);
             std::memcpy(p.b, &raw, 4);
+            p.b[4] = p.b[5] = 0;
             return p;
          }
 
+         // The FULL 6-byte field (index/tag/has_tail in the low 4, metadata in the high 2):
+         // the descent reads this once — child_line reads meta as raw>>32, deref masks it off.
          uint64_t raw() const noexcept
          {
-            uint32_t v;
-            std::memcpy(&v, b, 4);
+            uint64_t v = 0;
+            std::memcpy(&v, b, 6);
             return v;
          }
-         K    tag() const noexcept { return K(b[0] & 0xF); }
-         bool is_null() const noexcept { return tag() == K::null; }
+         K        tag() const noexcept { return K(b[0] & 0xF); }
+         bool     has_tail() const noexcept { return tag() == K::pfxd; }  // kind is authoritative
+         uint16_t meta() const noexcept
+         {
+            uint16_t m;
+            std::memcpy(&m, b + ABYTES, 2);
+            return m;
+         }
+         bool     is_null() const noexcept { return tag() == K::null; }
+
+         line_ptr with_meta(uint16_t m) const noexcept
+         {
+            line_ptr p = *this;
+            std::memcpy(p.b + ABYTES, &m, 2);
+            return p;
+         }
+         // No alignment hole in an index → no stored has_tail bit; the kind tag carries it.
+         line_ptr with_tail(bool) const noexcept { return *this; }
       };
-      static_assert(sizeof(line_ptr) == 4, "line_ptr is exactly 4 bytes");
+      static_assert(sizeof(line_ptr) == 6, "line_ptr is 4 index/tag bytes + 2 metadata bytes");
    }  // namespace detail
 
    // The line store. Single-threaded, like the tree. Not copyable/movable — every handle

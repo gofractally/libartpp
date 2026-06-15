@@ -78,7 +78,8 @@ namespace artpp::v2::detail
       // one ever matters, route the byte accessors through raw() instead.
       static_assert(std::endian::native == std::endian::little,
                     "artpp handles assume a little-endian host");
-      static constexpr bool indexed = false;  // direct addressing: the handle IS the address
+      static constexpr bool     indexed = false;  // direct addressing: the handle IS the address
+      static constexpr unsigned ABYTES  = N;       // no metadata: the whole field is the address
       uint8_t b[N];
 
       static packed_ptr_t null() noexcept

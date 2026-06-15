@@ -304,30 +304,29 @@ namespace detail  // implementation types & node helpers — not part of the pub
       for (int i = 0; i < s->rh.hdr.nbranch; ++i) f(s->stems[i], s->branch[i]);
    }
 
-   // ── dense router: sparse_full — CL0 header + popcount(presence) range lines ──
+   // ── dense router: sparse_full — HEADERLESS popcount(presence) range lines ────
    // §3.4 of v2_node_spec.md. The 256 byte-values split into 16 sub-ranges of 16
    // (sub = byte>>4, slot = byte&0xF). A 16-bit PRESENCE vector (bit sub ⇒ that
-   // sub-range exists) lives in CL0; only OCCUPIED sub-ranges materialize, stored
-   // CONTIGUOUSLY in rank order. This is the memory win over the old fixed 13-line
-   // (all-256-bytes) dense node: a 56-branch full now costs 128 + popcount*128 B,
-   // not a flat 1792 B. Same K::node_full / K::pfxd tags, same 6-byte handle — only
-   // the byte representation changed. This stage stores presence IN the node's CL0
-   // (the headerless presence-in-handle is a later build stage).
+   // sub-range exists) rides in the PARENT handle's 2 metadata bytes (meta_ptr::meta)
+   // — the node itself stores NO presence and NO header. Only OCCUPIED sub-ranges
+   // materialize, stored CONTIGUOUSLY in rank order from offset 0. This is the
+   // headerless win: a 56-branch full costs popcount*128 B with NOTHING before the
+   // first range line (the old CL0 header cacheline is gone).
    //
+   //   presence = handle.meta()
    //   sub  = byte >> 4
    //   present = (presence >> sub) & 1               // else MISS
    //   rank = popcount(presence & ((1<<sub) - 1))    // == sub when presence==0xFFFF
-   //   range = (char*)node + 128 + rank*128
+   //   range = (char*)node + rank*128                // NO CL0 skip — headerless
    //   child = *(Ptr*)(range + (byte & 0xF) * sizeof(Ptr))
    //
-   // Each range line covers 16 byte-values (16 child handles = 16*W; the spare bytes
-   // are unused THIS stage — the per-range replicated prefix is deferred). nset rides
-   // in the range line's spare tail for empty-line skip in ordered iteration.
+   // K::node_full has NO term and NO prefix: purely popcount(presence) range lines.
+   // K::pfxd is the SAME body plus ONE extra "tail" cacheline at offset popcount*128
+   // holding the optional term and the fused prefix (node_full_tail_t). The handle's
+   // has_tail bit mirrors the kind (set for pfxd, clear for node_full).
    //
    // Geometry is fixed by the spec: 16 sub-ranges of 16 byte-values (sub = byte>>4,
-   // slot = byte&0xF) — not derived from sizeof(Ptr) like the old reciprocal-index node.
-   // A range line: 16 handles up front (the routed slot is range + slot*W), nset in
-   // the spare tail (population, for ordered-iteration empty-line skip).
+   // slot = byte&0xF). A range line: 16 handles (the routed slot is range + slot*W).
    template <class Ptr>
    struct cline_direct_t
    {
@@ -341,50 +340,64 @@ namespace detail  // implementation types & node helpers — not part of the pub
    using cline_direct = cline_direct_t<packed_ptr>;
    static_assert(sizeof(cline_direct) == 128, "direct line is one cacheline");
 
-   // node_full_t models ONLY CL0 (the fixed header). The range lines are a variable
-   // tail of popcount(presence) cachelines laid out immediately after, addressed by
-   // pointer arithmetic (full_range below) — never as a flexible array member.
-   //
-   // CL0: [router_hdr rh][u16 presence][hdr...] where hdr = [pfxd_kind][prefix bytes].
-   // When the node carries an inline prefix it is HANDLE-TAGGED K::pfxd (a hint: "the
-   // header holds something you need"); hdr[0] records the REAL kind, hdr[1..] the
-   // prefix, rh.hdr.prefix_len the count. Plain K::node_full nodes never read CL0's
-   // prefix region — but presence is now ALWAYS in CL0 (it's read on every descent).
+   // node_full_t is a HEADERLESS marker — the node IS its array of popcount(presence)
+   // range lines (full_range below addresses them by pointer arithmetic from the base,
+   // with NO CL0 skip). It carries no members: presence lives in the handle, and a
+   // K::pfxd's term/prefix live in the trailing tail (node_full_tail_t).
    template <class Ptr>
    struct node_full_t
    {
       static_assert(sizeof(cline_direct_t<Ptr>) == cacheline_bytes, "direct line tiles one cacheline");
-      // presence sits between rh and the prefix region, so the pfxd kind byte/prefix
-      // shift past it (PFX_OFF below). PFX_CAP shrinks by the 2 presence bytes vs v1.
-      static constexpr unsigned PRES_OFF = unsigned(sizeof(router_hdr_t<Ptr>));
-      static constexpr unsigned PFX_OFF  = PRES_OFF + 2;  // [kind][prefix...] starts here
+      // PFX_CAP is bounded by node_hdr.prefix_len's 6 bits (max 63), and never exceeds
+      // the bytes that fit in the tail after [node_hdr hdr][Ptr term].
+      static constexpr unsigned TAIL_PFX_OFF = unsigned(sizeof(node_hdr) + sizeof(Ptr));
       static constexpr unsigned PFX_CAP =
-          std::min(63u, cacheline_bytes - PFX_OFF - 1);
-      router_hdr_t<Ptr> rh;
-      uint16_t          presence;  // bit s ⇒ sub-range s materialized (16 sub-ranges)
-      uint8_t           hdr[cacheline_bytes - PFX_OFF];  // [kind][prefix...]
+          std::min(63u, cacheline_bytes - TAIL_PFX_OFF);
    };
    using node_full = node_full_t<packed_ptr>;
-   static_assert(sizeof(node_full) == cacheline_bytes, "node_full CL0 is one cacheline");
 
-   // node_size for a sparse_full: CL0 + popcount(presence) range lines.
+   // The pfxd TAIL: one extra cacheline AFTER the range lines, holding the optional
+   // term (hdr.has_term) and the fused prefix (hdr.prefix_len bytes from prefix[]).
    template <class Ptr>
-   inline size_t full_node_bytes(const node_full_t<Ptr>* f) noexcept
+   struct node_full_tail_t
    {
-      return cacheline_bytes + size_t(std::popcount(f->presence)) * cacheline_bytes;
+      node_hdr hdr;   // has_term + prefix_len (nbranch unused — child count isn't stored)
+      Ptr      term;  // value when a key ends at this router (valid iff hdr.has_term)
+      uint8_t  prefix[cacheline_bytes - unsigned(sizeof(node_hdr) + sizeof(Ptr))];
+   };
+   using node_full_tail = node_full_tail_t<packed_ptr>;
+   static_assert(sizeof(node_full_tail) == cacheline_bytes, "pfxd tail is one cacheline");
+
+   // node_size for a sparse_full/pfxd from (presence, is_pfxd): popcount range lines,
+   // plus one tail cacheline when pfxd.
+   inline size_t full_node_bytes(uint16_t presence, bool is_pfxd) noexcept
+   {
+      return (size_t(std::popcount(presence)) + (is_pfxd ? 1u : 0u)) * cacheline_bytes;
    }
-   // The rank-th materialized range line (rank in [0, popcount(presence))).
+   // The rank-th materialized range line (rank in [0, popcount(presence))). HEADERLESS:
+   // the node base IS range line 0 — no CL0 skip.
    template <class Ptr>
    inline cline_direct_t<Ptr>* full_range(node_full_t<Ptr>* f, unsigned rank) noexcept
    {
-      return reinterpret_cast<cline_direct_t<Ptr>*>(reinterpret_cast<char*>(f) + cacheline_bytes) + rank;
+      return reinterpret_cast<cline_direct_t<Ptr>*>(f) + rank;
    }
    template <class Ptr>
    inline const cline_direct_t<Ptr>* full_range(const node_full_t<Ptr>* f, unsigned rank) noexcept
    {
-      return reinterpret_cast<const cline_direct_t<Ptr>*>(reinterpret_cast<const char*>(f) +
-                                                          cacheline_bytes) +
-             rank;
+      return reinterpret_cast<const cline_direct_t<Ptr>*>(f) + rank;
+   }
+   // The pfxd tail (only valid for K::pfxd): the cacheline at offset popcount(presence)*128.
+   template <class Ptr>
+   inline node_full_tail_t<Ptr>* full_tail(node_full_t<Ptr>* f, uint16_t presence) noexcept
+   {
+      return reinterpret_cast<node_full_tail_t<Ptr>*>(reinterpret_cast<char*>(f) +
+                                                      size_t(std::popcount(presence)) * cacheline_bytes);
+   }
+   template <class Ptr>
+   inline const node_full_tail_t<Ptr>* full_tail(const node_full_t<Ptr>* f, uint16_t presence) noexcept
+   {
+      return reinterpret_cast<const node_full_tail_t<Ptr>*>(
+          reinterpret_cast<const char*>(f) + size_t(std::popcount(presence)) * cacheline_bytes);
    }
    // rank of sub-range `sub` (count of present sub-ranges below it). For presence
    // 0xFFFF this is identically `sub` — the rank-free fast path.
@@ -392,46 +405,50 @@ namespace detail  // implementation types & node helpers — not part of the pub
    {
       return unsigned(std::popcount(unsigned(presence) & ((1u << sub) - 1u)));
    }
+   // Routing: presence comes from the handle (caller reads cur.meta() once).
    template <class Ptr>
-   inline Ptr full_find(const node_full_t<Ptr>* f, uint8_t byte) noexcept
+   inline Ptr full_find(const node_full_t<Ptr>* f, uint16_t presence, uint8_t byte) noexcept
    {
       const unsigned sub = unsigned(byte) >> 4;
-      if (!((f->presence >> sub) & 1u))
+      if (!((presence >> sub) & 1u))
          return Ptr::null();
-      return full_range<Ptr>(f, full_rank(f->presence, sub))->ptr[byte & 0xF];
+      return full_range<Ptr>(f, full_rank(presence, sub))->ptr[byte & 0xF];
    }
    // Slot pointer for byte (existing OR present-but-null), or nullptr when the whole
    // sub-range is absent. (Mirrors v1: a present sub-range with a null slot returns a
    // writable slot; an absent sub-range returns nullptr so the caller GROWS.)
    template <class Ptr>
-   inline Ptr* full_slot(node_full_t<Ptr>* f, uint8_t byte) noexcept
+   inline Ptr* full_slot(node_full_t<Ptr>* f, uint16_t presence, uint8_t byte) noexcept
    {
       const unsigned sub = unsigned(byte) >> 4;
-      if (!((f->presence >> sub) & 1u))
+      if (!((presence >> sub) & 1u))
          return nullptr;
-      return &full_range<Ptr>(f, full_rank(f->presence, sub))->ptr[byte & 0xF];
-   }
-   template <class Ptr>
-   inline void full_init(node_full_t<Ptr>* f) noexcept  // an empty node: zero sub-ranges
-   {
-      f->rh.hdr   = node_hdr{0, 0, 0};
-      f->rh.term  = Ptr::null();
-      f->presence = 0;
+      return &full_range<Ptr>(f, full_rank(presence, sub))->ptr[byte & 0xF];
    }
    // Set byte -> p WITHIN an already-present sub-range. The sub-range MUST be present
    // (presence bit set); growth (adding a sub-range) is the tree's job (full_grow_),
-   // because it reallocates the contiguous block. Maintains nset + nbranch.
+   // because it reallocates the contiguous block. nbranch is NOT stored — see full_nbranch.
    template <class Ptr>
-   inline void full_set_present(node_full_t<Ptr>* f, uint8_t byte, Ptr p) noexcept
+   inline void full_set_present(node_full_t<Ptr>* f, uint16_t presence, uint8_t byte, Ptr p) noexcept
    {
       const unsigned       sub = unsigned(byte) >> 4;
-      assert(((f->presence >> sub) & 1u) && "full_set_present: sub-range must exist");
-      cline_direct_t<Ptr>* ln       = full_range<Ptr>(f, full_rank(f->presence, sub));
-      Ptr&                 slot     = ln->ptr[byte & 0xF];
-      const bool           was_null = slot.is_null();
-      slot                          = p;
-      if (was_null && !p.is_null()) ++f->rh.hdr.nbranch;
-      else if (!was_null && p.is_null()) --f->rh.hdr.nbranch;
+      assert(((presence >> sub) & 1u) && "full_set_present: sub-range must exist");
+      cline_direct_t<Ptr>* ln  = full_range<Ptr>(f, full_rank(presence, sub));
+      ln->ptr[byte & 0xF]      = p;
+   }
+   // Child count — summed across the popcount(presence) range lines (nbranch is no
+   // longer stored). OFF the hot path only: rm_shrink_'s de-widen test + debug_stats.
+   template <class Ptr>
+   inline unsigned full_nbranch(const node_full_t<Ptr>* f, uint16_t presence) noexcept
+   {
+      unsigned n  = 0;
+      const unsigned nr = unsigned(std::popcount(presence));
+      for (unsigned r = 0; r < nr; ++r)
+      {
+         const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, r);
+         for (unsigned s = 0; s < 16; ++s) n += !ln->ptr[s].is_null();
+      }
+      return n;
    }
 
    // ── bucket: the "last-mile" terminal — a flat, lexicographically-sorted set of
@@ -531,6 +548,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       using setlist    = setlist_t<Ptr>;
       using setlist16  = setlist16_t<Ptr>;
       using node_full  = node_full_t<Ptr>;
+      using node_full_tail = node_full_tail_t<Ptr>;
       template <int N>
       using cnode = cnode_t<N, Ptr>;
 
@@ -669,11 +687,22 @@ namespace detail  // implementation types & node helpers — not part of the pub
       struct no_base_t
       {
       };
+      // The bytes of a handle that hold the ADDRESS field (the rest are routing metadata the
+      // headerless slots carry in the handle's high bytes). meta_ptr keeps the address in the
+      // low 48 bits and the 16-bit presence/divider vector above it; line_ptr keeps a 28-bit
+      // index + tag in the low 4 bytes and metadata above; a metadata-less packed_ptr_t<N>
+      // zero-extends to N bytes so this mask is a no-op for it.
+      static constexpr uint64_t ADDR_BITS_ =
+          (8u * Ptr::ABYTES >= 64u) ? ~uint64_t(0) : ((uint64_t(1) << (8u * Ptr::ABYTES)) - 1);
+      // Bit position of the 16-bit routing metadata within a handle's raw() value: it sits
+      // just above the address field, so meta == uint16_t(raw >> META_SHIFT_). Width-derived
+      // (48 for the 8-byte meta_ptr, 32 for the 6-byte indexed line_ptr).
+      static constexpr unsigned META_SHIFT_ = 8u * Ptr::ABYTES;
       void* deref_(packed_ptr p) const noexcept
       {
          assert(p.tag() != K::value_ptr && "artpp: terminals deref via deref_term_");
          if constexpr (indexed)
-            return const_cast<std::byte*>(base_) + ((p.raw() & ~uint64_t(0xF)) << 3);
+            return const_cast<std::byte*>(base_) + ((p.raw() & ADDR_BITS_ & ~uint64_t(0xF)) << 3);
          else
             return p.ptr();
       }
@@ -682,9 +711,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          assert(K(raw & 0xF) != K::value_ptr && "artpp: terminals deref via deref_term_raw_");
          if constexpr (indexed)
-            return reinterpret_cast<const char*>(base_) + ((raw & ~uint64_t(0xF)) << 3);
+            return reinterpret_cast<const char*>(base_) + ((raw & ADDR_BITS_ & ~uint64_t(0xF)) << 3);
          else
-            return reinterpret_cast<const char*>(raw & ~uint64_t(0x7f));
+            return reinterpret_cast<const char*>(raw & ADDR_BITS_ & ~uint64_t(0x7f));
       }
       packed_ptr pack_(const void* node, K k) const noexcept
       {
@@ -699,16 +728,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          assert(p.tag() == K::value_ptr && "artpp: only leaves live in the terminal region");
          if constexpr (indexed)
-            return const_cast<std::byte*>(tbase_) + (p.raw() & ~uint64_t(0xF));
+            return const_cast<std::byte*>(tbase_) + (p.raw() & ADDR_BITS_ & ~uint64_t(0xF));
          else
             return p.tptr();
       }
       const char* deref_term_raw_(uint64_t raw) const noexcept
       {
          if constexpr (indexed)
-            return reinterpret_cast<const char*>(tbase_) + (raw & ~uint64_t(0xF));
+            return reinterpret_cast<const char*>(tbase_) + (raw & ADDR_BITS_ & ~uint64_t(0xF));
          else
-            return reinterpret_cast<const char*>(raw & ~uint64_t(0xF));
+            return reinterpret_cast<const char*>(raw & ADDR_BITS_ & ~uint64_t(0xF));
       }
       packed_ptr pack_term_(const void* t, K k) const noexcept
       {
@@ -799,8 +828,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          static_assert(indexed, "map attach is only for indexed (pool-backed) handles");
          rebase_();
-         const uint32_t raw = uint32_t(root_handle);
-         std::memcpy(root_.b, &raw, sizeof(root_.b));  // line_ptr is 4 bytes: reconstruct the root
+         // Reconstruct the full handle (index/tag in the low bytes, presence metadata above) —
+         // root_handle() persisted root_.raw(), so copy back all sizeof(Ptr) bytes.
+         std::memcpy(root_.b, &root_handle, sizeof(root_.b));
       }
 
       ~map() { free_all_(root_); }  // walk the tree, destroy every T and free every node
@@ -883,8 +913,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if constexpr (Adaptive)
                if (is_router(k))
                {
-                  const unsigned nb = static_cast<router_hdr*>(deref_(cur))->hdr.nbranch;
-                  lowfan            = (nb < 3) ? lowfan + 1 : 0;
+                  // node_full/pfxd carry no nbranch (and are never low-fanout: they only
+                  // widen from a CAP-full setlist), so they reset the deep-narrow signal.
+                  const unsigned nb = (k == K::node_full || k == K::pfxd)
+                                          ? 3u
+                                          : static_cast<router_hdr*>(deref_(cur))->hdr.nbranch;
+                  lowfan = (nb < 3) ? lowfan + 1 : 0;
                }
             // Terminal bucket: only the bucket/adaptive policies ever create one, so the
             // other modes don't pay this tag test on every descend hop.
@@ -901,15 +935,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
             // (no reciprocal, no router_find_slot re-dispatch).
             if (k == K::node_full)
             {
-               char* f = static_cast<char*>(deref_(cur));
-               if (depth == key.size())
+               node_full*     f    = static_cast<node_full*>(deref_(cur));
+               const uint16_t pres = cur.meta();
+               if (depth == key.size())  // key ends here → add a term (reallocs to pfxd)
                {
-                  const bool ins = set_or_update_term<Assign>(reinterpret_cast<router_hdr*>(f), std::forward<VF>(v));
+                  bool ins;
+                  *slot = full_set_or_update_term<Assign>(cur, std::forward<VF>(v), ins);
                   count_ += ins;
                   return ins;
                }
                const uint8_t byte = uint8_t(key[depth]);
-               packed_ptr*   cs   = full_slot(reinterpret_cast<node_full*>(f), byte);
+               packed_ptr*   cs   = full_slot(f, pres, byte);
                if (cs && !cs->is_null())  // existing child -> descend
                {
                   if constexpr (WideStems) pslot = slot;
@@ -929,12 +965,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             switch (k)
             {
-               case K::pfxd:  // consume the in-header prefix, then route as the full hoist
+               case K::pfxd:  // consume the fused prefix (from the tail), then route as full
                {
-                  char*          f  = static_cast<char*>(deref_(cur));
-                  const unsigned pl = reinterpret_cast<router_hdr*>(f)->hdr.prefix_len;
-                  const size_t   c  = lcp(
-                      std::string_view(reinterpret_cast<const char*>(pfxd_pfx(f)), pl),
+                  node_full*     f    = static_cast<node_full*>(deref_(cur));
+                  const uint16_t pres = cur.meta();
+                  const unsigned pl   = pfxd_plen(f, pres);
+                  const size_t   c    = lcp(
+                      std::string_view(reinterpret_cast<const char*>(pfxd_pfx(f, pres)), pl),
                       key.substr(depth));
                   if (c < pl)  // fused prefix diverges → split it
                   {
@@ -947,13 +984,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   depth += pl;
                   if (depth == key.size())
                   {
-                     const bool ins = set_or_update_term<Assign>(reinterpret_cast<router_hdr*>(f),
-                                                                 std::forward<VF>(v));
+                     bool ins;
+                     *slot = full_set_or_update_term<Assign>(cur, std::forward<VF>(v), ins);
                      count_ += ins;
                      return ins;
                   }
                   const uint8_t byte = uint8_t(key[depth]);
-                  packed_ptr*   cs   = full_slot(reinterpret_cast<node_full*>(f), byte);
+                  packed_ptr*   cs   = full_slot(f, pres, byte);
                   if (cs && !cs->is_null())  // existing child -> descend
                   {
                      if constexpr (WideStems) pslot = slot;
@@ -995,14 +1032,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   char*          P  = static_cast<char*>(deref_(cur));
                   const uint16_t pl = pn_plen(P);
-                  // Lazy fusion: a prefix node sitting directly above a node_full migrates
-                  // into the full's header cacheline on the first write that touches it —
-                  // the dedicated node was only ever the overflow form. Alloc-free (the
-                  // make_prefix fusion branch memcpys + retags), then re-dispatch.
+                  // Lazy fusion: a prefix node sitting directly above a node_full/pfxd migrates
+                  // into the node's tail on the first write that touches it — the dedicated node
+                  // was only ever the overflow form. make_prefix grows/prepends the tail (it may
+                  // realloc node_full→pfxd, fine off the noexcept path), then re-dispatch.
                   if (const packed_ptr nx = pn_next<Ptr>(P);
                       (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
                       (nx.tag() == K::pfxd &&
-                       pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
+                       pl + pfxd_plen(static_cast<node_full*>(deref_(nx)), nx.meta()) <= node_full::PFX_CAP))
                   {
                      *slot = make_prefix(
                          std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
@@ -1166,7 +1203,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
 #define ARTPP_BODY_SETLIST { \
    const setlist* s = reinterpret_cast<const setlist*>(ARTPP_PTR(raw)); const unsigned pl = s->rh.hdr.prefix_len; \
    if (pl) { if (klen - depth < pl || std::memcmp(s->prefix, kp + depth, pl) != 0) return op.miss(); depth += pl; } \
-   if (depth == klen) return op.term(&s->rh); \
+   if (depth == klen) return op.term(s->rh.term); \
    const int sli_ = setlist_index(s, uint8_t(kp[depth])); \
    if (sli_ < 0) return op.miss(); \
    if (sl_is_inline(s, sli_)) /* inline leaf shares this line — no extra cacheline */ \
@@ -1174,32 +1211,34 @@ namespace detail  // implementation types & node helpers — not part of the pub
    raw = s->branch[sli_].raw(); ARTPP_NEXT(depth + 1); }
 #define ARTPP_BODY_SETLIST16 { \
    const setlist16* s = reinterpret_cast<const setlist16*>(ARTPP_PTR(raw)); \
-   if (klen - depth < 2) return depth == klen ? op.term(&s->rh) : op.miss(); \
+   if (klen - depth < 2) return depth == klen ? op.term(s->rh.term) : op.miss(); \
    const uint16_t q = uint16_t(uint16_t(uint8_t(kp[depth])) << 8 | uint8_t(kp[depth + 1])); \
    raw = sl16_find(s, q).raw(); ARTPP_NEXT(depth + 2); }
-/* sparse_full (§3.4): presence rides in CL0; the routed sub-range, if present, is the
-   rank-th materialized range line. An absent sub-range → MISS (full_find returns null,
-   whose all-1s raw reads as K::null next iteration). One presence read + popcount-rank
-   computes the line offset — no static offset table (the offset is per-node now). */
+/* sparse_full (§3.4): HEADERLESS — presence rides in the parent HANDLE's metadata
+   (raw>>48). The routed sub-range, if present, is the rank-th materialized range line.
+   An absent sub-range → MISS (full_find returns null, whose all-1s raw reads as K::null
+   next iteration). A node_full has NO term: reaching its end with key exhausted MISSES. */
 #define ARTPP_BODY_FULL { \
    const node_full* f = reinterpret_cast<const node_full*>(ARTPP_PTR(raw)); \
-   if (depth == klen) return op.term(&f->rh); \
-   raw = full_find(f, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
-/* pfxd: the handle says "consume the in-header prefix first"; the node's real kind is
-   hdr[0] (node_full is the only header-capacity kind today, so the body IS the full
-   body). One CL0 load serves prefix + presence + term, and the routed range line is a
-   later line of the same node (no pointer chase between them). */
+   if (depth == klen) return op.miss();  /* node_full carries no term */ \
+   const uint16_t pres = uint16_t(raw >> META_SHIFT_); \
+   raw = full_find(f, pres, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
+/* pfxd: the handle says "consume the fused prefix first". HEADERLESS — presence is in
+   the handle (raw>>48); the prefix and term live in the node's TAIL cacheline at offset
+   popcount(presence)*128. Routing is identical to node_full once the prefix is consumed. */
 #define ARTPP_BODY_PFXD { \
    const node_full* f = reinterpret_cast<const node_full*>(ARTPP_PTR(raw)); \
-   const unsigned pl = f->rh.hdr.prefix_len; \
-   if (klen - depth < pl || std::memcmp(f->hdr + 1, kp + depth, pl) != 0) \
+   const uint16_t pres = uint16_t(raw >> META_SHIFT_); \
+   const node_full_tail* tl = full_tail(f, pres); \
+   const unsigned pl = tl->hdr.prefix_len; \
+   if (klen - depth < pl || std::memcmp(tl->prefix, kp + depth, pl) != 0) \
       return op.miss(); \
    depth += pl; \
-   if (depth == klen) return op.term(&f->rh); \
-   raw = full_find(f, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
+   if (depth == klen) return tl->hdr.has_term ? op.term(tl->term) : op.miss(); \
+   raw = full_find(f, pres, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
 #define ARTPP_BODY_CN(N) { \
    const char* p = ARTPP_PTR(raw); \
-   if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
+   if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)->term); \
    raw = cnode_step(reinterpret_cast<const cnode<N>*>(p), uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
 
       template <class Op>
@@ -1281,7 +1320,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                return self->bkt_find(b, std::string_view(rem, rl), *out);
             }
-            bool term(const router_hdr* rh) const { return self->read_term(rh, *out); }
+            bool term(packed_ptr t) const { return self->read_term(t, *out); }
             bool miss() const { return false; }
          };
          return descend_read(key, op_t{this, &out});
@@ -1311,7 +1350,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                return bkt_locate(b, std::string_view(rem, rl)) != nullptr;
             }
-            bool term(const router_hdr* rh) const { return !rh->term.is_null(); }
+            bool term(packed_ptr t) const { return !t.is_null(); }
             bool miss() const { return false; }
          };
          return descend_read(key, op_t{});
@@ -1368,31 +1407,54 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::setlist_u16:
                {
                   setlist16* s = static_cast<setlist16*>(deref_(cur));
-                  if (key.size() - depth < 2) return depth == key.size() ? op.term(&s->rh) : op.miss();
+                  if (key.size() - depth < 2) return depth == key.size() ? op.term(&s->rh.term) : op.miss();
                   const uint16_t q  = two_stem(key, depth);
                   packed_ptr*    cs = sl16_find_slot(s, q);
                   if (!cs) return op.miss();
                   parent = cur; pstem = q; slot = cs; depth += 2; continue;
                }
-               case K::setlist_u8: case K::c2: case K::c4: case K::c8: case K::node_full:
+               case K::node_full:
                case K::pfxd:
+               {
+                  // HEADERLESS: presence in the handle, prefix/term in the pfxd tail.
+                  node_full*     f    = static_cast<node_full*>(deref_(cur));
+                  const uint16_t pres = cur.meta();
+                  if (cur.tag() == K::pfxd)  // consume the fused prefix from the tail
+                  {
+                     node_full_tail* tl = full_tail(f, pres);
+                     const unsigned  pl = tl->hdr.prefix_len;
+                     if (pl)
+                     {
+                        if (key.size() - depth < pl || std::memcmp(tl->prefix, key.data() + depth, pl) != 0)
+                           return op.miss();
+                        depth += pl;
+                     }
+                     if (depth == key.size())
+                        return tl->hdr.has_term ? op.term(&tl->term) : op.miss();
+                  }
+                  else if (depth == key.size())
+                     return op.miss();  // node_full carries no term
+                  const uint8_t byte = uint8_t(key[depth]);
+                  packed_ptr*   cs   = full_slot(f, pres, byte);
+                  if (!cs || cs->is_null()) return op.miss();
+                  parent = cur; pbyte = byte; slot = cs; ++depth; continue;
+               }
+               case K::setlist_u8: case K::c2: case K::c4: case K::c8:
                {
                   router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
                   const K     ck = cur.tag();
-                  if (ck == K::setlist_u8 || ck == K::pfxd)  // kinds with an inline prefix
+                  if (ck == K::setlist_u8)  // the only tier with an inline prefix here
                   {
                      const unsigned pl = rh->hdr.prefix_len;
                      if (pl)
                      {
-                        const uint8_t* pb = ck == K::pfxd
-                                                ? pfxd_pfx(rh)
-                                                : static_cast<const setlist*>(deref_(cur))->prefix;
+                        const uint8_t* pb = static_cast<const setlist*>(deref_(cur))->prefix;
                         if (key.size() - depth < pl || std::memcmp(pb, key.data() + depth, pl) != 0)
                            return op.miss();
                         depth += pl;
                      }
                   }
-                  if (depth == key.size()) return op.term(rh);
+                  if (depth == key.size()) return op.term(&rh->term);
                   const uint8_t byte = uint8_t(key[depth]);
                   packed_ptr*   cs   = router_find_slot(cur, byte);
                   if (!cs) return op.miss();
@@ -1434,12 +1496,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if constexpr (inlineable) *slot = pack_inline(*v);
                return true;
             }
-            bool term(router_hdr* rh) const
+            bool term(packed_ptr* tslot) const
             {
-               if (rh->term.is_null()) return false;
+               if (tslot->is_null()) return false;
                if constexpr (inlineable)
-                  if (rh->term.tag() == K::value_inline) { rh->term = pack_inline(*v); return true; }
-               return assign(leaf_val(static_cast<char*>(self->deref_term_(rh->term))));
+                  if (tslot->tag() == K::value_inline) { *tslot = pack_inline(*v); return true; }
+               return assign(leaf_val(static_cast<char*>(self->deref_term_(*tslot))));
             }
             bool bkt(packed_ptr*, packed_ptr cur, std::string_view rem) const
             {
@@ -1676,14 +1738,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // once hid the lower_bound/u16 miss).
          packed_ptr router_child_(packed_ptr node, uint8_t byte) const
          {
-            return t_->with_router(node, [byte](auto* n) noexcept { return router_find(n, byte); });
+            return t_->with_router(node, [byte](auto* n, uint16_t pres) noexcept { return router_find(n, pres, byte); });
          }
          bool next_child_(packed_ptr node, int from, uint8_t& ob, packed_ptr& oc) const
          {
             if (from > 255)
                return false;
             return t_->with_router(node,
-                                   [&](auto* n) noexcept { return router_next(n, from, ob, oc); });
+                                   [&](auto* n, uint16_t pres) noexcept { return router_next(n, pres, from, ob, oc); });
          }
          // Position the cursor on a setlist's INLINE leaf child (branch i) — the leaf lives
          // in the parent's line, so it can't be resolved from the child handle alone. Mirrors
@@ -1737,17 +1799,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::bucket:  // index order IS suffix order (see bkt_index_sorted_)
                   stk_.push_back(Frame{child, 0, uint32_t(base), uint32_t(base)});
                   return false;
-               default:  // routers (setlist / c2 / c4 / c8 / node_full)
+               default:  // routers (setlist / c2 / c4 / c8 / node_full / pfxd)
                {
-                  const router_hdr* rh = static_cast<const router_hdr*>(deref_(child));
-                  uint32_t          cb = uint32_t(base);
+                  uint32_t cb = uint32_t(base);
                   if (maintain_)
                   {
                      key_.len = base;
-                     if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
-                        key_.append(static_cast<const setlist*>(deref_(child))->prefix, rh->hdr.prefix_len);
-                     else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
-                        key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+                     const uint8_t* pb;
+                     if (const unsigned pl = t_->router_prefix(child, pb)) key_.append(pb, pl);
                      cb = uint32_t(key_.len);
                   }
                   stk_.push_back(Frame{child, -1, uint32_t(base), cb});
@@ -1818,14 +1877,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   else { if (maintain_) key_.len = f.plen; stk_.pop_back(); }
                   continue;
                }
-               const router_hdr* rh = static_cast<const router_hdr*>(deref_(f.node));
                if (f.cur == -1)
                {
                   f.cur = 0;
-                  if (!rh->term.is_null())
+                  if (const packed_ptr tm = t_->router_term(f.node); !tm.is_null())
                   {
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
-                     emit_(rh->term);
+                     emit_(tm);
                      if (maintain_) key_.len = f.cbase;
                      return;
                   }
@@ -1934,21 +1992,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return false;
             }
             // routers (setlist / c2 / c4 / c8 / node_full / pfxd)
-            const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-            if ((k == K::setlist_u8 || k == K::pfxd) && rh->hdr.prefix_len)
             {
-               const uint8_t* pb = k == K::pfxd ? pfxd_pfx(rh)
-                                                : static_cast<const setlist*>(deref_(cur))->prefix;
-               std::string_view PP(reinterpret_cast<const char*>(pb), rh->hdr.prefix_len);
-               std::string_view R = key.substr(depth);
-               const size_t     c = lcp(PP, R);
-               if (c < PP.size())
+               const uint8_t* pb;
+               if (const unsigned plen = t_->router_prefix(cur, pb))
                {
-                  if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c])) { descend_(cur, 0); return false; }
-                  stk_.push_back(Frame{cur, 256, 0, 0});  // subtree < target → pop router
-                  return false;
+                  std::string_view PP(reinterpret_cast<const char*>(pb), plen);
+                  std::string_view R = key.substr(depth);
+                  const size_t     c = lcp(PP, R);
+                  if (c < PP.size())
+                  {
+                     if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c])) { descend_(cur, 0); return false; }
+                     stk_.push_back(Frame{cur, 256, 0, 0});  // subtree < target → pop router
+                     return false;
+                  }
+                  depth += PP.size();
                }
-               depth += PP.size();
             }
             if (depth == key.size())  // key ends at this router
             {
@@ -1992,7 +2050,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (from < 0)
                return false;
             return t_->with_router(node,
-                                   [&](auto* n) noexcept { return router_prev(n, from, ob, oc); });
+                                   [&](auto* n, uint16_t pres) noexcept { return router_prev(n, pres, from, ob, oc); });
          }
          // Position at the RIGHTMOST terminal under `child` (the mirror of descend_ +
          // seek_: order at a node is [term] < children ascending, so rightmost = last
@@ -2066,18 +2124,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      if (maintain_) key_.len = cb;
                      return;
                   }
-                  default:  // byte routers (setlist / c2 / c4 / c8 / node_full)
+                  default:  // byte routers (setlist / c2 / c4 / c8 / node_full / pfxd)
                   {
-                     const router_hdr* rh = static_cast<const router_hdr*>(deref_(child));
-                     uint32_t          cb = uint32_t(base);
+                     uint32_t cb = uint32_t(base);
                      if (maintain_)
                      {
                         key_.len = base;
-                        if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
-                           key_.append(static_cast<const setlist*>(deref_(child))->prefix,
-                                       rh->hdr.prefix_len);
-                        else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
-                           key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+                        const uint8_t* pb;
+                        if (const unsigned pl = t_->router_prefix(child, pb)) key_.append(pb, pl);
                         cb = uint32_t(key_.len);
                      }
                      uint8_t    bb;
@@ -2102,7 +2156,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      }
                      stk_.push_back(Frame{child, 0, uint32_t(base), cb});  // childless: term only
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
-                     emit_(rh->term);
+                     emit_(t_->router_term(child));
                      if (maintain_) key_.len = cb;
                      return;
                   }
@@ -2184,23 +2238,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   }
                   default:  // byte routers (setlist / c2 / c4 / c8 / node_full / pfxd)
                   {
-                     const router_hdr* rh = static_cast<const router_hdr*>(deref_(child));
-                     uint32_t          cb = uint32_t(base);
+                     uint32_t cb = uint32_t(base);
                      if (maintain_)
                      {
                         key_.len = base;
-                        if (child.tag() == K::setlist_u8 && rh->hdr.prefix_len)
-                           key_.append(static_cast<const setlist*>(deref_(child))->prefix,
-                                       rh->hdr.prefix_len);
-                        else if (child.tag() == K::pfxd && rh->hdr.prefix_len)
-                           key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+                        const uint8_t* pb;
+                        if (const unsigned pl = t_->router_prefix(child, pb)) key_.append(pb, pl);
                         cb = uint32_t(key_.len);
                      }
-                     if (!rh->term.is_null())  // term < children
+                     if (const packed_ptr tm = t_->router_term(child); !tm.is_null())  // term < children
                      {
                         stk_.push_back(Frame{child, 0, uint32_t(base), cb});  // term consumed; children remain
                         sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
-                        emit_(rh->term);
+                        emit_(tm);
                         if (maintain_) key_.len = cb;
                         return;
                      }
@@ -2227,7 +2277,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      // termless AND childless — degenerate/unreachable; mirror descend_max_
                      stk_.push_back(Frame{child, 0, uint32_t(base), cb});
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
-                     emit_(rh->term);
+                     emit_(t_->router_term(child));
                      if (maintain_) key_.len = cb;
                      return;
                   }
@@ -2289,7 +2339,6 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   continue;
                }
                // byte routers
-               const router_hdr* rh = static_cast<const router_hdr*>(deref_(f.node));
                if (f.cur >= 1)  // current = child at byte cur-1
                {
                   uint8_t    bb;
@@ -2311,11 +2360,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      descend_max_(child, maintain_ ? size_t(key_.len) : 0);
                      return;
                   }
-                  if (!rh->term.is_null())  // the term precedes the first child
+                  if (const packed_ptr tm = t_->router_term(f.node); !tm.is_null())  // term precedes children
                   {
                      f.cur = 0;
                      sfx_ = nullptr; sfxlen_ = 0; full_str_ = nullptr;
-                     emit_(rh->term);
+                     emit_(tm);
                      if (maintain_) key_.len = f.cbase;
                      return;
                   }
@@ -2451,10 +2500,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   fr.cbase = uint32_t(key_.len);
                   if (fr.cur >= 1) key_.push(uint8_t(fr.cur - 1));
                }
-               else if (k == K::pfxd)  // fused prefix, then the edge byte like a full
+               else if (k == K::pfxd)  // fused prefix (in the tail), then the edge byte like a full
                {
-                  const router_hdr* rh = static_cast<const router_hdr*>(deref_(fr.node));
-                  if (rh->hdr.prefix_len) key_.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+                  const node_full* f = static_cast<const node_full*>(deref_(fr.node));
+                  if (const unsigned pl = pfxd_plen(f, fr.node.meta()))
+                     key_.append(pfxd_pfx(f, fr.node.meta()), pl);
                   fr.cbase = uint32_t(key_.len);
                   if (fr.cur >= 1) key_.push(uint8_t(fr.cur - 1));
                }
@@ -2910,7 +2960,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                const uint16_t pl = pn_plen(P);
                if (const packed_ptr nx = pn_next<Ptr>(P);  // lazy fusion, as in insert_
                    (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
-                   (nx.tag() == K::pfxd && pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
+                   (nx.tag() == K::pfxd &&
+                    pl + pfxd_plen(static_cast<node_full*>(deref_(nx)), nx.meta()) <= node_full::PFX_CAP))
                {
                   packed_ptr fused = make_prefix(
                       std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
@@ -2973,12 +3024,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                gc.release();
                return pl ? make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), w) : w;
             }
-            case K::pfxd:  // consume the fused prefix, then route as the dense default
+            case K::pfxd:  // consume the fused prefix (from the tail), then route as full
             {
-               void*          n  = deref_(node);
-               const unsigned pl = pfxd_plen(n);
-               const size_t   c  = lcp(
-                   std::string_view(reinterpret_cast<const char*>(pfxd_pfx(n)), pl),
+               node_full*     f    = static_cast<node_full*>(deref_(node));
+               const uint16_t pres = node.meta();
+               const unsigned pl   = pfxd_plen(f, pres);
+               const size_t   c    = lcp(
+                   std::string_view(reinterpret_cast<const char*>(pfxd_pfx(f, pres)), pl),
                    key.substr(depth));
                if (c < pl)
                {
@@ -2988,9 +3040,39 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   });
                }
                depth += pl;
-               [[fallthrough]];
+               if (depth == key.size())
+                  return full_set_or_update_term<Assign>(node, std::forward<VF>(val), ins);
+               const uint8_t byte = uint8_t(key[depth]);
+               if (packed_ptr* cs = router_find_slot(node, byte))
+               {
+                  *cs = bkt_put<Assign>(*cs, key, depth + 1, std::forward<VF>(val), ins);
+                  return node;
+               }
+               ins              = true;
+               packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
+               build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
+               packed_ptr w     = widen_set_(node, byte, child);  // sparse_full grow
+               gc.release();
+               return w;
             }
-            default:  // c2 / c4 / c8 / node_full — no inline prefix
+            case K::node_full:  // headerless full: a term needs a tail (reallocs to pfxd)
+            {
+               if (depth == key.size())
+                  return full_set_or_update_term<Assign>(node, std::forward<VF>(val), ins);
+               const uint8_t byte = uint8_t(key[depth]);
+               if (packed_ptr* cs = router_find_slot(node, byte))
+               {
+                  *cs = bkt_put<Assign>(*cs, key, depth + 1, std::forward<VF>(val), ins);
+                  return node;
+               }
+               ins              = true;
+               packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
+               build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
+               packed_ptr w     = widen_set_(node, byte, child);  // sparse_full grow
+               gc.release();
+               return w;
+            }
+            default:  // c2 / c4 / c8 — no inline prefix, term lives in the router_hdr
             {
                router_hdr* rh = static_cast<router_hdr*>(deref_(node));
                if (depth == key.size()) { ins = set_or_update_term<Assign>(rh, std::forward<VF>(val)); return node; }
@@ -3062,13 +3144,23 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          for (;;)  // a de-widened node is re-evaluated once as a setlist
          {
-            const packed_ptr nd = *slot;
-            const K          k  = nd.tag();
+            const packed_ptr nd     = *slot;
+            const K          k      = nd.tag();
             if (k == K::prefix_node || !is_router(k))
                return false;
-            router_hdr*    rh = static_cast<router_hdr*>(deref_(nd));
-            const unsigned nb = rh->hdr.nbranch;
-            const bool     tm = !rh->term.is_null();
+            const bool       isfull = (k == K::node_full || k == K::pfxd);
+            // HEADERLESS node_full/pfxd carry no router_hdr: nbranch is summed across the
+            // range lines, term/prefix come from the handle-located tail. Other tiers read
+            // their router_hdr directly. (`rh` is null for node_full/pfxd — never deref'd.)
+            router_hdr*    rh = isfull ? nullptr : static_cast<router_hdr*>(deref_(nd));
+            node_full*     fn = isfull ? static_cast<node_full*>(deref_(nd)) : nullptr;
+            const uint16_t pres = nd.meta();
+            const unsigned nb = isfull ? full_nbranch(fn, pres) : unsigned(rh->hdr.nbranch);
+            const packed_ptr term = router_term(nd);
+            const bool       tm   = !term.is_null();
+            // The fused/inline prefix (node_full/pfxd via tail, setlist via inline).
+            const uint8_t*   pfxb = nullptr;
+            const unsigned   pfxl = router_prefix(nd, pfxb);
             if (nb == 0)
             {
                if (!tm)
@@ -3079,26 +3171,20 @@ namespace detail  // implementation types & node helpers — not part of the pub
                // Only payload is a key ending HERE: the term handle (an empty-suffix leaf /
                // inline value) replaces the router. An inline prefix (setlist or fused) is
                // part of that key's path — it must survive as a prefix node above the term.
-               if (k == K::setlist_u8 || k == K::pfxd)
+               if (pfxl)
                {
-                  if (const unsigned pl = rh->hdr.prefix_len)
+                  try
                   {
-                     const uint8_t* pb = k == K::pfxd
-                                             ? pfxd_pfx(rh)
-                                             : static_cast<const setlist*>(deref_(nd))->prefix;
-                     try
-                     {
-                        *slot = make_prefix(
-                            std::string_view(reinterpret_cast<const char*>(pb), pl), rh->term);
-                        rm_free_(nd);
-                     }
-                     catch (...)
-                     {
-                     }  // OOM: keep the router
-                     return false;
+                     *slot = make_prefix(
+                         std::string_view(reinterpret_cast<const char*>(pfxb), pfxl), term);
+                     rm_free_(nd);
                   }
+                  catch (...)
+                  {
+                  }  // OOM: keep the router
+                  return false;
                }
-               *slot = rh->term;
+               *slot = term;
                rm_free_(nd);
                return false;
             }
@@ -3128,11 +3214,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                }
                else  // cN/full/pfxd: fused prefix (if any) ++ the lone child's byte
                {
-                  if (k == K::pfxd)
-                  {
-                     pl = rh->hdr.prefix_len;
-                     std::memcpy(pfx, pfxd_pfx(rh), pl);
-                  }
+                  std::memcpy(pfx, pfxb, pfxl);  // pfxl==0 for cN / plain full
+                  pl               = pfxl;
                   packed_ptr child = packed_ptr::null();
                   router_for_each(nd, [&](uint8_t bb, packed_ptr br) {
                      pfx[pl] = bb;
@@ -3144,23 +3227,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return false;
             }
             if (nb <= unsigned(SHRINK_MAX) && k != K::setlist_u8 && k != K::setlist_u16 &&
-                !(k == K::pfxd && rh->hdr.prefix_len > setlist::PREFIX_CAP))  // prefix must ride
+                !(k == K::pfxd && pfxl > setlist::PREFIX_CAP))  // prefix must ride
             {
                try  // sparse dense node: de-widen back to one cacheline (best-effort)
                {
-                  setlist* s2         = new_setlist();
-                  s2->rh.term         = rh->term;
-                  s2->rh.hdr.has_term = rh->hdr.has_term;
+                  setlist* s2 = new_setlist();
+                  if (tm) { s2->rh.term = term; s2->rh.hdr.has_term = 1; }
                   router_for_each(nd, [&](uint8_t bb, packed_ptr br) {
                      const bool ok = setlist_set(s2, bb, br);
                      assert(ok && "SHRINK_MAX <= setlist CAP");
                      (void)ok;
                   });
-                  if (k == K::pfxd)  // the fused prefix rides into the setlist's inline slot
+                  if (pfxl)  // the fused prefix rides into the setlist's inline slot
                   {
-                     const unsigned pl = rh->hdr.prefix_len;
-                     std::memcpy(s2->prefix, pfxd_pfx(rh), pl);
-                     s2->rh.hdr.prefix_len = pl;
+                     std::memcpy(s2->prefix, pfxb, pfxl);
+                     s2->rh.hdr.prefix_len = pfxl;
                   }
                   *slot = pack_(s2, K::setlist_u8);
                   rm_free_(nd);
@@ -3329,15 +3410,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
                case K::pfxd:
                {
                   const K ck = cur.tag();
-                  if (ck == K::setlist_u8 || ck == K::pfxd)  // kinds with an inline prefix
-                  {
-                     const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-                     const unsigned    pl = rh->hdr.prefix_len;
-                     if (pl)
+                  {  // kinds with an inline/fused prefix (setlist_u8 / pfxd)
+                     const uint8_t* pb;
+                     if (const unsigned pl = router_prefix(cur, pb))
                      {
-                        const uint8_t* pb = ck == K::pfxd
-                                                ? pfxd_pfx(rh)
-                                                : static_cast<const setlist*>(deref_(cur))->prefix;
                         if (key.size() - depth < pl ||
                             std::memcmp(pb, key.data() + depth, pl) != 0)
                            return false;
@@ -3381,7 +3457,34 @@ namespace detail  // implementation types & node helpers — not part of the pub
             __builtin_unreachable();
          rm_term:  // the key ends AT this router: drop its term, then shrink from this level
          {
-            router_hdr* rh = static_cast<router_hdr*>(deref_(*slot));
+            const packed_ptr cur = *slot;
+            const K          k   = cur.tag();
+            if (k == K::node_full)
+               return false;  // headerless node_full carries no term
+            if (k == K::pfxd)
+            {
+               node_full_tail* tl = full_tail(static_cast<node_full*>(deref_(cur)), cur.meta());
+               if (!tl->hdr.has_term)
+                  return false;
+               if (tl->term.tag() == K::value_ptr)  // leaf("",v); inline term frees nothing
+                  free_leaf(static_cast<char*>(deref_term_(tl->term)));
+               tl->term         = packed_ptr::null();
+               tl->hdr.has_term = 0;
+               // No term and no fused prefix → the tail is dead weight: realloc to node_full.
+               if (tl->hdr.prefix_len == 0)
+               {
+                  try { *slot = full_drop_tail_(cur); }
+                  catch (...) {}  // OOM: keep the (term-less) pfxd; still correct
+               }
+               --count_;
+               if (rm_shrink_(slot))
+               {
+                  if (n >= 2) rm_unwind_(path, n, n - 2);
+                  else root_ = packed_ptr::null();
+               }
+               return true;
+            }
+            router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
             if (rh->term.is_null())
                return false;
             if (rh->term.tag() == K::value_ptr)  // leaf("",v); an inline term has nothing to free
@@ -3560,11 +3663,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             case K::pfxd:  // fused prefixes must agree, then compare as the dense router
             {
-               const router_hdr* RA = static_cast<const router_hdr*>(deref_(a));
-               const router_hdr* RB = static_cast<const router_hdr*>(tb.deref_(b));
-               const unsigned    pa = RA->hdr.prefix_len, pb = RB->hdr.prefix_len;
-               const unsigned    m  = pa < pb ? pa : pb;
-               if (m && std::memcmp(pfxd_pfx(RA), pfxd_pfx(RB), m) != 0) return 0;
+               const node_full* FA = static_cast<const node_full*>(deref_(a));
+               const node_full* FB = static_cast<const node_full*>(tb.deref_(b));
+               const unsigned   pa = pfxd_plen(FA, a.meta()), pb = pfxd_plen(FB, b.meta());
+               const unsigned   m  = pa < pb ? pa : pb;
+               if (m && std::memcmp(pfxd_pfx(FA, a.meta()), pfxd_pfx(FB, b.meta()), m) != 0) return 0;
                if (pa != pb) return -1;  // same bytes, different carving → undecided
                [[fallthrough]];
             }
@@ -3573,10 +3676,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c8:
             case K::node_full:
             {
-               const router_hdr* RA = static_cast<const router_hdr*>(deref_(a));
-               const router_hdr* RB = static_cast<const router_hdr*>(tb.deref_(b));
-               if (RA->hdr.nbranch != RB->hdr.nbranch) return 0;
-               if (eq_value_(RA->term, tb, RB->term) == 0) return 0;
+               // HEADERLESS: child count summed from the range lines; term from the tail/hdr.
+               const unsigned na = (ka == K::node_full || ka == K::pfxd)
+                                       ? full_nbranch(static_cast<const node_full*>(deref_(a)), a.meta())
+                                       : static_cast<const router_hdr*>(deref_(a))->hdr.nbranch;
+               const unsigned nbb = (ka == K::node_full || ka == K::pfxd)
+                                        ? full_nbranch(static_cast<const node_full*>(tb.deref_(b)), b.meta())
+                                        : static_cast<const router_hdr*>(tb.deref_(b))->hdr.nbranch;
+               if (na != nbb) return 0;
+               if (eq_value_(router_term(a), tb, tb.router_term(b)) == 0) return 0;
                int res = 1;
                router_for_each(a, [&](uint8_t e, packed_ptr ca) {
                   if (res != 1) return;
@@ -3666,12 +3774,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::bucket:       return 0;  // census doesn't descend buckets
             case K::null:         return 0;  // exhaustive (no default)
          }
-         const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-         const bool        noterm = rh->term.is_null();
+         const K          kk     = cur.tag();
+         const bool       isfull = (kk == K::node_full || kk == K::pfxd);
+         const packed_ptr term   = router_term(cur);
+         const bool       noterm = term.is_null();
          {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode branches
-            const unsigned nb = rh->hdr.nbranch;
-            const K        kk = cur.tag();
-            if (kk == K::node_full || kk == K::pfxd)
+            const unsigned nb = isfull ? full_nbranch(static_cast<const node_full*>(deref_(cur)), cur.meta())
+                                       : static_cast<const router_hdr*>(deref_(cur))->hdr.nbranch;
+            if (isfull)
             {
                d.full_nbr_sum += nb;
                d.full_lt48 += (nb < 48);
@@ -3684,7 +3794,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                d.cn_nbr_sum += nb;
          }
          if (parent_noterm_router) ++d.collapsible;
-         uint64_t sub = dbg_walk(rh->term, d, depth + 1, routers_above + 1, false);
+         uint64_t sub = dbg_walk(term, d, depth + 1, routers_above + 1, false);
          router_for_each(cur, [&](uint8_t, packed_ptr br) {
             sub += dbg_walk(br, d, depth + 1, routers_above + 1, noterm);
          });
@@ -3781,8 +3891,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             default:
             {
-               const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-               if (!rh->term.is_null()) { T tmp; f(*val_of_(rh->term, tmp)); }
+               if (const packed_ptr tm = router_term(cur); !tm.is_null()) { T tmp; f(*val_of_(tm, tmp)); }
                auto recurse = [&](uint8_t, packed_ptr ch) { walk_v_(ch, f); };
                switch (k)
                {
@@ -3805,12 +3914,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
                   case K::c4: cnode_for_each(static_cast<const cnode<4>*>(deref_(cur)), recurse); break;
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
-                  default:  // node_full / pfxd (both deref to a node_full)
+                  default:  // node_full / pfxd (both deref to a headerless node_full)
                   {
-                     const node_full* fn = static_cast<const node_full*>(deref_(cur));
+                     const node_full* fn   = static_cast<const node_full*>(deref_(cur));
+                     const uint16_t   pres = cur.meta();
                      for (int byte = 0; byte < 256; ++byte)
                      {
-                        packed_ptr ch = full_find(fn, uint8_t(byte));
+                        packed_ptr ch = full_find(fn, pres, uint8_t(byte));
                         if (!ch.is_null()) walk_v_(ch, f);
                      }
                      break;
@@ -3873,15 +3983,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             default:  // routers
             {
-               const router_hdr* rh   = static_cast<const router_hdr*>(deref_(cur));
-               const size_t      base = key.len;
-               if (k == K::setlist_u8 && rh->hdr.prefix_len)
-                  key.append(static_cast<const setlist*>(deref_(cur))->prefix, rh->hdr.prefix_len);
-               else if (k == K::pfxd && rh->hdr.prefix_len)
-                  key.append(pfxd_pfx(rh), rh->hdr.prefix_len);
+               const size_t   base = key.len;
+               const uint8_t* pb;
+               if (const unsigned pl = router_prefix(cur, pb)) key.append(pb, pl);
                const size_t cb = key.len;
-               if (!rh->term.is_null())
-                  call_val_(key.view(), rh->term, f);  // key ends here (path + prefix)
+               if (const packed_ptr tm = router_term(cur); !tm.is_null())
+                  call_val_(key.view(), tm, f);  // key ends here (path + prefix)
                auto recurse = [&](uint8_t byte, packed_ptr ch) {
                   key.push(byte);
                   walk_(ch, key, f);
@@ -3910,10 +4017,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   case K::c8: cnode_for_each(static_cast<const cnode<8>*>(deref_(cur)), recurse); break;
                   default:
                   {
-                     const node_full* fn = static_cast<const node_full*>(deref_(cur));
+                     const node_full* fn   = static_cast<const node_full*>(deref_(cur));
+                     const uint16_t   pres = cur.meta();
                      for (int byte = 0; byte < 256; ++byte)
                      {
-                        packed_ptr ch = full_find(fn, uint8_t(byte));
+                        packed_ptr ch = full_find(fn, pres, uint8_t(byte));
                         if (!ch.is_null()) recurse(uint8_t(byte), ch);
                      }
                      break;
@@ -3956,7 +4064,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      return bkt_val(const_cast<char*>(e));
                return nullptr;
             }
-            T* term(const router_hdr* rh) const { return of_term(rh->term); }
+            T* term(packed_ptr t) const { return of_term(t); }
             T* miss() const { return nullptr; }
          };
          return descend_read(key, op_t{this});
@@ -4055,11 +4163,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             copy_value(out, leaf_val(static_cast<const char*>(deref_term_(v))));
       }
-      bool read_term(const router_hdr* rh, T& out) const
+      bool read_term(packed_ptr t, T& out) const
       {
-         if (rh->term.is_null())
+         if (t.is_null())
             return false;
-         read_value(rh->term, out);
+         read_value(t, out);
          return true;
       }
 
@@ -4274,44 +4382,53 @@ namespace detail  // implementation types & node helpers — not part of the pub
             return make_leaf_full(pfx, suf, std::forward<VF>(val));
          return make_leaf(suf, std::forward<VF>(val));
       }
-      // ── pfxd: the in-header prefix (the tag is a hint, not a type) ──────────────
-      // A K::pfxd handle says only "the header cacheline carries a prefix you must
-      // consume"; the node's REAL kind is recorded in the header itself. Today the
-      // node_full is the kind with header capacity (its CL0 was pure padding); cN and
-      // wide setlists keep prefix_node as their overflow. Layout behind a pfxd handle:
-      //   CL0: router_hdr | u16 presence | kind (u8) | prefix bytes (rh.hdr.prefix_len of them)
-      //   tail: popcount(presence) range lines (sparse_full body). The kind byte + prefix
-      //   live PAST the presence vector (node_full::PFX_OFF), so pfxd reads CL0 once for
-      //   prefix + presence + term, then the routed range line is a later line of the node.
-      static K pfxd_kind(const void* n) noexcept
+      // ── pfxd: the fused prefix + term, in the node's TAIL cacheline ─────────────
+      // A K::pfxd is a headerless node_full body (popcount(presence) range lines) PLUS
+      // one trailing tail cacheline holding the optional term and the fused prefix. The
+      // handle's metadata carries presence; has_tail mirrors the kind. These accessors
+      // resolve the tail from (node base, presence): tail = node + popcount(presence)*128.
+      static uint8_t* pfxd_pfx(node_full* n, uint16_t presence) noexcept
       {
-         return K(static_cast<const uint8_t*>(n)[node_full::PFX_OFF]);
+         return full_tail<Ptr>(n, presence)->prefix;
       }
-      static uint8_t* pfxd_pfx(void* n) noexcept
+      static const uint8_t* pfxd_pfx(const node_full* n, uint16_t presence) noexcept
       {
-         return static_cast<uint8_t*>(n) + node_full::PFX_OFF + 1;
+         return full_tail<Ptr>(n, presence)->prefix;
       }
-      static const uint8_t* pfxd_pfx(const void* n) noexcept
+      static unsigned pfxd_plen(const node_full* n, uint16_t presence) noexcept
       {
-         return static_cast<const uint8_t*>(n) + node_full::PFX_OFF + 1;
+         return full_tail<Ptr>(n, presence)->hdr.prefix_len;
       }
-      static unsigned pfxd_plen(const void* n) noexcept
+      // Re-anchor a node_full → pfxd: REALLOCATE the range-line block with one extra tail
+      // cacheline, copy the range lines verbatim, zero-init the tail (no term, empty prefix).
+      // Returns the new handle (same presence meta, has_tail set, tag K::pfxd). Throws on OOM
+      // → the original node is left untouched.
+      packed_ptr full_add_tail_(packed_ptr cur)
       {
-         return static_cast<const router_hdr*>(n)->hdr.prefix_len;
+         node_full*     of   = static_cast<node_full*>(deref_(cur));
+         const uint16_t pres = cur.meta();
+         const unsigned nr   = unsigned(std::popcount(pres));
+         node_full*     nf   = ::new (node_alloc_(size_t(nr + 1) * cacheline_bytes)) node_full;
+         std::memcpy(static_cast<void*>(nf), static_cast<const void*>(of),
+                     size_t(nr) * cacheline_bytes);
+         node_full_tail* tl = full_tail(nf, pres);
+         tl->hdr            = node_hdr{0, 0, 0};
+         tl->term           = packed_ptr::null();
+         node_free_(of, full_node_bytes(pres, false));
+         return pack_(nf, K::pfxd).with_meta(pres).with_tail(true);
       }
-      // Drop a consumed/shortened fused prefix in place; returns the handle to use
-      // (retags back to the real kind when the prefix empties — header no longer needed).
-      packed_ptr pfxd_set_prefix(void* n, const uint8_t* bytes, unsigned pl)
+      // Re-anchor a pfxd → node_full: REALLOCATE dropping the tail (caller guarantees the tail
+      // holds no term and no prefix). Returns the new handle (same presence, has_tail clear).
+      packed_ptr full_drop_tail_(packed_ptr cur)
       {
-         router_hdr* rh = static_cast<router_hdr*>(n);
-         if (pl == 0)
-         {
-            rh->hdr.prefix_len = 0;
-            return pack_(n, pfxd_kind(n));
-         }
-         std::memmove(pfxd_pfx(n), bytes, pl);  // bytes may alias the tail of the old prefix
-         rh->hdr.prefix_len = pl & 0x3F;
-         return pack_(n, K::pfxd);
+         node_full*     of   = static_cast<node_full*>(deref_(cur));
+         const uint16_t pres = cur.meta();
+         const unsigned nr   = unsigned(std::popcount(pres));
+         node_full*     nf   = ::new (node_alloc_(size_t(nr) * cacheline_bytes)) node_full;
+         std::memcpy(static_cast<void*>(nf), static_cast<const void*>(of),
+                     size_t(nr) * cacheline_bytes);
+         node_free_(of, full_node_bytes(pres, true));
+         return pack_(nf, K::node_full).with_meta(pres).with_tail(false);
       }
 
       // Attach a shared prefix above `next`. The prefix lives in the TARGET's header
@@ -4324,18 +4441,24 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (pfx.empty())
             return next;
          const K nk = next.tag();
-         if (nk == K::node_full || (nk == K::pfxd && pfxd_kind(deref_(next)) == K::node_full))
+         if (nk == K::node_full || nk == K::pfxd)
          {
-            node_full*     f  = static_cast<node_full*>(deref_(next));
-            const unsigned pl = f->rh.hdr.prefix_len;  // 0 for plain node_full
+            // Fuse into the node's tail: a node_full first gains a tail (realloc, re-anchor),
+            // then we PREPEND pfx before any existing fused prefix. Falls back to a dedicated
+            // prefix_node only when the combined prefix exceeds the tail's capacity.
+            const uint16_t  pres = next.meta();
+            const unsigned  pl   = nk == K::pfxd ? pfxd_plen(static_cast<node_full*>(deref_(next)), pres) : 0;
             if (pfx.size() + pl <= node_full::PFX_CAP)
             {
-               uint8_t* pb = f->hdr + 1;
+               if (nk == K::node_full)
+                  next = full_add_tail_(next);  // throws → unchanged; re-anchors to pfxd
+               node_full*      f  = static_cast<node_full*>(deref_(next));
+               node_full_tail* tl = full_tail(f, pres);
+               uint8_t*        pb = tl->prefix;
                std::memmove(pb + pfx.size(), pb, pl);  // prepend before any existing
                std::memcpy(pb, pfx.data(), pfx.size());
-               f->hdr[0]            = uint8_t(K::node_full);
-               f->rh.hdr.prefix_len = uint16_t(pfx.size() + pl) & 0x3F;
-               return pack_(f, K::pfxd);
+               tl->hdr.prefix_len = uint16_t(pfx.size() + pl) & 0x3F;
+               return next;  // already tagged K::pfxd with presence meta + has_tail
             }
          }
          char*    p  = static_cast<char*>(node_alloc_(pn_size<Ptr>(pfx.size())));
@@ -4391,14 +4514,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
             const K          ck = c.tag();
             if (ck == K::setlist_u16 || !is_router(ck))  // 2-byte child or leaf/term/bucket/prefix
                return;
-            const router_hdr* crh = static_cast<const router_hdr*>(deref_(c));
-            if (!crh->term.is_null())                    // a key ends 1 byte in → not representable
+            // HEADERLESS-aware: term/prefix/nbranch via the handle (node_full/pfxd carry no
+            // router_hdr; a plain node_full has neither term nor prefix).
+            const bool isfull = (ck == K::node_full || ck == K::pfxd);
+            if (!router_term(c).is_null())               // a key ends 1 byte in → not representable
                return;
-            if ((ck == K::setlist_u8 || ck == K::pfxd) && crh->hdr.prefix_len != 0)
+            const uint8_t* pb;
+            if (router_prefix(c, pb) != 0)
                return;  // an inline (or fused) prefix is not representable in the wide node
             if (ck == K::setlist_u8 && sl_inl_active(static_cast<setlist*>(deref_(c))))
                return;  // child's inline leaves can't move into the u16 — skip fusion
-            total += crh->hdr.nbranch;
+            total += isfull ? int(full_nbranch(static_cast<const node_full*>(deref_(c)), c.meta()))
+                            : int(static_cast<const router_hdr*>(deref_(c))->hdr.nbranch);
             if (total > FUSE_THRESH)
                return;
          }
@@ -4482,6 +4609,46 @@ namespace detail  // implementation types & node helpers — not part of the pub
          rh->hdr.has_term = 1;
       }
 
+      // Insert-or-update a node_full / pfxd term — HEADERLESS: the term lives in the pfxd
+      // tail, so adding a term to a plain K::node_full first REALLOCATES it to a pfxd (a
+      // fresh tail), re-anchoring the handle. Returns the (possibly new) handle in `cur`/the
+      // return value; `ins` is set true iff a NEW term was added. The value is built BEFORE
+      // any realloc so a throw leaves the node unchanged (strong exception safety).
+      template <bool Assign, class VF>
+      packed_ptr full_set_or_update_term(packed_ptr cur, VF&& val, bool& ins)
+      {
+         if (cur.tag() == K::node_full)  // no tail yet → must grow one
+         {
+            packed_ptr tv = make_value(std::string_view{}, std::forward<VF>(val));  // throws → unchanged
+            build_guard gt{this, &tv};
+            cur = full_add_tail_(cur);  // throws → tv reclaimed, original node intact
+            gt.release();
+            node_full_tail* tl = full_tail(static_cast<node_full*>(deref_(cur)), cur.meta());
+            tl->term           = tv;
+            tl->hdr.has_term   = 1;
+            ins                = true;
+            return cur;
+         }
+         // pfxd: a tail already exists.
+         node_full_tail* tl = full_tail(static_cast<node_full*>(deref_(cur)), cur.meta());
+         if (tl->hdr.has_term)  // present: overwrite (insert) or leave (emplace)
+         {
+            if constexpr (Assign)
+            {
+               if (tl->term.tag() == K::value_inline)
+                  tl->term = pack_inline(vf_make(std::forward<VF>(val)));
+               else
+                  vf_assign(std::forward<VF>(val), leaf_val(static_cast<char*>(deref_term_(tl->term))));
+            }
+            ins = false;
+            return cur;
+         }
+         tl->term         = make_value(std::string_view{}, std::forward<VF>(val));  // throws → unchanged
+         tl->hdr.has_term = 1;
+         ins              = true;
+         return cur;
+      }
+
       // ── router dispatch over the tier family {setlist, c2, c4, c8, node_full} ───
       // FIXED-size kinds only: node_full / pfxd are now PER-NODE (128 + popcount*128),
       // so they must be sized from the node via node_bytes_(handle), not from the tag.
@@ -4509,31 +4676,32 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          const K k = nd.tag();
          if (k == K::node_full || k == K::pfxd)
-            return full_node_bytes<Ptr>(static_cast<const node_full*>(deref_(nd)));
+            return full_node_bytes(nd.meta(), k == K::pfxd);
          return node_size(k);
       }
-      // ONE typed visitor for the byte-router family: switch on the tag once, hand the
-      // TYPED node to f. Every byte-router dispatcher below is a packed_ptr -> typed-overload
-      // one-liner over this, so tag exhaustiveness lives in exactly one switch (u16 is not a
-      // byte router; the callers that can see one handle it first).
+      // ONE typed visitor for the byte-router family: switch on the tag once, hand the TYPED
+      // node AND its presence (the handle's metadata — needed by the headerless node_full /
+      // pfxd; ignored by the others) to f. Every byte-router dispatcher below is a packed_ptr
+      // -> typed-overload one-liner over this, so tag exhaustiveness lives in exactly one
+      // switch (u16 is not a byte router; the callers that can see one handle it first).
       // always_inline + noexcept propagation: the typed switch must dissolve into each
       // dispatcher exactly as the hand-written switches did — an outlined call (or a
       // may-throw edge inside the noexcept dispatchers) would bloat every caller with
       // EH/terminate scaffolding. Verified per-function asm-identical against those.
       template <class F>
       [[gnu::always_inline]] decltype(auto) with_router(packed_ptr cur, F&& f) const noexcept(
-          std::is_nothrow_invocable_v<F&, setlist*>)
+          std::is_nothrow_invocable_v<F&, setlist*, uint16_t>)
       {
+         const uint16_t pres = cur.meta();
          switch (cur.tag())
          {
-            case K::pfxd:  // hint tag: real kind in the header — node_full today, and the
-                           // body offsets are identical, so the typed view is the full's
-               return f(static_cast<node_full*>(deref_(cur)));
-            case K::setlist_u8: return f(static_cast<setlist*>(deref_(cur)));
-            case K::c2:         return f(static_cast<cnode<2>*>(deref_(cur)));
-            case K::c4:         return f(static_cast<cnode<4>*>(deref_(cur)));
-            case K::c8:         return f(static_cast<cnode<8>*>(deref_(cur)));
-            case K::node_full:  return f(static_cast<node_full*>(deref_(cur)));
+            case K::pfxd:  // headerless full body + a tail; presence in the handle metadata
+               return f(static_cast<node_full*>(deref_(cur)), pres);
+            case K::setlist_u8: return f(static_cast<setlist*>(deref_(cur)), pres);
+            case K::c2:         return f(static_cast<cnode<2>*>(deref_(cur)), pres);
+            case K::c4:         return f(static_cast<cnode<4>*>(deref_(cur)), pres);
+            case K::c8:         return f(static_cast<cnode<8>*>(deref_(cur)), pres);
+            case K::node_full:  return f(static_cast<node_full*>(deref_(cur)), pres);
             // exhaustive (no default): a new K must be decided here — and only here.
             case K::value_ptr: case K::value_inline: case K::prefix_node:
             case K::setlist_u16: case K::bucket: case K::null:
@@ -4541,16 +4709,54 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
       }
 
-      // byte -> child (read step), per tier and dispatched.
-      static packed_ptr router_find(setlist* s, uint8_t byte) noexcept { return setlist_find(s, byte); }
+      // The term handle of ANY router (null when there is no term). For setlist/setlist16/cN
+      // it lives in the node's router_hdr; for a headerless node_full there is NO term; for a
+      // pfxd it lives in the tail (presence-located from the handle). Used by the structural
+      // walkers/iterators that emit a router's "key ends here" terminal.
+      packed_ptr router_term(packed_ptr cur) const noexcept
+      {
+         const K k = cur.tag();
+         if (k == K::node_full)
+            return packed_ptr::null();
+         if (k == K::pfxd)
+         {
+            const node_full_tail* tl = full_tail(static_cast<const node_full*>(deref_(cur)), cur.meta());
+            return tl->hdr.has_term ? tl->term : packed_ptr::null();
+         }
+         return static_cast<const router_hdr*>(deref_(cur))->term;
+      }
+      // The fused/inline prefix of a router (length 0 for kinds that carry none). pb points at
+      // the bytes, valid while the node lives. setlist_u8 → inline prefix; pfxd → tail prefix.
+      unsigned router_prefix(packed_ptr cur, const uint8_t*& pb) const noexcept
+      {
+         const K k = cur.tag();
+         if (k == K::setlist_u8)
+         {
+            const setlist* s = static_cast<const setlist*>(deref_(cur));
+            pb               = s->prefix;
+            return s->rh.hdr.prefix_len;
+         }
+         if (k == K::pfxd)
+         {
+            const node_full* f = static_cast<const node_full*>(deref_(cur));
+            pb                 = pfxd_pfx(f, cur.meta());
+            return pfxd_plen(f, cur.meta());
+         }
+         pb = nullptr;
+         return 0;
+      }
+
+      // byte -> child (read step), per tier and dispatched. The `presence` arg is the
+      // handle's metadata: live for node_full/pfxd, ignored by the fixed-shape tiers.
+      static packed_ptr router_find(setlist* s, uint16_t, uint8_t byte) noexcept { return setlist_find(s, byte); }
       template <int N>
-      static packed_ptr router_find(cnode<N>* c, uint8_t byte) noexcept { return cnode_step(c, byte); }
-      static packed_ptr router_find(node_full* f, uint8_t byte) noexcept { return full_find(f, byte); }
+      static packed_ptr router_find(cnode<N>* c, uint16_t, uint8_t byte) noexcept { return cnode_step(c, byte); }
+      static packed_ptr router_find(node_full* f, uint16_t pres, uint8_t byte) noexcept { return full_find(f, pres, byte); }
 
       // First child with byte >= from (iterator stepping). Each tier resumes from its own
       // structure — sorted stems, presence-bitmap ctz, nset line skip — instead of probing
-      // every byte through a find.
-      static bool router_next(setlist* s, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      // every byte through a find. `presence` is the handle metadata (live for node_full).
+      static bool router_next(setlist* s, uint16_t, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          // bytes[] sorted ascending ⇒ "first index >= from" == "count of bytes < from".
          // Counted (branchless) instead of a data-dependent early-exit scan: the original
@@ -4564,7 +4770,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          return true;
       }
       template <int N>
-      static bool router_next(cnode<N>* c, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      static bool router_next(cnode<N>* c, uint16_t, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          constexpr int SEGW = cnode<N>::SEGW, SHIFT = cnode<N>::SHIFT, MASKB = cnode<N>::MASKB;
          for (int sg = from >> SHIFT; sg < N; ++sg)
@@ -4589,7 +4795,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
          return false;
       }
-      static bool router_next(node_full* f, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      static bool router_next(node_full* f, uint16_t presence, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          // First child with byte >= from. Walk present sub-ranges ascending (presence bit
          // set ⇒ a materialized range line at popcount-rank); within one scan its 16 slots.
@@ -4597,9 +4803,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
          unsigned slot = unsigned(from) & 0xF;
          for (; sub < 16; ++sub, slot = 0)
          {
-            if (!((f->presence >> sub) & 1u))
+            if (!((presence >> sub) & 1u))
                continue;  // sub-range absent
-            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(f->presence, sub));
+            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(presence, sub));
             for (; slot < 16; ++slot)
                if (!ln->ptr[slot].is_null())
                {
@@ -4614,7 +4820,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Last child with byte <= from (reverse-iterator stepping) — mirror of router_next:
       // bytes[] sorted ascending ⇒ the last index <= from is (count of bytes <= from) - 1.
       // Counted (branchless) for the same reason router_next is — no mispredicting exit.
-      static bool router_prev(setlist* s, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      static bool router_prev(setlist* s, uint16_t, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          const int n   = s->rh.hdr.nbranch;
          int       cnt = 0;
@@ -4626,7 +4832,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          return true;
       }
       template <int N>
-      static bool router_prev(cnode<N>* c, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      static bool router_prev(cnode<N>* c, uint16_t, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          constexpr int SEGW = cnode<N>::SEGW, SHIFT = cnode<N>::SHIFT, MASKB = cnode<N>::MASKB;
          for (int sg = from >> SHIFT; sg >= 0; --sg)
@@ -4651,16 +4857,16 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
          return false;
       }
-      static bool router_prev(node_full* f, int from, uint8_t& ob, packed_ptr& oc) noexcept
+      static bool router_prev(node_full* f, uint16_t presence, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
          // Last child with byte <= from. Walk present sub-ranges descending.
          int sub  = from >> 4;
          int slot = from & 0xF;
          for (; sub >= 0; --sub, slot = 15)
          {
-            if (!((f->presence >> sub) & 1u))
+            if (!((presence >> sub) & 1u))
                continue;  // sub-range absent
-            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(f->presence, unsigned(sub)));
+            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(presence, unsigned(sub)));
             for (int S = slot; S >= 0; --S)
                if (!ln->ptr[S].is_null())
                {
@@ -4674,56 +4880,56 @@ namespace detail  // implementation types & node helpers — not part of the pub
 
       // The slot holding byte's child if present, else nullptr — ONE dispatch for the
       // insert descend (find-or-add), instead of a separate find + child_slot pair.
-      static packed_ptr* router_find_slot(setlist* s, uint8_t byte) noexcept
+      static packed_ptr* router_find_slot(setlist* s, uint16_t, uint8_t byte) noexcept
       {
          const int i = setlist_index(s, byte);
          return i >= 0 ? &s->branch[i] : nullptr;
       }
       template <int N>
-      static packed_ptr* router_find_slot(cnode<N>* c, uint8_t byte) noexcept
+      static packed_ptr* router_find_slot(cnode<N>* c, uint16_t, uint8_t byte) noexcept
       {
          return cnode_find_slot(c, byte);
       }
-      static packed_ptr* router_find_slot(node_full* f, uint8_t byte) noexcept
+      static packed_ptr* router_find_slot(node_full* f, uint16_t pres, uint8_t byte) noexcept
       {
-         packed_ptr* p = full_slot(f, byte);  // null when the sub-range is absent
+         packed_ptr* p = full_slot(f, pres, byte);  // null when the sub-range is absent
          return (p && !p->is_null()) ? p : nullptr;
       }
       packed_ptr* router_find_slot(packed_ptr cur, uint8_t byte) const noexcept
       {
-         return with_router(cur, [byte](auto* n) noexcept { return router_find_slot(n, byte); });
+         return with_router(cur, [byte](auto* n, uint16_t pres) noexcept { return router_find_slot(n, pres, byte); });
       }
 
       // Update-or-insert byte -> p; false when the tier is full (the widen signal).
-      static bool router_try_set(setlist* s, uint8_t byte, packed_ptr p) noexcept { return setlist_set(s, byte, p); }
+      static bool router_try_set(setlist* s, uint16_t, uint8_t byte, packed_ptr p) noexcept { return setlist_set(s, byte, p); }
       template <int N>
-      static bool router_try_set(cnode<N>* c, uint8_t byte, packed_ptr p) noexcept { return cnode_set(c, byte, p); }
-      static bool router_try_set(node_full* f, uint8_t byte, packed_ptr p) noexcept
+      static bool router_try_set(cnode<N>* c, uint16_t, uint8_t byte, packed_ptr p) noexcept { return cnode_set(c, byte, p); }
+      static bool router_try_set(node_full* f, uint16_t pres, uint8_t byte, packed_ptr p) noexcept
       {
          // The sub-range must already be present — growth (materializing a new sub-range)
          // is full_grow_/full_insert_child_ (they realloc + re-anchor the handle, which a
          // static setter can't). Reached only from clone (presence preserved) and the few
          // structural callers that operate within an already-built node's sub-ranges.
-         full_set_present(f, byte, p);
+         full_set_present(f, pres, byte, p);
          return true;
       }
       bool router_try_set(packed_ptr cur, uint8_t byte, packed_ptr p) const noexcept
       {
-         return with_router(cur, [&](auto* n) noexcept { return router_try_set(n, byte, p); });
+         return with_router(cur, [&](auto* n, uint16_t pres) noexcept { return router_try_set(n, pres, byte, p); });
       }
 
       // Remove byte's branch (keeps each tier's invariants: setlist gap, cnode rank/present,
-      // full direct slot + nset).
-      static void router_remove(setlist* s, uint8_t byte) noexcept { setlist_remove(s, byte); }
+      // full direct slot).
+      static void router_remove(setlist* s, uint16_t, uint8_t byte) noexcept { setlist_remove(s, byte); }
       template <int N>
-      static void router_remove(cnode<N>* c, uint8_t byte) noexcept { cnode_remove(c, byte); }
-      static void router_remove(node_full* f, uint8_t byte) noexcept
+      static void router_remove(cnode<N>* c, uint16_t, uint8_t byte) noexcept { cnode_remove(c, byte); }
+      static void router_remove(node_full* f, uint16_t pres, uint8_t byte) noexcept
       {
          // Null the slot in place; the sub-range LINE is kept (matches v1 — the node only
          // shrinks via rm_shrink_'s de-widen-to-setlist, never by dropping a range here,
          // so node_size stays consistent across the node's lifetime). Absent sub-range is
          // a no-op (nothing to remove).
-         if ((f->presence >> (unsigned(byte) >> 4)) & 1u) full_set_present(f, byte, packed_ptr::null());
+         if ((pres >> (unsigned(byte) >> 4)) & 1u) full_set_present(f, pres, byte, packed_ptr::null());
       }
       void router_remove(packed_ptr cur, uint8_t byte) const noexcept
       {
@@ -4737,24 +4943,24 @@ namespace detail  // implementation types & node helpers — not part of the pub
                return;
             }
          }
-         with_router(cur, [byte](auto* n) noexcept { router_remove(n, byte); });
+         with_router(cur, [byte](auto* n, uint16_t pres) noexcept { router_remove(n, pres, byte); });
       }
 
       // Visit (byte, branch) ascending, per tier; the dispatcher also accepts setlist_u16
       // for STRUCTURAL callers (destroy/census/fusion) — they get the stem's high byte and
       // recurse the branch, never route on it.
       template <class F>
-      static void router_for_each(setlist* s, F&& f)
+      static void router_for_each(setlist* s, uint16_t, F&& f)
       {
          for (int i = 0; i < s->rh.hdr.nbranch; ++i) f(s->bytes[i], s->branch[i]);
       }
       template <int N, class F>
-      static void router_for_each(cnode<N>* c, F&& f)
+      static void router_for_each(cnode<N>* c, uint16_t, F&& f)
       {
          cnode_for_each(c, f);
       }
       template <class F>
-      static void router_for_each(node_full* fn, F&& f)
+      static void router_for_each(node_full* fn, uint16_t presence, F&& f)
       {
          // Visit (byte, child) ascending: present sub-ranges in rank order, then each
          // sub-range's 16 slots. rank advances only on present sub-ranges, so the range
@@ -4762,7 +4968,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          unsigned rank = 0;
          for (unsigned sub = 0; sub < 16; ++sub)
          {
-            if (!((fn->presence >> sub) & 1u))
+            if (!((presence >> sub) & 1u))
                continue;
             const cline_direct_t<Ptr>* ln = full_range<Ptr>(fn, rank++);
             for (unsigned slot = 0; slot < 16; ++slot)  // scan slots; empty ranges contribute none
@@ -4779,7 +4985,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             for (int i = 0; i < s->rh.hdr.nbranch; ++i) f(uint8_t(s->stems[i] >> 8), s->branch[i]);
             return;
          }
-         with_router(cur, [&](auto* n) { router_for_each(n, f); });
+         with_router(cur, [&](auto* n, uint16_t pres) { router_for_each(n, pres, f); });
       }
 
       // Widen a full router. Default (flat): setlist→node_full directly. With the cnode density
@@ -4834,59 +5040,63 @@ namespace detail  // implementation types & node helpers — not part of the pub
          });
          return np;
       }
-      // Build a COMPACT sparse_full from a narrower router `src`: scan its branches to
-      // learn the occupied sub-ranges (presence), allocate 128 + popcount*128 bytes,
-      // then fill. `reserve_sub` (0..15, or -1) forces an extra empty sub-range so the
-      // caller can set a NEW byte in place with no further alloc. `src`'s term carries
-      // over; `src` is freed by the caller (widen).
-      packed_ptr build_full(packed_ptr src, K newtag, int reserve_sub = -1)
+      // Build a COMPACT headerless sparse_full from a narrower router `src`: scan its
+      // branches to learn the occupied sub-ranges (presence), allocate popcount*128 bytes
+      // (+128 for a tail when `src` carries a term — it becomes a K::pfxd), then fill.
+      // `reserve_sub` (0..15, or -1) forces an extra empty sub-range so the caller can set
+      // a NEW byte in place with no further alloc. `src`'s term carries into the tail; its
+      // prefix (setlists only) is lifted by the caller, so `src` here is prefix-less. `src`
+      // is freed by the caller (widen). Returns the handle carrying presence + has_tail.
+      packed_ptr build_full(packed_ptr src, K /*newtag*/, int reserve_sub = -1)
       {
          uint16_t presence = reserve_sub >= 0 ? uint16_t(1u << reserve_sub) : 0;
          router_for_each(src, [&](uint8_t b, packed_ptr) { presence |= uint16_t(1u << (b >> 4)); });
-         const unsigned nr = unsigned(std::popcount(presence));
-         node_full*     n  = ::new (node_alloc_(cacheline_bytes + size_t(nr) * cacheline_bytes)) node_full;
-         full_init(n);
-         n->presence = presence;
+         const unsigned    nr   = unsigned(std::popcount(presence));
+         const router_hdr* srh  = static_cast<const router_hdr*>(deref_(src));
+         const bool        pfxd = srh->hdr.has_term;  // a term needs a tail → pfxd
+         node_full*        n    = ::new (node_alloc_(full_node_bytes(presence, pfxd))) node_full;
          for (unsigned r = 0; r < nr; ++r)  // null every materialized slot
             std::memset(full_range<Ptr>(n, r)->ptr, 0xFF, sizeof(cline_direct_t<Ptr>::ptr));
-         router_hdr* srh    = static_cast<router_hdr*>(deref_(src));
-         n->rh.hdr.has_term = srh->hdr.has_term;
-         n->rh.term         = srh->term;
-         router_for_each(src, [&](uint8_t b, packed_ptr br) { full_set_present(n, b, br); });
-         return pack_(n, newtag);
+         if (pfxd)
+         {
+            node_full_tail* tl = full_tail(n, presence);
+            tl->hdr            = node_hdr{1, 0, 0};  // has_term, no prefix
+            tl->term           = srh->term;
+         }
+         router_for_each(src, [&](uint8_t b, packed_ptr br) { full_set_present(n, presence, b, br); });
+         return pack_(n, pfxd ? K::pfxd : K::node_full).with_meta(presence).with_tail(pfxd);
       }
       // Insert byte->child into a sparse_full at *slot (cur == *slot). If byte's
       // sub-range is present, set in place; else grow (re-anchoring *slot to the new
-      // node, same tag) and then set. `child` must be guarded by the caller — full_grow_
+      // node, same kind) and then set. `child` must be guarded by the caller — full_grow_
       // can throw (alloc), leaving the tree unchanged.
       void full_insert_child_(packed_ptr* slot, packed_ptr cur, uint8_t byte, packed_ptr child)
       {
-         node_full* f = static_cast<node_full*>(deref_(cur));
-         if (!((f->presence >> (unsigned(byte) >> 4)) & 1u))  // absent sub-range → grow
+         if (!((cur.meta() >> (unsigned(byte) >> 4)) & 1u))  // absent sub-range → grow
          {
-            const packed_ptr nf = full_grow_(cur, byte);  // throws → unchanged
-            *slot               = nf;
-            f                   = static_cast<node_full*>(deref_(nf));
+            cur   = full_grow_(cur, byte);  // throws → unchanged; re-anchors (new meta)
+            *slot = cur;
          }
-         full_set_present(f, byte, child);
+         full_set_present(static_cast<node_full*>(deref_(cur)), cur.meta(), byte, child);
       }
       // Grow a sparse_full (or pfxd full) by materializing the absent sub-range that
-      // `byte` falls in: reallocate the contiguous block with one more range line
-      // spliced at rank, set the presence bit, and return the re-anchored handle (same
-      // tag). The new range line's slots are all null — the caller then sets byte's.
+      // `byte` falls in: reallocate the range-line block with one more line spliced at rank
+      // (and the tail, if pfxd, after it), set the presence bit IN THE HANDLE metadata, and
+      // return the re-anchored handle (same kind + has_tail). The new line's slots are all
+      // null — the caller then sets byte's.
       packed_ptr full_grow_(packed_ptr cur, uint8_t byte)
       {
-         node_full*     of  = static_cast<node_full*>(deref_(cur));
-         const unsigned sub = unsigned(byte) >> 4;
-         assert(!((of->presence >> sub) & 1u) && "full_grow_: sub-range already present");
-         const unsigned old_nr = unsigned(std::popcount(of->presence));
-         const unsigned rank   = full_rank(of->presence, sub);
-         node_full*     nf =
-             ::new (node_alloc_(cacheline_bytes + size_t(old_nr + 1) * cacheline_bytes)) node_full;
-         std::memcpy(static_cast<void*>(nf), static_cast<const void*>(of), cacheline_bytes);  // CL0
-         nf->presence = uint16_t(of->presence | (1u << sub));
+         node_full*     of    = static_cast<node_full*>(deref_(cur));
+         const uint16_t opres = cur.meta();
+         const bool     pfxd  = cur.tag() == K::pfxd;
+         const unsigned sub   = unsigned(byte) >> 4;
+         assert(!((opres >> sub) & 1u) && "full_grow_: sub-range already present");
+         const unsigned old_nr = unsigned(std::popcount(opres));
+         const unsigned rank   = full_rank(opres, sub);
+         const uint16_t npres  = uint16_t(opres | (1u << sub));
+         node_full*     nf     = ::new (node_alloc_(full_node_bytes(npres, pfxd))) node_full;
          // ranges [0, rank) copy verbatim; the new range goes at `rank`; [rank, old_nr)
-         // shift up by one.
+         // shift up by one. The tail (if any) is copied AFTER the new range count.
          for (unsigned r = 0; r < rank; ++r)
             std::memcpy(static_cast<void*>(full_range<Ptr>(nf, r)),
                         static_cast<const void*>(full_range<Ptr>(of, r)), cacheline_bytes);
@@ -4895,8 +5105,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
          for (unsigned r = rank; r < old_nr; ++r)
             std::memcpy(static_cast<void*>(full_range<Ptr>(nf, r + 1)),
                         static_cast<const void*>(full_range<Ptr>(of, r)), cacheline_bytes);
-         node_free_(of, full_node_bytes<Ptr>(of));
-         return pack_(nf, cur.tag());  // same tag (node_full or pfxd); address re-anchored
+         if (pfxd)  // carry the tail (term + fused prefix) verbatim
+            std::memcpy(static_cast<void*>(full_tail(nf, npres)),
+                        static_cast<const void*>(full_tail(of, opres)), cacheline_bytes);
+         node_free_(of, full_node_bytes(opres, pfxd));
+         return pack_(nf, cur.tag()).with_meta(npres).with_tail(pfxd);  // re-anchored, new presence
       }
       // Widen `node` (freeing each predecessor) until byte->child fits in place, or it
       // reaches a sparse_full — which may need a GROW (materialize byte's sub-range) when
@@ -4917,9 +5130,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
             // call (the dangling window is only post-widen, closed by reserve).
             if (node.tag() == K::node_full || node.tag() == K::pfxd)
             {
-               if (!((static_cast<node_full*>(deref_(node))->presence >> (unsigned(byte) >> 4)) & 1u))
+               if (!((node.meta() >> (unsigned(byte) >> 4)) & 1u))
                   node = full_grow_(node, byte);  // throws → unchanged, caller's guard frees child
-               full_set_present(static_cast<node_full*>(deref_(node)), byte, child);
+               full_set_present(static_cast<node_full*>(deref_(node)), node.meta(), byte, child);
                return node;
             }
             if (router_try_set(node, byte, child)) return node;  // setlist/cN: set in place
@@ -4960,31 +5173,37 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // throwing leaves *rslot on a live (wider) node, never a freed one.
          for (;;)
          {
-            if (node.tag() == K::node_full)  // top tier: byte's sub-range was reserved → set
-            {
-               full_set_present(static_cast<node_full*>(deref_(node)), byte, child);
+            // Top tier: a node_full (byte's sub-range was reserved by widen) OR a pfxd (when
+            // the widened router carried a term → build_full made a tail). At the top tier we
+            // do NOT set child yet: a lifted prefix may still need to be fused back (which can
+            // REALLOCATE node_full→pfxd, a throwing op), and the caller's guard frees child on
+            // any throw — so child must not be linked into a node until after the last throw.
+            if (node.tag() == K::node_full || node.tag() == K::pfxd)
                break;
-            }
-            if (router_try_set(node, byte, child)) break;  // setlist/cN: set in place
+            if (router_try_set(node, byte, child)) return;  // setlist/cN: set in place, done
             node    = widen(node, int(byte) >> 4);  // reserve byte's sub-range in the new full
             *rslot  = node;
          }
-         // The ladder is done: if the lifted prefix now sits above a node_full, fuse it
-         // back into the full's header cacheline and free the prefix node — prefix_node
-         // is the overflow form, not the home (a setlist prefix is <= 8, always fits).
-         if (pn && node.tag() == K::node_full)
+         // The ladder reached the full tier. If the lifted prefix sits above it, fuse it back
+         // into the node's tail (this realloc may THROW — child isn't linked yet, so the
+         // caller's guard cleanly frees child and the tree is unchanged). prefix_node is the
+         // overflow form, not the home (a setlist prefix is <= 8, always fits the tail).
+         if (pn)
          {
-            const uint16_t pl = pn_plen(pn);
-            node_full*     f  = static_cast<node_full*>(deref_(node));
-            if (pl <= node_full::PFX_CAP)
+            const uint16_t pl     = pn_plen(pn);
+            const unsigned cur_pl =
+                node.tag() == K::pfxd ? pfxd_plen(static_cast<node_full*>(deref_(node)), node.meta()) : 0;
+            if (pl + cur_pl <= node_full::PFX_CAP)
             {
-               std::memcpy(f->hdr + 1, pn_pfx<Ptr>(pn), pl);
-               f->hdr[0]            = uint8_t(K::node_full);
-               f->rh.hdr.prefix_len = pl & 0x3F;
-               *slot                = pack_(f, K::pfxd);
+               uint8_t pfx[node_full::PFX_CAP];
+               std::memcpy(pfx, pn_pfx<Ptr>(pn), pl);
+               node  = make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), node);  // throws → child unlinked
+               *slot = node;  // re-anchor through the (now-fused) node, dropping the prefix_node
                node_free_(pn, pn_size<Ptr>(pl));
             }
          }
+         // Last: link child in place (non-throwing) — every reallocation is behind us.
+         full_set_present(static_cast<node_full*>(deref_(node)), node.meta(), byte, child);
       }
 
       template <bool Assign, class VF>
@@ -5149,9 +5368,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       packed_ptr split_pfxd_prefix(packed_ptr cur, std::string_view key, size_t depth,
                                    size_t c, VF&& val, MakeBranch&& make_branch)
       {
-         void*          n  = deref_(cur);
-         uint8_t*       pb = pfxd_pfx(n);
-         const unsigned pl = pfxd_plen(n);
+         node_full*     n    = static_cast<node_full*>(deref_(cur));
+         const uint16_t pres = cur.meta();
+         uint8_t*       pb   = pfxd_pfx(n, pres);
+         const unsigned pl   = pfxd_plen(n, pres);
          uint8_t        common[node_full::PFX_CAP];
          std::memcpy(common, pb, c);          // shared part [0..c) (read, no mutation)
          const uint8_t  oldbyte = pb[c];      // byte leading back to this node
@@ -5165,8 +5385,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             setlist_set(r, uint8_t(R[c]), make_branch(std::forward<VF>(val)));
          partial = apply_prefix(r, std::string_view(reinterpret_cast<char*>(common), c));
-         // commit (non-throwing): shorten the fused prefix in place, then graft
-         setlist_set(r, oldbyte, pfxd_set_prefix(n, pb + c + 1, newpl));
+         // commit (non-throwing): shorten the fused prefix IN PLACE (the tail is kept — a
+         // realloc here would break this commit's strong guarantee), then graft the node back.
+         node_full_tail* tl = full_tail(n, pres);
+         std::memmove(tl->prefix, pb + c + 1, newpl);
+         tl->hdr.prefix_len = newpl & 0x3F;
+         setlist_set(r, oldbyte, cur);  // cur stays K::pfxd with its presence meta + has_tail
          g.release();
          sl_inline_compact_(r);  // the new-value branch is a small leaf → pull it inline
          return partial;
@@ -5202,32 +5426,40 @@ namespace detail  // implementation types & node helpers — not part of the pub
          const router_hdr* sh = reinterpret_cast<const router_hdr*>(S);
          router_hdr*       dh = reinterpret_cast<router_hdr*>(D);
          dh->term             = packed_ptr::null();
-         router_for_each(const_cast<Node*>(S),  // null every slot before recursion can throw
-                         [&](uint8_t e, packed_ptr) { router_try_set(D, e, packed_ptr::null()); });
+         // setlist/cN ignore presence (0): clone the edge directory + re-point each child.
+         router_for_each(const_cast<Node*>(S), uint16_t(0),  // null every slot before recursion can throw
+                         [&](uint8_t e, packed_ptr) { router_try_set(D, uint16_t(0), e, packed_ptr::null()); });
          packed_ptr  dp = pack_(D, k);
          build_guard g{this, &dp};
          dh->term = clone_walk_(src, sh->term);
-         router_for_each(const_cast<Node*>(S),
-                         [&](uint8_t e, packed_ptr child) { router_try_set(D, e, clone_walk_(src, child)); });
+         router_for_each(const_cast<Node*>(S), uint16_t(0),
+                         [&](uint8_t e, packed_ptr child) { router_try_set(D, uint16_t(0), e, clone_walk_(src, child)); });
          g.release();
          return dp;
       }
-      // Clone a sparse_full / pfxd: copy the WHOLE per-node block (CL0 + popcount range
-      // lines) so presence, prefix, nset and the materialized geometry carry verbatim;
-      // then re-point each branch slot at its cloned child. node_size matches the source.
-      packed_ptr clone_full_(const map& src, const node_full* S, K k)
+      // Clone a HEADERLESS sparse_full / pfxd: copy the WHOLE per-node block (popcount range
+      // lines + the pfxd tail) so the materialized geometry, fused prefix and term-flag carry
+      // verbatim; then re-point each branch slot — and a pfxd's tail term — at its cloned
+      // child. presence rides in the source handle's metadata. The clone carries the same
+      // presence meta + has_tail.
+      packed_ptr clone_full_(const map& src, packed_ptr s, K k)
       {
-         const size_t sz = full_node_bytes<Ptr>(S);
-         node_full*   D  = ::new (node_alloc_(sz)) node_full;
+         const node_full* S    = static_cast<const node_full*>(src.deref_(s));
+         const uint16_t   pres = s.meta();
+         const bool       pfxd = (k == K::pfxd);
+         const size_t     sz   = full_node_bytes(pres, pfxd);
+         node_full*       D    = ::new (node_alloc_(sz)) node_full;
          std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), sz);
-         D->rh.term = packed_ptr::null();
-         router_for_each(D,  // null every slot before recursion can throw (frees half-built clones)
-                         [&](uint8_t e, packed_ptr) { full_set_present(D, e, packed_ptr::null()); });
-         packed_ptr  dp = pack_(D, k);
+         router_for_each(D, pres,  // null every slot before recursion can throw (frees half-built)
+                         [&](uint8_t e, packed_ptr) { full_set_present(D, pres, e, packed_ptr::null()); });
+         node_full_tail* dtl = pfxd ? full_tail(D, pres) : nullptr;
+         if (dtl && dtl->hdr.has_term) dtl->term = packed_ptr::null();  // null before recursion
+         packed_ptr  dp = pack_(D, k).with_meta(pres).with_tail(pfxd);
          build_guard g{this, &dp};
-         D->rh.term = clone_walk_(src, S->rh.term);
-         router_for_each(const_cast<node_full*>(S),
-                         [&](uint8_t e, packed_ptr child) { full_set_present(D, e, clone_walk_(src, child)); });
+         if (dtl && dtl->hdr.has_term)
+            dtl->term = clone_walk_(src, full_tail(S, pres)->term);
+         router_for_each(const_cast<node_full*>(S), pres,
+                         [&](uint8_t e, packed_ptr child) { full_set_present(D, pres, e, clone_walk_(src, child)); });
          g.release();
          return dp;
       }
@@ -5301,8 +5533,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                g.release();
                return dp;
             }
-            case K::pfxd:  // sparse_full body + in-header prefix; the per-node memcpy carries both
-               return clone_full_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
+            case K::pfxd:  // headerless full body + a tail (term/prefix); per-node memcpy carries it
+               return clone_full_(src, s, K::pfxd);
             case K::c2:
                return clone_router_(src, static_cast<const cnode<2>*>(src.deref_(s)), K::c2);
             case K::c4:
@@ -5310,7 +5542,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c8:
                return clone_router_(src, static_cast<const cnode<8>*>(src.deref_(s)), K::c8);
             case K::node_full:
-               return clone_full_(src, static_cast<const node_full*>(src.deref_(s)), K::node_full);
+               return clone_full_(src, s, K::node_full);
             case K::bucket:
             {
                const bucket* B = static_cast<const bucket*>(src.deref_(s));
@@ -5380,8 +5612,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::node_full:
             case K::pfxd:
             {
-               router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
-               free_all_(rh->term);
+               free_all_(router_term(cur));  // headerless full/pfxd: term from tail (or none)
                router_for_each(cur, [&](uint8_t, packed_ptr br) { free_all_(br); });
                node_free_(deref_(cur), node_bytes_(cur));  // per-node for sparse_full/pfxd
                return;
