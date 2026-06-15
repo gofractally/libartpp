@@ -31,6 +31,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -43,12 +44,26 @@ namespace artpp::v2
 {
    namespace detail
    {
-      // 6-byte indexed meta-handle (node_addr's handle_t<6>): [28-bit line index | 4-bit tag
-      // : 4 bytes][routing metadata : 2 bytes], little-endian. Same byte-array shape as the
-      // direct meta_ptr (memcpy load/store, unaligned-safe inside packed node arrays), but the
-      // address payload is a line INDEX resolved against a pool base. The 2 metadata bytes
-      // carry the headerless routing vector (presence / dividers) the CHILD's tier reads — so
-      // a pool-backed tree is headerless exactly like a direct one.
+      // 8-byte indexed meta-handle: [28-bit line index | 4-bit tag : 4 bytes][routing
+      // metadata : 2 bytes][prefix-fusion PADDING : 2 bytes], little-endian. Same byte-array
+      // shape as the direct meta_ptr (memcpy load/store, unaligned-safe inside packed node
+      // arrays), but the address payload is a line INDEX resolved against a pool base. The 2
+      // metadata bytes carry the headerless routing vector (presence / dividers) the CHILD's
+      // tier reads — so a pool-backed tree is headerless exactly like a direct one.
+      //
+      // WIDTH-8 STRIDE: the handle was 6 bytes, so a routing array stored at 6-byte stride
+      // needed a runtime MULTIPLY (umaddl ×6) to address a slot. Widening to 8 makes the
+      // stride a power of two (slot = base + index<<3, a shift) and reclaims 2 bytes per
+      // slot. The handle VALUE ignores bytes 6-7: the address is the low 4 bytes (masked by
+      // ADDR_BITS_ == 0xFFFFFFFF) and the meta is bytes 4-5 (uint16_t(raw>>32)), so both
+      // mask the pad out and a handle with arbitrary pad bytes still derefs and routes
+      // correctly. Bytes 6-7 are PADDING reserved for prefix-fusion striping (slot i's pad
+      // could hold the node's fused common prefix bytes [2i, 2i+2)); they are minted as 0 and
+      // currently unused — the sdiv tier still keeps its fused prefix in the lean line's
+      // post-handle slack (which remains in-cacheline at width 8). The handle stays a PLAIN
+      // byte array, TRIVIALLY COPYABLE — it has NO custom operator=/copy-ctor, so handle
+      // writes blit all 8 bytes and the iterator's trivially-copyable Frame and its memcpy
+      // are untouched.
       //
       // Unlike a 128-aligned pointer, an index has no 7-bit alignment hole, so the 4-byte
       // field is fully spent on index+tag with NO room for a has_tail bit. For indexed handles
@@ -59,12 +74,12 @@ namespace artpp::v2
       {
          static constexpr bool     indexed = true;
          static constexpr unsigned ABYTES  = 4;  // index/tag field width; metadata in bytes 4-5
-         uint8_t                   b[6];
+         uint8_t                   b[8];          // bytes 6-7 are prefix-fusion padding (value-ignored)
 
          static line_ptr null() noexcept
          {
             line_ptr p;
-            std::memset(p.b, 0xFF, 6);  // tag nibble becomes 0xF == K::null
+            std::memset(p.b, 0xFF, 8);  // tag nibble becomes 0xF == K::null
             return p;
          }
          // Encode a byte offset from the pool's NODE base (line-aligned, < 32 GB).
@@ -76,6 +91,7 @@ namespace artpp::v2
             const uint32_t raw = uint32_t(byte_off >> 3) | uint8_t(k);  // (off>>7)<<4 == off>>3
             std::memcpy(p.b, &raw, 4);
             p.b[4] = p.b[5] = 0;  // metadata defaults to 0
+            p.b[6] = p.b[7] = 0;  // prefix-fusion padding (value-ignored; (re)scattered by the tier)
             return p;
          }
          // Encode a byte offset from the pool's TERMINAL base (16-byte units, < 4 GB).
@@ -90,15 +106,17 @@ namespace artpp::v2
             const uint32_t raw = uint32_t(byte_off) | uint8_t(k);
             std::memcpy(p.b, &raw, 4);
             p.b[4] = p.b[5] = 0;
+            p.b[6] = p.b[7] = 0;  // prefix-fusion padding (value-ignored)
             return p;
          }
 
-         // The FULL 6-byte field (index/tag/has_tail in the low 4, metadata in the high 2):
-         // the descent reads this once — child_line reads meta as raw>>32, deref masks it off.
+         // The FULL 8-byte field (index/tag in the low 4, metadata in bytes 4-5, prefix pad in
+         // bytes 6-7): the descent reads this once — child_line reads meta as raw>>32, deref
+         // masks both meta AND pad off (raw & 0xFFFFFFFF). The pad never reaches addr or meta.
          uint64_t raw() const noexcept
          {
             uint64_t v = 0;
-            std::memcpy(&v, b, 6);
+            std::memcpy(&v, b, 8);
             return v;
          }
          K        tag() const noexcept { return K(b[0] & 0xF); }
@@ -120,7 +138,11 @@ namespace artpp::v2
          // No alignment hole in an index → no stored has_tail bit; the kind tag carries it.
          line_ptr with_tail(bool) const noexcept { return *this; }
       };
-      static_assert(sizeof(line_ptr) == 6, "line_ptr is 4 index/tag bytes + 2 metadata bytes");
+      static_assert(sizeof(line_ptr) == 8,
+                    "line_ptr is 4 index/tag + 2 metadata + 2 prefix-pad bytes (8-byte stride)");
+      static_assert(std::is_trivially_copyable_v<line_ptr>,
+                    "line_ptr must stay trivially copyable — handle writes blit all 8 bytes, the "
+                    "prefix is re-scattered into the pads afterward; no custom operator=/copy-ctor");
    }  // namespace detail
 
    // The line store. Single-threaded, like the tree. Not copyable/movable — every handle

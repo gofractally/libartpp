@@ -791,14 +791,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
       };
       // The bytes of a handle that hold the ADDRESS field (the rest are routing metadata the
       // headerless slots carry in the handle's high bytes). meta_ptr keeps the address in the
-      // low 48 bits and the 16-bit presence/divider vector above it; line_ptr keeps a 28-bit
-      // index + tag in the low 4 bytes and metadata above; a metadata-less packed_ptr_t<N>
-      // zero-extends to N bytes so this mask is a no-op for it.
+      // low 48 bits and the 16-bit presence/divider vector above it; the 8-byte line_ptr keeps a
+      // 28-bit index + tag in the low 4 bytes, metadata in bytes 4-5, and prefix-fusion PADDING
+      // in bytes 6-7 — ADDR_BITS_ (== 0xFFFFFFFF at ABYTES==4) masks BOTH meta and pad off the
+      // address, and the pad never reaches meta (uint16_t(raw>>32) is bytes 4-5). A metadata-less
+      // packed_ptr_t<N> zero-extends to N bytes so this mask is a no-op for it.
       static constexpr uint64_t ADDR_BITS_ =
           (8u * Ptr::ABYTES >= 64u) ? ~uint64_t(0) : ((uint64_t(1) << (8u * Ptr::ABYTES)) - 1);
       // Bit position of the 16-bit routing metadata within a handle's raw() value: it sits
       // just above the address field, so meta == uint16_t(raw >> META_SHIFT_). Width-derived
-      // (48 for the 8-byte meta_ptr, 32 for the 6-byte indexed line_ptr).
+      // (48 for the 8-byte meta_ptr, 32 for the 8-byte indexed line_ptr whose 4-byte address
+      // field puts meta at bytes 4-5 and leaves bytes 6-7 as value-ignored prefix padding).
       static constexpr unsigned META_SHIFT_ = 8u * Ptr::ABYTES;
       void* deref_(packed_ptr p) const noexcept
       {
