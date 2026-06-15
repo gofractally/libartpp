@@ -130,6 +130,97 @@ namespace artpp::v2::detail
       bool  is_null() const noexcept { return tag() == K::null; }
    };
 
+   // The headerless META-HANDLE — the v2 "the pointer is the header" branch slot.
+   //
+   // 8 bytes: a 128-byte-aligned tagged address in the low 6 (a 48-bit pointer, tag in the
+   // low 4 bits, `has_tail` in bit 4 — both sit in the 7-bit alignment hole) PLUS 2 metadata
+   // bytes the CHILD's tier reads (a 16-bit presence vector for sparse_full, two dividers for
+   // sdiv). Because the parent's slot carries the child's routing metadata, the descent
+   // computes WHICH cacheline of the child to load FROM THE HANDLE — before loading it — so a
+   // hop is one cacheline per level and a pure router stores no header at all. 16 slots tile a
+   // 128-byte line exactly (16x8), so a full sub-range is one line with zero waste.
+   //
+   // API-compatible with packed_ptr_t (tag/raw/ptr/tptr/is_null/null/from/from_term + the
+   // `indexed` flag) so it drops into every Ptr-templated node layout, plus meta()/with_meta()
+   // and has_tail()/with_tail() for the routing metadata and the optional-tail flag.
+   struct meta_ptr
+   {
+      static_assert(std::endian::native == std::endian::little,
+                    "artpp handles assume a little-endian host");
+      static constexpr bool     indexed = false;  // direct addressing: low 6 bytes ARE the address
+      static constexpr unsigned ABYTES  = 6;      // address-field width (48-bit, 128-aligned)
+      static constexpr uint8_t  TAIL    = 0x10;   // has_tail flag, bit 4 (in the alignment hole)
+      static constexpr uint64_t AMASK   = (uint64_t(1) << 48) - 1;  // address occupies the low 48 bits
+      uint8_t b[8];
+
+      static meta_ptr null() noexcept
+      {
+         meta_ptr p;
+         std::memset(p.b, 0xFF, 8);  // tag nibble 0xF == K::null
+         return p;
+      }
+      static meta_ptr from(const void* addr, K k) noexcept
+      {
+         const uint64_t a = reinterpret_cast<uint64_t>(addr);
+         assert((a & 0x7f) == 0 && "artpp: tagged allocation must be 128-byte aligned");
+         assert((a & ~AMASK) == 0 && "artpp: address exceeds the 48-bit handle field");
+         meta_ptr       p;
+         const uint64_t raw = (a & ~uint64_t(0x7f)) | uint8_t(k);  // has_tail stays 0
+         std::memcpy(p.b, &raw, ABYTES);
+         p.b[6] = p.b[7] = 0;  // metadata defaults to 0
+         return p;
+      }
+      // TERMINAL handle: only the tag's low nibble matters, so terminals are 16-byte aligned
+      // (8x denser than a line). has_tail (bit 4) is NOT free at 16-byte alignment, so a
+      // terminal must never carry it — terminals are leaves, never tail-bearing routers.
+      static meta_ptr from_term(const void* addr, K k) noexcept
+      {
+         const uint64_t a = reinterpret_cast<uint64_t>(addr);
+         assert((a & 0xF) == 0 && "artpp: terminal allocation must be 16-byte aligned");
+         assert((a & ~AMASK) == 0 && "artpp: address exceeds the 48-bit handle field");
+         meta_ptr       p;
+         const uint64_t raw = a | uint8_t(k);
+         std::memcpy(p.b, &raw, ABYTES);
+         p.b[6] = p.b[7] = 0;
+         return p;
+      }
+
+      // The FULL 8-byte field (address + has_tail in the low 6, metadata in the high 2). The
+      // descent loads this once: child_line reads the metadata as (raw>>48), deref masks it off.
+      uint64_t raw() const noexcept
+      {
+         uint64_t v = 0;
+         std::memcpy(&v, b, 8);
+         return v;
+      }
+      K        tag() const noexcept { return K(b[0] & 0xF); }
+      bool     has_tail() const noexcept { return (b[0] & TAIL) != 0; }
+      uint16_t meta() const noexcept
+      {
+         uint16_t m;
+         std::memcpy(&m, b + 6, 2);
+         return m;
+      }
+      // Address accessors mask BOTH the metadata (high 2 bytes) and the tag/alignment bits.
+      void* ptr() const noexcept { return reinterpret_cast<void*>((raw() & AMASK) & ~uint64_t(0x7f)); }
+      void* tptr() const noexcept { return reinterpret_cast<void*>((raw() & AMASK) & ~uint64_t(0xF)); }
+      bool  is_null() const noexcept { return tag() == K::null; }
+
+      meta_ptr with_meta(uint16_t m) const noexcept
+      {
+         meta_ptr p = *this;
+         std::memcpy(p.b + 6, &m, 2);
+         return p;
+      }
+      meta_ptr with_tail(bool t) const noexcept
+      {
+         meta_ptr p = *this;
+         p.b[0]     = uint8_t((p.b[0] & ~TAIL) | (t ? TAIL : 0));
+         return p;
+      }
+   };
+   static_assert(sizeof(meta_ptr) == 8, "meta_ptr is 6 address bytes + 2 metadata bytes");
+
    // Default branch handle: 6 bytes (48-bit). An allocator overrides the width per tree by
    // exposing `artpp_handle` (see handle_of in tree.hpp); every node layout derives from sizeof(Ptr).
    using packed_ptr = packed_ptr_t<6>;
@@ -179,4 +270,5 @@ namespace artpp::v2
    // API, so naming a width must not reach into detail::
    //   template <class T> struct my_alloc { using artpp_handle = artpp::v2::packed_ptr_t<8>; ... };
    using detail::packed_ptr_t;
+   using detail::meta_ptr;  // the default headerless 8-byte branch slot (address + 2 metadata)
 }  // namespace artpp::v2

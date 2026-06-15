@@ -585,8 +585,8 @@ static void test_equality()
    CHECK(a == a);
 
    // Structural equality must survive SHAPE divergence: equality is content, not
-   // representation. A grows to 14 branches directly (setlist); B overshoots to 20
-   // (widens to node_full) and erases back to the same 14 — widen/shrink hysteresis
+   // representation. A grows to 10 branches directly (setlist); B overshoots to 20
+   // (widens to node_full) and erases back to the same 10 — widen/shrink hysteresis
    // keeps B wide, so the node-by-node walk hits a representation mismatch and the
    // compare falls back to the canonical sequence. Equal content must compare equal
    // through BOTH paths. Uses the default (flat) map → the direct-index node_full path
@@ -596,9 +596,9 @@ static void test_equality()
       using T2 = map<std::string_view, uint64_t>;
       T2 s, w;
       auto key = [](char c) { return std::string("k") + c; };
-      for (char c = 'a'; c < 'a' + 14; ++c) s.insert(key(c), uint64_t(c));
-      for (char c = 'a'; c < 'a' + 20; ++c) w.insert(key(c), uint64_t(c));
-      for (char c = 'a' + 14; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);
+      for (char c = 'a'; c < 'a' + 10; ++c) s.insert(key(c), uint64_t(c));   // 10 <= CAP(11) → setlist
+      for (char c = 'a'; c < 'a' + 20; ++c) w.insert(key(c), uint64_t(c));   // 20 → node_full
+      for (char c = 'a' + 10; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);  // → 10 (hysteresis: stays full)
       const auto ds = s.debug_stats(), dw = w.debug_stats();
       CHECK(ds.setlist == 1 && ds.full == 0);  // prove the shapes really diverged
       CHECK(dw.fullp == 1);  // widened under the "k" prefix → fused-prefix full (pfxd)
@@ -607,33 +607,33 @@ static void test_equality()
       CHECK(s != w);
       w.update(key('c'), uint64_t('c'));
       CHECK(s == w);
-      // erase well below the de-widen threshold (SHRINK_MAX = setlist CAP - 4): the
+      // erase well below the de-widen threshold (SHRINK_MAX = setlist CAP - 4 = 7): the
       // wide node de-widens (carrying its fused prefix into the setlist's inline slot);
       // both setlists → the fast path again
-      for (char c = 'a' + 8; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }
+      for (char c = 'a' + 3; c < 'a' + 10; ++c) { s.erase(key(c)); w.erase(key(c)); }
       CHECK(w.debug_stats().full == 0 && w.debug_stats().fullp == 0);
       CHECK(s == w);
    }
    // Same content-equality-survives-shape-divergence check on the DEFAULT ladder: A stays a
-   // setlist; B widens into a cnode (20 clustered "k?" branches overflow c2 → c4) and erases
-   // back to 14 — hysteresis keeps it a c4 — so the node-by-node walk hits a setlist-vs-cnode
+   // setlist; B widens into a cnode (15 clustered "k?" branches overflow c2 → c4) and erases
+   // back to 10 — hysteresis keeps it a c4 — so the node-by-node walk hits a setlist-vs-cnode
    // representation mismatch and must still compare equal via the canonical-sequence fallback.
    {
       using T2 = map<std::string_view, uint64_t, mode::dense_tiers>;  // explicit cnode density ladder
       T2 s, w;
       auto key = [](char c) { return std::string("k") + c; };
-      for (char c = 'a'; c < 'a' + 14; ++c) s.insert(key(c), uint64_t(c));
-      for (char c = 'a'; c < 'a' + 20; ++c) w.insert(key(c), uint64_t(c));
-      for (char c = 'a' + 14; c < 'a' + 20; ++c) CHECK(w.erase(key(c)) == 1);
+      for (char c = 'a'; c < 'a' + 10; ++c) s.insert(key(c), uint64_t(c));   // 10 <= CAP(11) → setlist
+      for (char c = 'a'; c < 'a' + 15; ++c) w.insert(key(c), uint64_t(c));   // 15 clustered: c2 seg(>14)→c4
+      for (char c = 'a' + 10; c < 'a' + 15; ++c) CHECK(w.erase(key(c)) == 1);  // → 10, hysteresis holds c4
       const auto ds = s.debug_stats(), dw = w.debug_stats();
-      CHECK(ds.setlist == 1 && ds.full == 0 && ds.c4 == 0);  // A: plain setlist (14 <= CAP 16)
-      CHECK(dw.c4 == 1 && dw.full == 0 && dw.c2 == 0);        // B: setlist→c2→c4, hysteresis holds at 14
+      CHECK(ds.setlist == 1 && ds.full == 0 && ds.c4 == 0);  // A: plain setlist (10 <= CAP 11)
+      CHECK(dw.c4 == 1 && dw.full == 0 && dw.c2 == 0);        // B: setlist→c2→c4, hysteresis holds at 10
       CHECK(s == w && w == s);                                // equal across setlist-vs-cnode shapes
       w.update(key('c'), 999u);
       CHECK(s != w);
       w.update(key('c'), uint64_t('c'));
       CHECK(s == w);
-      for (char c = 'a' + 8; c < 'a' + 14; ++c) { s.erase(key(c)); w.erase(key(c)); }  // → 8 branches
+      for (char c = 'a' + 3; c < 'a' + 10; ++c) { s.erase(key(c)); w.erase(key(c)); }  // → 3 branches
       CHECK(w.debug_stats().setlist == 1 && w.debug_stats().c4 == 0);  // de-widened cnode→setlist
       CHECK(s == w);
    }
@@ -643,31 +643,37 @@ static void test_equality()
    {
       using T8 = map<uint32_t, uint32_t, mode::dense_tiers | mode::ladder_c8>;
       T8 t;
-      for (uint32_t i = 0; i < 100; ++i) t.insert((i * 2) << 24, i);  // top bytes 0,2,..,198: <=16 / 32-seg
-      CHECK(t.size() == 100);
-      CHECK(t.debug_stats().c8 == 1 && t.debug_stats().full == 0);  // 100 spread branches land in c8
+      // 96 keys spread 12 per c8-segment (SEGW 32): 12 <= c8 seg-CAP(15) so it fits c8, but a
+      // c4 segment (SEGW 64) sees 24 > c4 seg-CAP(15) so it climbs PAST c4. Keys ascend, so
+      // values 0..95 enumerate in order. (Top byte = sg*32+j; key = byte<<24.)
+      std::vector<uint32_t> keys;
+      for (int sg = 0; sg < 8; ++sg)
+         for (int j = 0; j < 12; ++j) keys.push_back(uint32_t(sg * 32 + j) << 24);
+      for (uint32_t i = 0; i < keys.size(); ++i) t.insert(keys[i], i);
+      CHECK(t.size() == 96);
+      CHECK(t.debug_stats().c8 == 1 && t.debug_stats().full == 0);  // 96 spread branches land in c8
       std::vector<uint32_t> got;
       t.for_each_value([&](const uint32_t& v) { got.push_back(v); });
-      bool ordered = got.size() == 100;
+      bool ordered = got.size() == 96;
       for (uint32_t i = 0; i < got.size(); ++i) ordered = ordered && got[i] == i;
       CHECK(ordered);  // c8 router_next yields ascending key order
-      for (uint32_t i = 0; i < 100; ++i) { uint32_t o; CHECK(t.find((i * 2) << 24, o) && o == i); }
-      for (uint32_t i = 0; i < 50; ++i) CHECK(t.erase((i * 2) << 24) == 1);
-      CHECK(t.size() == 50);
-      for (uint32_t i = 50; i < 100; ++i) { uint32_t o; CHECK(t.find((i * 2) << 24, o) && o == i); }
+      for (uint32_t i = 0; i < keys.size(); ++i) { uint32_t o; CHECK(t.find(keys[i], o) && o == i); }
+      for (uint32_t i = 0; i < 48; ++i) CHECK(t.erase(keys[i]) == 1);
+      CHECK(t.size() == 48);
+      for (uint32_t i = 48; i < 96; ++i) { uint32_t o; CHECK(t.find(keys[i], o) && o == i); }
    }
    // Capacity hint (compact_map / ExpectedSize): a SMALL hint auto-engages the cnode ladder, a
    // LARGE hint stays flat — using the same 20 clustered "k?" branches that become a c4 vs a full.
    {
-      auto fill = [](auto& m) { for (char c = 'a'; c < 'a' + 20; ++c) m.insert(std::string("k") + c, uint64_t(c)); };
+      auto fill = [](auto& m) { for (char c = 'a'; c < 'a' + 15; ++c) m.insert(std::string("k") + c, uint64_t(c)); };
       compact_map<std::string_view, uint64_t, 1000>        small;  fill(small);
       compact_map<std::string_view, uint64_t, 100'000'000> big;    fill(big);
       const auto sds = small.debug_stats();
       const auto bds = big.debug_stats();
-      CHECK(sds.c4 == 1 && sds.full + sds.fullp == 0);  // hint small → cnode ladder
+      CHECK(sds.c4 == 1 && sds.full + sds.fullp == 0);  // hint small → cnode ladder (15 → c2→c4)
       CHECK(bds.full + bds.fullp == 1 && bds.c4 == 0);  // hint large → flat (k-prefix fuses → pfxd)
-      CHECK(small.size() == 20 && big.size() == 20);
-      for (char c = 'a'; c < 'a' + 20; ++c)
+      CHECK(small.size() == 15 && big.size() == 15);
+      for (char c = 'a'; c < 'a' + 15; ++c)
       {
          uint64_t o;
          const auto k = std::string("k") + c;
@@ -944,11 +950,12 @@ static void test_fused_prefix()
       // term ending exactly AT the fused boundary
       t.insert(pre, 1000u);
       CHECK(t.find_opt(pre).value() == 1000 && t.erase(pre) == 1);
-      // erase below SHRINK_MAX: de-widen carries the fused prefix into the setlist
-      for (int i = 11; i < 26; ++i) CHECK(t.erase(pre + char('a' + i)) == 1);
+      // erase below SHRINK_MAX (= setlist CAP - 4 = 7): de-widen carries the fused prefix
+      // into the setlist. Leaving 7 branches (i=0..6) trips the de-widen; 11 would not.
+      for (int i = 7; i < 26; ++i) CHECK(t.erase(pre + char('a' + i)) == 1);
       d = t.debug_stats();
       CHECK(d.fullp == 0 && d.full == 0);
-      for (int i = 0; i < 11; ++i)
+      for (int i = 0; i < 7; ++i)
          if (!has(t, pre + char('a' + i), uint32_t(i))) { CHECK(false); break; }
       CHECK(t.contains("shared-pifball"));
    }

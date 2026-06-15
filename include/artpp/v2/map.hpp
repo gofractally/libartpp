@@ -4,11 +4,13 @@
 //   leaf<T>      value_ptr  — suffix (rest of key) + value, one alloc (lazy expansion)
 //   prefix_node  prefix_node— long shared prefix + one next pointer (path compression)
 //   setlist      setlist_u8 — sparse byte router, 1 cacheline, up to 16 branches (R1)
-//   node_full    node_full  — dense direct-index router, full_lines_v lines, skip-CL0 (SFULL)
+//   node_full    node_full  — sparse_full: dense direct-index router, CL0 presence +
+//                             popcount(presence) contiguous 16-value range lines (§3.4)
 //
-// Routing is off the pointer tag: setlist/prefix read the node (R1); node_full
-// computes the segment line from the key byte, PREFETCHES it, then reads the slot
-// (skip-CL0). Growth: a full setlist widens to node_full. Mutation is in place
+// Routing is off the pointer tag: setlist/prefix read the node (R1); node_full reads
+// the CL0 presence vector, popcount-ranks the routing byte's sub-range to the range
+// line, then reads the slot. Growth: a full setlist widens to a compact sparse_full;
+// a sparse_full grows by splicing one range line when a new sub-range appears. In place
 // (no COW). The narrow bitset tiers (r32/64/128, c2/c4/c8) and wide setlists are
 // the documented next step; the dispatch and growth scaffolding already fits them.
 #pragma once
@@ -302,120 +304,134 @@ namespace detail  // implementation types & node helpers — not part of the pub
       for (int i = 0; i < s->rh.hdr.nbranch; ++i) f(s->stems[i], s->branch[i]);
    }
 
-   // ── dense router: CL0 header + 13 direct-index lines, 21 pointers/line ──────
-   // Direct-index dense node, derived from sizeof(Ptr): as many branches as fit a cacheline
-   // beside the 2-byte (nset,rsvd) population counter, and enough lines to cover all 256 bytes.
-   template <class Ptr>
-   inline constexpr unsigned full_per_line_v = (cacheline_bytes - 2) / unsigned(sizeof(Ptr));  // 21 at 6B
-   template <class Ptr>
-   inline constexpr unsigned full_lines_v = (256 + full_per_line_v<Ptr> - 1) / full_per_line_v<Ptr>;  // 13 at 6B
+   // ── dense router: sparse_full — CL0 header + popcount(presence) range lines ──
+   // §3.4 of v2_node_spec.md. The 256 byte-values split into 16 sub-ranges of 16
+   // (sub = byte>>4, slot = byte&0xF). A 16-bit PRESENCE vector (bit sub ⇒ that
+   // sub-range exists) lives in CL0; only OCCUPIED sub-ranges materialize, stored
+   // CONTIGUOUSLY in rank order. This is the memory win over the old fixed 13-line
+   // (all-256-bytes) dense node: a 56-branch full now costs 128 + popcount*128 B,
+   // not a flat 1792 B. Same K::node_full / K::pfxd tags, same 6-byte handle — only
+   // the byte representation changed. This stage stores presence IN the node's CL0
+   // (the headerless presence-in-handle is a later build stage).
+   //
+   //   sub  = byte >> 4
+   //   present = (presence >> sub) & 1               // else MISS
+   //   rank = popcount(presence & ((1<<sub) - 1))    // == sub when presence==0xFFFF
+   //   range = (char*)node + 128 + rank*128
+   //   child = *(Ptr*)(range + (byte & 0xF) * sizeof(Ptr))
+   //
+   // Each range line covers 16 byte-values (16 child handles = 16*W; the spare bytes
+   // are unused THIS stage — the per-range replicated prefix is deferred). nset rides
+   // in the range line's spare tail for empty-line skip in ordered iteration.
+   //
+   // Geometry is fixed by the spec: 16 sub-ranges of 16 byte-values (sub = byte>>4,
+   // slot = byte&0xF) — not derived from sizeof(Ptr) like the old reciprocal-index node.
+   // A range line: 16 handles up front (the routed slot is range + slot*W), nset in
+   // the spare tail (population, for ordered-iteration empty-line skip).
    template <class Ptr>
    struct cline_direct_t
    {
-      Ptr     ptr[full_per_line_v<Ptr>];
-      uint8_t nset;  // population of this line; optional, iteration only
-      uint8_t rsvd;
-      [[no_unique_address]] pad_t<cacheline_bytes - full_per_line_v<Ptr> * unsigned(sizeof(Ptr)) - 2>
-          pad;  // tile to one CL (node_full_t static_asserts it per instantiation)
+      static_assert(16u * unsigned(sizeof(Ptr)) <= cacheline_bytes, "16 handles fit one cacheline");
+      // 16 child slots = one sub-range. At the 8-byte meta-handle this is 16x8 = 128 B exactly
+      // (zero waste, no header). Iteration counts live slots by scanning for non-null — there is
+      // no `nset` field (it would not fit at width 8, and the scan is the same result).
+      Ptr ptr[16];
+      [[no_unique_address]] pad_t<cacheline_bytes - 16u * unsigned(sizeof(Ptr))> pad;
    };
    using cline_direct = cline_direct_t<packed_ptr>;
    static_assert(sizeof(cline_direct) == 128, "direct line is one cacheline");
 
+   // node_full_t models ONLY CL0 (the fixed header). The range lines are a variable
+   // tail of popcount(presence) cachelines laid out immediately after, addressed by
+   // pointer arithmetic (full_range below) — never as a flexible array member.
+   //
+   // CL0: [router_hdr rh][u16 presence][hdr...] where hdr = [pfxd_kind][prefix bytes].
+   // When the node carries an inline prefix it is HANDLE-TAGGED K::pfxd (a hint: "the
+   // header holds something you need"); hdr[0] records the REAL kind, hdr[1..] the
+   // prefix, rh.hdr.prefix_len the count. Plain K::node_full nodes never read CL0's
+   // prefix region — but presence is now ALWAYS in CL0 (it's read on every descent).
    template <class Ptr>
    struct node_full_t
    {
       static_assert(sizeof(cline_direct_t<Ptr>) == cacheline_bytes, "direct line tiles one cacheline");
-      // CL0's spare capacity carries the node's inline prefix when one exists: the
-      // node is then HANDLE-TAGGED K::pfxd (a hint: "the header holds something you
-      // need"), hdr[0] records the node's REAL kind, hdr[1..] the prefix bytes, and
-      // rh.hdr.prefix_len the count (6-bit field bounds the cap). The prefix lives in
-      // the header cacheline whenever it fits — prefix_node is the OVERFLOW form, not
-      // the default. With no prefix the node is tagged K::node_full and descent
-      // direct-indexes without ever touching CL0 (the skip-CL0 fast path, unchanged).
+      // presence sits between rh and the prefix region, so the pfxd kind byte/prefix
+      // shift past it (PFX_OFF below). PFX_CAP shrinks by the 2 presence bytes vs v1.
+      static constexpr unsigned PRES_OFF = unsigned(sizeof(router_hdr_t<Ptr>));
+      static constexpr unsigned PFX_OFF  = PRES_OFF + 2;  // [kind][prefix...] starts here
       static constexpr unsigned PFX_CAP =
-          std::min(63u, cacheline_bytes - unsigned(sizeof(router_hdr_t<Ptr>)) - 1);
-      router_hdr_t<Ptr>   rh;
-      uint8_t             hdr[cacheline_bytes - sizeof(router_hdr_t<Ptr>)];  // [kind][prefix...]
-      cline_direct_t<Ptr> ranges[full_lines_v<Ptr>];  // bytes 0..255, branchfree reciprocal index
+          std::min(63u, cacheline_bytes - PFX_OFF - 1);
+      router_hdr_t<Ptr> rh;
+      uint16_t          presence;  // bit s ⇒ sub-range s materialized (16 sub-ranges)
+      uint8_t           hdr[cacheline_bytes - PFX_OFF];  // [kind][prefix...]
    };
    using node_full = node_full_t<packed_ptr>;
-   static_assert(sizeof(node_full) == 128 + full_lines_v<packed_ptr> * 128, "node_full = header + lines");
+   static_assert(sizeof(node_full) == cacheline_bytes, "node_full CL0 is one cacheline");
 
-   // byte -> (line, slot) with no divide: line = byte/21, slot = byte%21.
-   // 3121 = ceil(2^16/21); exact for all bytes 0..255 (the smaller s=12 magic errs at 251).
+   // node_size for a sparse_full: CL0 + popcount(presence) range lines.
    template <class Ptr>
-   inline void full_index(uint8_t byte, unsigned& line, unsigned& slot) noexcept
+   inline size_t full_node_bytes(const node_full_t<Ptr>* f) noexcept
    {
-      constexpr unsigned PL = full_per_line_v<Ptr>;
-      if constexpr ((PL & (PL - 1)) == 0)  // power-of-2 lines (8B=16, 4B=32) → shift/mask, no magic
-      {
-         constexpr unsigned SH = unsigned(std::countr_zero(PL));
-         line = unsigned(byte) >> SH;
-         slot = unsigned(byte) & (PL - 1);
-      }
-      else  // non-power-of-2: reciprocal-multiply divide (3121 at 21/line), exactness proven 0..255
-      {
-         constexpr unsigned RM = (1u << 16) / PL + 1;  // ceil(2^16/PL)
-         static_assert([] {
-            for (unsigned b = 0; b < 256; ++b)
-               if ((b * RM) >> 16 != b / PL) return false;
-            return true;
-         }(), "full_index reciprocal must be exact for every byte");
-         line = (unsigned(byte) * RM) >> 16;
-         slot = unsigned(byte) - line * PL;
-      }
+      return cacheline_bytes + size_t(std::popcount(f->presence)) * cacheline_bytes;
    }
-   // Precomputed byte -> byte-offset of ranges[byte/N].ptr[byte%N] from the node base.
-   // Collapses the reciprocal + slot multiply on the descent hot path to one L1 load.
+   // The rank-th materialized range line (rank in [0, popcount(presence))).
    template <class Ptr>
-   inline constexpr std::array<uint16_t, 256> make_full_offtab() noexcept
+   inline cline_direct_t<Ptr>* full_range(node_full_t<Ptr>* f, unsigned rank) noexcept
    {
-      std::array<uint16_t, 256> t{};
-      for (int b = 0; b < 256; ++b)
-      {
-         const int li = b / int(full_per_line_v<Ptr>), slot = b - li * int(full_per_line_v<Ptr>);
-         t[size_t(b)] = uint16_t(128 + li * 128 + slot * int(sizeof(Ptr)));
-      }
-      return t;
+      return reinterpret_cast<cline_direct_t<Ptr>*>(reinterpret_cast<char*>(f) + cacheline_bytes) + rank;
    }
    template <class Ptr>
-   inline constexpr std::array<uint16_t, 256> full_offtab_v = make_full_offtab<Ptr>();
+   inline const cline_direct_t<Ptr>* full_range(const node_full_t<Ptr>* f, unsigned rank) noexcept
+   {
+      return reinterpret_cast<const cline_direct_t<Ptr>*>(reinterpret_cast<const char*>(f) +
+                                                          cacheline_bytes) +
+             rank;
+   }
+   // rank of sub-range `sub` (count of present sub-ranges below it). For presence
+   // 0xFFFF this is identically `sub` — the rank-free fast path.
+   inline unsigned full_rank(uint16_t presence, unsigned sub) noexcept
+   {
+      return unsigned(std::popcount(unsigned(presence) & ((1u << sub) - 1u)));
+   }
    template <class Ptr>
    inline Ptr full_find(const node_full_t<Ptr>* f, uint8_t byte) noexcept
    {
-      unsigned li, slot;
-      full_index<Ptr>(byte, li, slot);
-      return f->ranges[li].ptr[slot];
+      const unsigned sub = unsigned(byte) >> 4;
+      if (!((f->presence >> sub) & 1u))
+         return Ptr::null();
+      return full_range<Ptr>(f, full_rank(f->presence, sub))->ptr[byte & 0xF];
+   }
+   // Slot pointer for byte (existing OR present-but-null), or nullptr when the whole
+   // sub-range is absent. (Mirrors v1: a present sub-range with a null slot returns a
+   // writable slot; an absent sub-range returns nullptr so the caller GROWS.)
+   template <class Ptr>
+   inline Ptr* full_slot(node_full_t<Ptr>* f, uint8_t byte) noexcept
+   {
+      const unsigned sub = unsigned(byte) >> 4;
+      if (!((f->presence >> sub) & 1u))
+         return nullptr;
+      return &full_range<Ptr>(f, full_rank(f->presence, sub))->ptr[byte & 0xF];
    }
    template <class Ptr>
-   inline void full_set(node_full_t<Ptr>* f, uint8_t byte, Ptr p) noexcept
+   inline void full_init(node_full_t<Ptr>* f) noexcept  // an empty node: zero sub-ranges
    {
-      unsigned li, slot;
-      full_index<Ptr>(byte, li, slot);
-      const bool was_null = f->ranges[li].ptr[slot].is_null();
-      f->ranges[li].ptr[slot] = p;
-      if (was_null && !p.is_null())
-      {
-         ++f->ranges[li].nset;
-         ++f->rh.hdr.nbranch;
-      }
-      else if (!was_null && p.is_null())
-      {
-         --f->ranges[li].nset;
-         --f->rh.hdr.nbranch;
-      }
+      f->rh.hdr   = node_hdr{0, 0, 0};
+      f->rh.term  = Ptr::null();
+      f->presence = 0;
    }
+   // Set byte -> p WITHIN an already-present sub-range. The sub-range MUST be present
+   // (presence bit set); growth (adding a sub-range) is the tree's job (full_grow_),
+   // because it reallocates the contiguous block. Maintains nset + nbranch.
    template <class Ptr>
-   inline void full_init(node_full_t<Ptr>* f) noexcept
+   inline void full_set_present(node_full_t<Ptr>* f, uint8_t byte, Ptr p) noexcept
    {
-      f->rh.hdr  = node_hdr{0, 0, 0};
-      f->rh.term = Ptr::null();
-      for (auto& line : f->ranges)
-      {
-         std::memset(line.ptr, 0xFF, sizeof(line.ptr));  // every slot -> null
-         line.nset = 0;
-         line.rsvd = 0;
-      }
+      const unsigned       sub = unsigned(byte) >> 4;
+      assert(((f->presence >> sub) & 1u) && "full_set_present: sub-range must exist");
+      cline_direct_t<Ptr>* ln       = full_range<Ptr>(f, full_rank(f->presence, sub));
+      Ptr&                 slot     = ln->ptr[byte & 0xF];
+      const bool           was_null = slot.is_null();
+      slot                          = p;
+      if (was_null && !p.is_null()) ++f->rh.hdr.nbranch;
+      else if (!was_null && p.is_null()) --f->rh.hdr.nbranch;
    }
 
    // ── bucket: the "last-mile" terminal — a flat, lexicographically-sorted set of
@@ -478,7 +494,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
    };
 
    template <class A, class = void>
-   struct handle_of { using type = packed_ptr; };
+   struct handle_of { using type = meta_ptr; };  // headerless 8-byte meta-handle by default
    template <class A>
    struct handle_of<A, std::void_t<typename A::artpp_handle>> { using type = typename A::artpp_handle; };
 
@@ -893,16 +909,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return ins;
                }
                const uint8_t byte = uint8_t(key[depth]);
-               packed_ptr*   cs   = reinterpret_cast<packed_ptr*>(f + full_offtab_v<Ptr>[byte]);
-               if (!cs->is_null())  // existing child -> descend
+               packed_ptr*   cs   = full_slot(reinterpret_cast<node_full*>(f), byte);
+               if (cs && !cs->is_null())  // existing child -> descend
                {
                   if constexpr (WideStems) pslot = slot;
                   slot  = cs;
                   ++depth;
                   continue;
                }
-               full_set(reinterpret_cast<node_full*>(f), byte,
-                        make_value_at(key, depth + 1, std::forward<VF>(v)));  // node_full never overflows
+               // No child here: present-but-null slot (set in place) or absent sub-range
+               // (grow the node, splicing the new range). Either way the value is built
+               // first and guarded so a grow OOM can't orphan it.
+               packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
+               build_guard glf{this, &lf};
+               full_insert_child_(slot, cur, byte, lf);
+               glf.release();
                ++count_;
                return true;
             }
@@ -932,16 +953,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      return ins;
                   }
                   const uint8_t byte = uint8_t(key[depth]);
-                  packed_ptr*   cs   = reinterpret_cast<packed_ptr*>(f + full_offtab_v<Ptr>[byte]);
-                  if (!cs->is_null())  // existing child -> descend
+                  packed_ptr*   cs   = full_slot(reinterpret_cast<node_full*>(f), byte);
+                  if (cs && !cs->is_null())  // existing child -> descend
                   {
                      if constexpr (WideStems) pslot = slot;
                      slot = cs;
                      ++depth;
                      continue;
                   }
-                  full_set(reinterpret_cast<node_full*>(f), byte,
-                           make_value_at(key, depth + 1, std::forward<VF>(v)));
+                  packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
+                  build_guard glf{this, &lf};
+                  full_insert_child_(slot, cur, byte, lf);
+                  glf.release();
                   ++count_;
                   return true;
                }
@@ -1154,22 +1177,26 @@ namespace detail  // implementation types & node helpers — not part of the pub
    if (klen - depth < 2) return depth == klen ? op.term(&s->rh) : op.miss(); \
    const uint16_t q = uint16_t(uint16_t(uint8_t(kp[depth])) << 8 | uint8_t(kp[depth + 1])); \
    raw = sl16_find(s, q).raw(); ARTPP_NEXT(depth + 2); }
+/* sparse_full (§3.4): presence rides in CL0; the routed sub-range, if present, is the
+   rank-th materialized range line. An absent sub-range → MISS (full_find returns null,
+   whose all-1s raw reads as K::null next iteration). One presence read + popcount-rank
+   computes the line offset — no static offset table (the offset is per-node now). */
 #define ARTPP_BODY_FULL { \
-   const char* p = ARTPP_PTR(raw); \
-   if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
-   std::memcpy(&raw, p + full_offtab_v<Ptr>[uint8_t(kp[depth])], sizeof(Ptr)); ARTPP_NEXT(depth + 1); }
+   const node_full* f = reinterpret_cast<const node_full*>(ARTPP_PTR(raw)); \
+   if (depth == klen) return op.term(&f->rh); \
+   raw = full_find(f, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
 /* pfxd: the handle says "consume the in-header prefix first"; the node's real kind is
    hdr[0] (node_full is the only header-capacity kind today, so the body IS the full
-   body — offtab offsets are identical). One CL0 load serves prefix + term, and the
-   slot line is the NEXT line of the same node (no pointer chase between them). */
+   body). One CL0 load serves prefix + presence + term, and the routed range line is a
+   later line of the same node (no pointer chase between them). */
 #define ARTPP_BODY_PFXD { \
-   const char* p = ARTPP_PTR(raw); \
-   const unsigned pl = reinterpret_cast<const router_hdr*>(p)->hdr.prefix_len; \
-   if (klen - depth < pl || std::memcmp(p + sizeof(router_hdr) + 1, kp + depth, pl) != 0) \
+   const node_full* f = reinterpret_cast<const node_full*>(ARTPP_PTR(raw)); \
+   const unsigned pl = f->rh.hdr.prefix_len; \
+   if (klen - depth < pl || std::memcmp(f->hdr + 1, kp + depth, pl) != 0) \
       return op.miss(); \
    depth += pl; \
-   if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
-   std::memcpy(&raw, p + full_offtab_v<Ptr>[uint8_t(kp[depth])], sizeof(Ptr)); ARTPP_NEXT(depth + 1); }
+   if (depth == klen) return op.term(&f->rh); \
+   raw = full_find(f, uint8_t(kp[depth])).raw(); ARTPP_NEXT(depth + 1); }
 #define ARTPP_BODY_CN(N) { \
    const char* p = ARTPP_PTR(raw); \
    if (depth == klen) return op.term(reinterpret_cast<const router_hdr*>(p)); \
@@ -2942,9 +2969,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                uint8_t pfx[setlist::PREFIX_CAP];
                std::memcpy(pfx, s->prefix, pl);
                s->rh.hdr.prefix_len = 0;
-               packed_ptr w         = node;
-               do w = widen(w);
-               while (!router_try_set(w, byte, child));
+               packed_ptr w         = widen_set_(node, byte, child);  // ladder + sparse_full grow
                gc.release();
                return pl ? make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), w) : w;
             }
@@ -2978,8 +3003,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                ins              = true;
                packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
                build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
-               packed_ptr w     = node;
-               while (!router_try_set(w, byte, child)) w = widen(w);
+               packed_ptr w     = widen_set_(node, byte, child);  // ladder + sparse_full grow
                gc.release();
                return w;
             }
@@ -2998,7 +3022,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                                                                 // against widen/shrink ping-pong
 
       // Free the node at *L.slot (already unlinked logically); kinds of router only.
-      void rm_free_(packed_ptr nd) noexcept { node_free_(deref_(nd), node_size(nd.tag())); }
+      void rm_free_(packed_ptr nd) noexcept { node_free_(deref_(nd), node_bytes_(nd)); }
 
       // Collapse a single-branch term-less router: absorb its inline prefix (setlist only)
       // + the edge to its one child INTO the child — free when the child is a setlist with
@@ -4255,19 +4279,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // consume"; the node's REAL kind is recorded in the header itself. Today the
       // node_full is the kind with header capacity (its CL0 was pure padding); cN and
       // wide setlists keep prefix_node as their overflow. Layout behind a pfxd handle:
-      //   CL0: router_hdr | kind (u8) | prefix bytes (rh.hdr.prefix_len of them)
-      //   CL1+: the kind's normal body at its normal offsets (offtab unchanged).
+      //   CL0: router_hdr | u16 presence | kind (u8) | prefix bytes (rh.hdr.prefix_len of them)
+      //   tail: popcount(presence) range lines (sparse_full body). The kind byte + prefix
+      //   live PAST the presence vector (node_full::PFX_OFF), so pfxd reads CL0 once for
+      //   prefix + presence + term, then the routed range line is a later line of the node.
       static K pfxd_kind(const void* n) noexcept
       {
-         return K(static_cast<const uint8_t*>(n)[sizeof(router_hdr)]);
+         return K(static_cast<const uint8_t*>(n)[node_full::PFX_OFF]);
       }
       static uint8_t* pfxd_pfx(void* n) noexcept
       {
-         return static_cast<uint8_t*>(n) + sizeof(router_hdr) + 1;
+         return static_cast<uint8_t*>(n) + node_full::PFX_OFF + 1;
       }
       static const uint8_t* pfxd_pfx(const void* n) noexcept
       {
-         return static_cast<const uint8_t*>(n) + sizeof(router_hdr) + 1;
+         return static_cast<const uint8_t*>(n) + node_full::PFX_OFF + 1;
       }
       static unsigned pfxd_plen(const void* n) noexcept
       {
@@ -4390,7 +4416,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                             [&](uint8_t b1, packed_ptr gc) { sl16_set(U, uint16_t(uint16_t(b0) << 8 | b1), gc); });
          }
          for (int i = 0; i < nb; ++i)  // the child routers are absorbed; grandchildren are reused
-            node_free_(deref_(P->branch[i]), node_size(P->branch[i].tag()));
+            node_free_(deref_(P->branch[i]), node_bytes_(P->branch[i]));
          node_free_(P, sizeof(setlist));
          *pslot = pack_(U, K::setlist_u16);
       }
@@ -4457,22 +4483,34 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
 
       // ── router dispatch over the tier family {setlist, c2, c4, c8, node_full} ───
+      // FIXED-size kinds only: node_full / pfxd are now PER-NODE (128 + popcount*128),
+      // so they must be sized from the node via node_bytes_(handle), not from the tag.
       static size_t node_size(K k) noexcept
       {
          switch (k)
          {
-            case K::pfxd:        return sizeof(node_full);  // only header-capacity kind today
             case K::setlist_u8:  return sizeof(setlist);
             case K::setlist_u16: return sizeof(setlist16);
             case K::c2:          return sizeof(cnode<2>);
             case K::c4:          return sizeof(cnode<4>);
             case K::c8:          return sizeof(cnode<8>);
-            case K::node_full:   return sizeof(node_full);
-            // exhaustive (no default): a new node kind must declare its size here.
+            // node_full / pfxd are variable-sized: route them through node_bytes_(handle).
+            case K::pfxd: case K::node_full:
             case K::value_ptr: case K::value_inline: case K::prefix_node:
             case K::bucket: case K::null:
-               assert(false); __builtin_unreachable();
+               assert(false && "fixed-size kinds only — use node_bytes_(handle)");
+               __builtin_unreachable();
          }
+      }
+      // Allocation byte count for ANY router handle — per-node for sparse_full/pfxd
+      // (128 + popcount(presence)*128), fixed for the rest. Every free site that can see
+      // a node_full sizes through here, never node_size(tag).
+      size_t node_bytes_(packed_ptr nd) const noexcept
+      {
+         const K k = nd.tag();
+         if (k == K::node_full || k == K::pfxd)
+            return full_node_bytes<Ptr>(static_cast<const node_full*>(deref_(nd)));
+         return node_size(k);
       }
       // ONE typed visitor for the byte-router family: switch on the tag once, hand the
       // TYPED node to f. Every byte-router dispatcher below is a packed_ptr -> typed-overload
@@ -4553,25 +4591,22 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       static bool router_next(node_full* f, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
-         unsigned li, sl;
-         full_index<Ptr>(uint8_t(from), li, sl);
-         for (; li < full_lines_v<Ptr>; ++li, sl = 0)
+         // First child with byte >= from. Walk present sub-ranges ascending (presence bit
+         // set ⇒ a materialized range line at popcount-rank); within one scan its 16 slots.
+         unsigned sub  = unsigned(from) >> 4;
+         unsigned slot = unsigned(from) & 0xF;
+         for (; sub < 16; ++sub, slot = 0)
          {
-            const cline_direct_t<Ptr>& ln = f->ranges[li];
-            if (ln.nset == 0)
-               continue;  // empty line: population is tracked
-            for (; sl < full_per_line_v<Ptr>; ++sl)
-            {
-               const unsigned byte = li * full_per_line_v<Ptr> + sl;
-               if (byte > 255)
-                  return false;
-               if (!ln.ptr[sl].is_null())
+            if (!((f->presence >> sub) & 1u))
+               continue;  // sub-range absent
+            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(f->presence, sub));
+            for (; slot < 16; ++slot)
+               if (!ln->ptr[slot].is_null())
                {
-                  ob = uint8_t(byte);
-                  oc = ln.ptr[sl];
+                  ob = uint8_t((sub << 4) | slot);
+                  oc = ln->ptr[slot];
                   return true;
                }
-            }
          }
          return false;
       }
@@ -4618,23 +4653,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       static bool router_prev(node_full* f, int from, uint8_t& ob, packed_ptr& oc) noexcept
       {
-         unsigned li, sl;
-         full_index<Ptr>(uint8_t(from), li, sl);
-         for (int L = int(li); L >= 0; --L)
+         // Last child with byte <= from. Walk present sub-ranges descending.
+         int sub  = from >> 4;
+         int slot = from & 0xF;
+         for (; sub >= 0; --sub, slot = 15)
          {
-            const cline_direct_t<Ptr>& ln = f->ranges[size_t(L)];
-            const int s0 = (L == int(li)) ? int(sl) : int(full_per_line_v<Ptr>) - 1;
-            if (ln.nset == 0)
-               continue;  // empty line: population is tracked
-            for (int S = s0; S >= 0; --S)
-            {
-               if (!ln.ptr[S].is_null())
+            if (!((f->presence >> sub) & 1u))
+               continue;  // sub-range absent
+            const cline_direct_t<Ptr>* ln = full_range<Ptr>(f, full_rank(f->presence, unsigned(sub)));
+            for (int S = slot; S >= 0; --S)
+               if (!ln->ptr[S].is_null())
                {
-                  ob = uint8_t(unsigned(L) * full_per_line_v<Ptr> + unsigned(S));
-                  oc = ln.ptr[S];
+                  ob = uint8_t((unsigned(sub) << 4) | unsigned(S));
+                  oc = ln->ptr[S];
                   return true;
                }
-            }
          }
          return false;
       }
@@ -4653,10 +4686,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       static packed_ptr* router_find_slot(node_full* f, uint8_t byte) noexcept
       {
-         unsigned li, sl;
-         full_index<Ptr>(byte, li, sl);
-         packed_ptr* p = &f->ranges[li].ptr[sl];
-         return p->is_null() ? nullptr : p;
+         packed_ptr* p = full_slot(f, byte);  // null when the sub-range is absent
+         return (p && !p->is_null()) ? p : nullptr;
       }
       packed_ptr* router_find_slot(packed_ptr cur, uint8_t byte) const noexcept
       {
@@ -4669,7 +4700,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static bool router_try_set(cnode<N>* c, uint8_t byte, packed_ptr p) noexcept { return cnode_set(c, byte, p); }
       static bool router_try_set(node_full* f, uint8_t byte, packed_ptr p) noexcept
       {
-         full_set(f, byte, p);  // node_full never overflows
+         // The sub-range must already be present — growth (materializing a new sub-range)
+         // is full_grow_/full_insert_child_ (they realloc + re-anchor the handle, which a
+         // static setter can't). Reached only from clone (presence preserved) and the few
+         // structural callers that operate within an already-built node's sub-ranges.
+         full_set_present(f, byte, p);
          return true;
       }
       bool router_try_set(packed_ptr cur, uint8_t byte, packed_ptr p) const noexcept
@@ -4682,7 +4717,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static void router_remove(setlist* s, uint8_t byte) noexcept { setlist_remove(s, byte); }
       template <int N>
       static void router_remove(cnode<N>* c, uint8_t byte) noexcept { cnode_remove(c, byte); }
-      static void router_remove(node_full* f, uint8_t byte) noexcept { full_set(f, byte, packed_ptr::null()); }
+      static void router_remove(node_full* f, uint8_t byte) noexcept
+      {
+         // Null the slot in place; the sub-range LINE is kept (matches v1 — the node only
+         // shrinks via rm_shrink_'s de-widen-to-setlist, never by dropping a range here,
+         // so node_size stays consistent across the node's lifetime). Absent sub-range is
+         // a no-op (nothing to remove).
+         if ((f->presence >> (unsigned(byte) >> 4)) & 1u) full_set_present(f, byte, packed_ptr::null());
+      }
       void router_remove(packed_ptr cur, uint8_t byte) const noexcept
       {
          if (cur.tag() == K::setlist_u8)  // inline-aware: keep inl in sync with branch[]
@@ -4714,16 +4756,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <class F>
       static void router_for_each(node_full* fn, F&& f)
       {
-         for (unsigned li = 0; li < full_lines_v<Ptr>; ++li)
+         // Visit (byte, child) ascending: present sub-ranges in rank order, then each
+         // sub-range's 16 slots. rank advances only on present sub-ranges, so the range
+         // line pointer steps contiguously.
+         unsigned rank = 0;
+         for (unsigned sub = 0; sub < 16; ++sub)
          {
-            if (fn->ranges[li].nset == 0)  // skip empty lines (population is tracked)
+            if (!((fn->presence >> sub) & 1u))
                continue;
-            for (unsigned sl = 0; sl < full_per_line_v<Ptr>; ++sl)
-            {
-               const unsigned byte = li * full_per_line_v<Ptr> + sl;
-               if (byte < 256 && !fn->ranges[li].ptr[sl].is_null())
-                  f(uint8_t(byte), fn->ranges[li].ptr[sl]);
-            }
+            const cline_direct_t<Ptr>* ln = full_range<Ptr>(fn, rank++);
+            for (unsigned slot = 0; slot < 16; ++slot)  // scan slots; empty ranges contribute none
+               if (!ln->ptr[slot].is_null())
+                  f(uint8_t((sub << 4) | slot), ln->ptr[slot]);
          }
       }
       template <class F>
@@ -4744,7 +4788,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // memory + tighter ordered iteration than a sparse full). Occupancy is bimodal — a router
       // ends at ~30 branches or ~256, little between — so c4→full is the right jump and the c8
       // rung is dead weight (skipped unless LadderC8, kept for adversarial mid-density clusters).
-      packed_ptr widen(packed_ptr cur)
+      // `reserve_sub` (0..15, or -1): when widening TO a sparse_full, materialize this
+      // sub-range too, so the caller's subsequent set never needs a second alloc (grow)
+      // after widen already freed the source — closing the dangling-pointer/leak window.
+      packed_ptr widen(packed_ptr cur, int reserve_sub = -1)
       {
          const K k = cur.tag();
          // cN / node_full have no inline region: a setlist's inline leaves must become
@@ -4757,15 +4804,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
          const size_t os = node_size(k);
          packed_ptr   out;
          if constexpr (!DenseTiers)
-            out = build_wider<node_full>(cur, K::node_full);  // flat_full: straight to full
+            out = build_full(cur, K::node_full, reserve_sub);  // flat_full: straight to full
          else if (k == K::setlist_u8) out = build_wider<cnode<2>>(cur, K::c2);
          else if (k == K::c2)         out = build_wider<cnode<4>>(cur, K::c4);
          else if (k == K::c4)
          {
             if constexpr (LadderC8) out = build_wider<cnode<8>>(cur, K::c8);
-            else                    out = build_wider<node_full>(cur, K::node_full);  // skip dead c8
+            else                    out = build_full(cur, K::node_full, reserve_sub);  // skip dead c8
          }
-         else if (k == K::c8)         out = build_wider<node_full>(cur, K::node_full);  // only if LadderC8
+         else if (k == K::c8)         out = build_full(cur, K::node_full, reserve_sub);  // only if LadderC8
          else { assert(false); __builtin_unreachable(); }
          node_free_(deref_(cur), os);
          return out;
@@ -4773,21 +4820,111 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <class N>
       packed_ptr build_wider(packed_ptr src, K newtag)
       {
+         static_assert(!std::is_same_v<N, node_full>, "use build_full for sparse_full (per-node sized)");
          N* n = ::new (node_alloc_(sizeof(N))) N;
-         if constexpr (std::is_same_v<N, node_full>)
-            full_init(n);
-         else
-            cnode_init(n);
-         router_hdr* srh      = static_cast<router_hdr*>(deref_(src));
-         n->rh.hdr.has_term   = srh->hdr.has_term;
-         n->rh.term           = srh->term;
-         packed_ptr np        = pack_(n, newtag);
+         cnode_init(n);
+         router_hdr* srh    = static_cast<router_hdr*>(deref_(src));
+         n->rh.hdr.has_term = srh->hdr.has_term;
+         n->rh.term         = srh->term;
+         packed_ptr np      = pack_(n, newtag);
          router_for_each(src, [&](uint8_t b, packed_ptr br) {
             const bool ok = router_try_set(np, b, br);
             assert(ok && "next tier always has room for a rebuild");
             (void)ok;
          });
          return np;
+      }
+      // Build a COMPACT sparse_full from a narrower router `src`: scan its branches to
+      // learn the occupied sub-ranges (presence), allocate 128 + popcount*128 bytes,
+      // then fill. `reserve_sub` (0..15, or -1) forces an extra empty sub-range so the
+      // caller can set a NEW byte in place with no further alloc. `src`'s term carries
+      // over; `src` is freed by the caller (widen).
+      packed_ptr build_full(packed_ptr src, K newtag, int reserve_sub = -1)
+      {
+         uint16_t presence = reserve_sub >= 0 ? uint16_t(1u << reserve_sub) : 0;
+         router_for_each(src, [&](uint8_t b, packed_ptr) { presence |= uint16_t(1u << (b >> 4)); });
+         const unsigned nr = unsigned(std::popcount(presence));
+         node_full*     n  = ::new (node_alloc_(cacheline_bytes + size_t(nr) * cacheline_bytes)) node_full;
+         full_init(n);
+         n->presence = presence;
+         for (unsigned r = 0; r < nr; ++r)  // null every materialized slot
+            std::memset(full_range<Ptr>(n, r)->ptr, 0xFF, sizeof(cline_direct_t<Ptr>::ptr));
+         router_hdr* srh    = static_cast<router_hdr*>(deref_(src));
+         n->rh.hdr.has_term = srh->hdr.has_term;
+         n->rh.term         = srh->term;
+         router_for_each(src, [&](uint8_t b, packed_ptr br) { full_set_present(n, b, br); });
+         return pack_(n, newtag);
+      }
+      // Insert byte->child into a sparse_full at *slot (cur == *slot). If byte's
+      // sub-range is present, set in place; else grow (re-anchoring *slot to the new
+      // node, same tag) and then set. `child` must be guarded by the caller — full_grow_
+      // can throw (alloc), leaving the tree unchanged.
+      void full_insert_child_(packed_ptr* slot, packed_ptr cur, uint8_t byte, packed_ptr child)
+      {
+         node_full* f = static_cast<node_full*>(deref_(cur));
+         if (!((f->presence >> (unsigned(byte) >> 4)) & 1u))  // absent sub-range → grow
+         {
+            const packed_ptr nf = full_grow_(cur, byte);  // throws → unchanged
+            *slot               = nf;
+            f                   = static_cast<node_full*>(deref_(nf));
+         }
+         full_set_present(f, byte, child);
+      }
+      // Grow a sparse_full (or pfxd full) by materializing the absent sub-range that
+      // `byte` falls in: reallocate the contiguous block with one more range line
+      // spliced at rank, set the presence bit, and return the re-anchored handle (same
+      // tag). The new range line's slots are all null — the caller then sets byte's.
+      packed_ptr full_grow_(packed_ptr cur, uint8_t byte)
+      {
+         node_full*     of  = static_cast<node_full*>(deref_(cur));
+         const unsigned sub = unsigned(byte) >> 4;
+         assert(!((of->presence >> sub) & 1u) && "full_grow_: sub-range already present");
+         const unsigned old_nr = unsigned(std::popcount(of->presence));
+         const unsigned rank   = full_rank(of->presence, sub);
+         node_full*     nf =
+             ::new (node_alloc_(cacheline_bytes + size_t(old_nr + 1) * cacheline_bytes)) node_full;
+         std::memcpy(static_cast<void*>(nf), static_cast<const void*>(of), cacheline_bytes);  // CL0
+         nf->presence = uint16_t(of->presence | (1u << sub));
+         // ranges [0, rank) copy verbatim; the new range goes at `rank`; [rank, old_nr)
+         // shift up by one.
+         for (unsigned r = 0; r < rank; ++r)
+            std::memcpy(static_cast<void*>(full_range<Ptr>(nf, r)),
+                        static_cast<const void*>(full_range<Ptr>(of, r)), cacheline_bytes);
+         cline_direct_t<Ptr>* nl = full_range<Ptr>(nf, rank);  // the freshly materialized sub-range
+         std::memset(nl->ptr, 0xFF, sizeof(nl->ptr));
+         for (unsigned r = rank; r < old_nr; ++r)
+            std::memcpy(static_cast<void*>(full_range<Ptr>(nf, r + 1)),
+                        static_cast<const void*>(full_range<Ptr>(of, r)), cacheline_bytes);
+         node_free_(of, full_node_bytes<Ptr>(of));
+         return pack_(nf, cur.tag());  // same tag (node_full or pfxd); address re-anchored
+      }
+      // Widen `node` (freeing each predecessor) until byte->child fits in place, or it
+      // reaches a sparse_full — which may need a GROW (materialize byte's sub-range) when
+      // byte falls outside the carried-over presence. Returns the final node handle
+      // (re-anchored by full_grow_ when it reallocated). `child` must be caller-guarded.
+      // The by-value sibling of grow_router_'s ladder, for callers that re-link by return
+      // value (bkt_put) rather than through a held *slot.
+      packed_ptr widen_set_(packed_ptr node, uint8_t byte, packed_ptr child)
+      {
+         for (;;)
+         {
+            // Top tier = any sparse_full body: a plain K::node_full OR a K::pfxd (a full
+            // carrying a fused in-header prefix — bkt_put reaches here with a pfxd node
+            // after consuming its prefix). BOTH need grow-or-set on an absent sub-range;
+            // routing a pfxd to router_try_set below would call full_set_present without
+            // the presence guard and write through a bogus rank. Re-anchored by return
+            // value. Safe: an entry-already-full node was NOT freed by a widen in this
+            // call (the dangling window is only post-widen, closed by reserve).
+            if (node.tag() == K::node_full || node.tag() == K::pfxd)
+            {
+               if (!((static_cast<node_full*>(deref_(node))->presence >> (unsigned(byte) >> 4)) & 1u))
+                  node = full_grow_(node, byte);  // throws → unchanged, caller's guard frees child
+               full_set_present(static_cast<node_full*>(deref_(node)), byte, child);
+               return node;
+            }
+            if (router_try_set(node, byte, child)) return node;  // setlist/cN: set in place
+            node = widen(node, int(byte) >> 4);  // widen→full reserves byte's sub-range (no grow)
+         }
       }
       // Grow the router at *slot until byte->child fits, then leave the result in *slot. The
       // widen ladder (setlist→c2→c4→c8→full under dense tiers) can take MULTIPLE steps, and the
@@ -4814,11 +4951,23 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
          }
          packed_ptr node = cur;
-         while (!router_try_set(node, byte, child))
+         // The slot that HOLDS the router being widened: *slot directly, or the lifted
+         // prefix node's next field when a setlist prefix was hoisted above it.
+         packed_ptr* rslot = pn ? reinterpret_cast<packed_ptr*>(pn + 2) : slot;
+         // Drive the ladder until byte->child fits in place. widen(.., byte>>4) reserves
+         // byte's sub-range when it builds the sparse_full, so the full arm sets in place
+         // (no post-widen grow). *rslot is re-anchored after EVERY widen so a later widen
+         // throwing leaves *rslot on a live (wider) node, never a freed one.
+         for (;;)
          {
-            node = widen(node);  // frees the old node; re-anchor before the next (throwing) widen
-            if (pn) pn_set_next(pn, node);
-            else    *slot = node;
+            if (node.tag() == K::node_full)  // top tier: byte's sub-range was reserved → set
+            {
+               full_set_present(static_cast<node_full*>(deref_(node)), byte, child);
+               break;
+            }
+            if (router_try_set(node, byte, child)) break;  // setlist/cN: set in place
+            node    = widen(node, int(byte) >> 4);  // reserve byte's sub-range in the new full
+            *rslot  = node;
          }
          // The ladder is done: if the lifted prefix now sits above a node_full, fuse it
          // back into the full's header cacheline and free the prefix node — prefix_node
@@ -5042,9 +5191,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
          root_  = clone_walk_(o, o.root_);
          count_ = o.count_;
       }
-      // Clone one router node (setlist / cN / node_full): the memcpy preserves the
-      // edge directory (sorted bytes / presence bitmaps / direct slots); each branch
-      // slot is then re-pointed at the cloned child via router_try_set on its own edge.
+      // Clone one router node (setlist / cN): the memcpy preserves the edge directory
+      // (sorted bytes / presence bitmaps / direct slots); each branch slot is then
+      // re-pointed at the cloned child via router_try_set on its own edge.
       template <class Node>
       packed_ptr clone_router_(const map& src, const Node* S, K k)
       {
@@ -5060,6 +5209,25 @@ namespace detail  // implementation types & node helpers — not part of the pub
          dh->term = clone_walk_(src, sh->term);
          router_for_each(const_cast<Node*>(S),
                          [&](uint8_t e, packed_ptr child) { router_try_set(D, e, clone_walk_(src, child)); });
+         g.release();
+         return dp;
+      }
+      // Clone a sparse_full / pfxd: copy the WHOLE per-node block (CL0 + popcount range
+      // lines) so presence, prefix, nset and the materialized geometry carry verbatim;
+      // then re-point each branch slot at its cloned child. node_size matches the source.
+      packed_ptr clone_full_(const map& src, const node_full* S, K k)
+      {
+         const size_t sz = full_node_bytes<Ptr>(S);
+         node_full*   D  = ::new (node_alloc_(sz)) node_full;
+         std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), sz);
+         D->rh.term = packed_ptr::null();
+         router_for_each(D,  // null every slot before recursion can throw (frees half-built clones)
+                         [&](uint8_t e, packed_ptr) { full_set_present(D, e, packed_ptr::null()); });
+         packed_ptr  dp = pack_(D, k);
+         build_guard g{this, &dp};
+         D->rh.term = clone_walk_(src, S->rh.term);
+         router_for_each(const_cast<node_full*>(S),
+                         [&](uint8_t e, packed_ptr child) { full_set_present(D, e, clone_walk_(src, child)); });
          g.release();
          return dp;
       }
@@ -5133,8 +5301,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                g.release();
                return dp;
             }
-            case K::pfxd:  // full body + in-header prefix; the memcpy carries both
-               return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
+            case K::pfxd:  // sparse_full body + in-header prefix; the per-node memcpy carries both
+               return clone_full_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
             case K::c2:
                return clone_router_(src, static_cast<const cnode<2>*>(src.deref_(s)), K::c2);
             case K::c4:
@@ -5142,7 +5310,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::c8:
                return clone_router_(src, static_cast<const cnode<8>*>(src.deref_(s)), K::c8);
             case K::node_full:
-               return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::node_full);
+               return clone_full_(src, static_cast<const node_full*>(src.deref_(s)), K::node_full);
             case K::bucket:
             {
                const bucket* B = static_cast<const bucket*>(src.deref_(s));
@@ -5215,7 +5383,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
                free_all_(rh->term);
                router_for_each(cur, [&](uint8_t, packed_ptr br) { free_all_(br); });
-               node_free_(deref_(cur), node_size(cur.tag()));
+               node_free_(deref_(cur), node_bytes_(cur));  // per-node for sparse_full/pfxd
                return;
             }
             case K::bucket:
