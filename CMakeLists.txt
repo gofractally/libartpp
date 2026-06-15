@@ -185,4 +185,11 @@ if(ARTPP_BENCHMARKS)
    target_compile_definitions(artpp_perf_gate PRIVATE
        ARTPP_PERF_BASELINE="${CMAKE_CURRENT_SOURCE_DIR}/bench/perf_baseline.tsv")
    set_target_properties(artpp_perf_gate PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+   # artpp::set<string_view> vs std::set<string>: find ns/op + bytes/key (counting allocator),
+   # three workloads at 2M keys (random 16B, alnum 16B, short 3-7B). artpp-only deps; run alone.
+   add_executable(artpp_set_bench bench/set_bench.cpp)
+   target_link_libraries(artpp_set_bench PRIVATE artpp)
+   target_compile_options(artpp_set_bench PRIVATE -O3 -DNDEBUG -Wall -Werror=switch)
+   set_target_properties(artpp_set_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
