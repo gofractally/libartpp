@@ -424,30 +424,47 @@ prior image with **no relocation**: handles are byte offsets, so the bytes
 already *are* the tree.
 
 ```c++
-// write, then close
+using Map = artpp::map<std::string_view, uint64_t, artpp::mode::none, A>;
 {
-   artpp::line_pool pool("mystore");                           // reopen-or-create the directory
-   artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
+   artpp::line_pool pool("mystore");     // open or create the store directory
+   Map t{A{&pool}, artpp::attach};       // the checkpointed tree; empty on a new store
    t.insert("key", 42);
-   pool.checkpoint(t.root_handle(), t.size());                 // persist root + carving state
-   t.detach();                                                 // tree lives on disk; skip teardown
-}
-// reopen — same process or a later one
+   t.checkpoint();                       // record the tree as the store's content
+}                                        // the map and the pool close; the tree stays
 {
-   artpp::line_pool pool("mystore");                           // pool.restored() == true
-   artpp::map<std::string_view, uint64_t, artpp::mode::none, A>
-       t{A{&pool}, artpp::attach, pool.root(), pool.count()};  // O(1) attach, no rebuild
+   artpp::line_pool pool("mystore");     // a later run: pool.restored() == true
+   Map t{A{&pool}, artpp::attach};       // O(1), no rebuild
    uint64_t v;
-   t.find("key", v);                                           // == 42
+   t.find("key", v);                     // == 42
 }
 ```
 
-`checkpoint(root, count)` stamps the superblock and flushes it; `attach`
-rebinds a map to the reopened image in O(1); `detach()` relinquishes the
-in-memory tree without freeing so close stays O(1). This is **clean-close**
-durability — crash/reboot durability (a full data sync + write-ahead log) is
-the next layer: `checkpoint` flushes the header, and data pages ride the page
-cache across a clean reopen.
+The lifecycle is **attach → use → `checkpoint()` → close**:
+
+- `Map{alloc, artpp::attach}` binds a map to the tree of the last checkpoint in
+  O(1), or to an empty tree when the store is new (`pool.restored()` tells the
+  two apart).
+- `checkpoint()` records the tree as the store's content. What a later open
+  sees is what the last `checkpoint()` recorded.
+- **Destroying a map never tears down a tree in a file-backed pool.** The tree
+  belongs to the store, so the destructor leaves it in place (and close is
+  O(1)); it does not matter whether the map is destroyed before or after the
+  checkpoint, or the pool's root and count are read first. `clear()` is how to
+  give the space of a tree back to the pool. (The exception is a mapped type
+  with a destructor: those values are destroyed and their nodes freed, and such
+  a tree cannot be attached again in any case. `attach` and `checkpoint()`
+  require a trivially copyable mapped type.)
+- A store holds **one** tree. Other maps may use the same pool as scratch space,
+  but only the checkpointed one is found again.
+
+`pool.checkpoint(root, count)` with `map::root_handle()` / `size()`, the
+four-argument `attach` constructor and `detach()` are the low-level calls
+underneath; `detach()` is only needed to hand a tree over within an anonymous
+pool.
+
+This is **clean-close** durability — crash/reboot durability (a full data
+sync + write-ahead log) is the next layer: `checkpoint` flushes the header, and
+data pages ride the page cache across a clean reopen.
 
 ## Limits and guarantees
 
@@ -654,8 +671,8 @@ A pre-release audit found bugs that are open in the
 [issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
 fixed:
 
-- **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged
-  or stale store is not detected (#8, #10).
+- **File-backed `line_pool`:** a damaged or stale store is not detected (#10),
+  and it cannot be opened on a kernel with 64 KB pages (#17).
 
 Reproducers are in [tests/known_bugs](tests/known_bugs).
 

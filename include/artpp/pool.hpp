@@ -13,9 +13,11 @@
 // region means each grows densely from offset 0, so there are NO sparse holes and NO dependency on
 // sparse-file support (the earlier single-file layout put the terminal region at a fixed 32 GB
 // offset, forcing a sparse hole — hostile to FAT/exFAT and to copy/backup tools). Call
-// checkpoint(root, count) before close to persist; a later line_pool(dir) restores it with no
-// relocation (offset handles need none). Crash/reboot durability (full data sync / WAL) is the
-// next stage — checkpoint flushes the header, and data pages ride the page cache across a reopen.
+// map::checkpoint() (or checkpoint(root, count)) before close to persist; a later line_pool(dir)
+// restores it with no relocation (offset handles need none) and map{alloc, artpp::attach} binds
+// to it. A map never tears its tree down when it is destroyed on a file-backed pool: the tree
+// belongs to the store. Crash/reboot durability (full data sync / WAL) is the next stage —
+// checkpoint flushes the header, and data pages ride the page cache across a reopen.
 //
 // MEASURED vs std::allocator (M5, 5M keys, artpp_pool_ab INTERLEAVED per rep): inserts
 // recover the malloc cost and more (uniform u64 0.81x, clustered 0.94x), queries are
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <utility>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -126,6 +129,7 @@ namespace artpp
       static constexpr size_t term_unit      = 16;
       static constexpr size_t max_term_bytes = size_t(1) << 32;  // 4 GB — u32 offsets
 
+      bool       file_backed() const noexcept { return sb_bytes_ != 0; }
       std::byte* base() const noexcept { return base_; }
       std::byte* term_base() const noexcept { return tbase_; }
       size_t     committed() const noexcept { return committed_; }
@@ -520,6 +524,12 @@ namespace artpp
       {
          pool->free_term(p, (bytes + line_pool::term_unit - 1) / line_pool::term_unit);
       }
+
+      // Persistent-image hooks (see has_artpp_image_ in map.hpp). A file-backed pool's content
+      // outlives every container: a map on it never tears its tree down when destroyed.
+      bool artpp_retains() const noexcept { return pool && pool->file_backed(); }
+      void artpp_checkpoint(uint64_t root, uint64_t count) { pool->checkpoint(root, count); }
+      std::pair<uint64_t, uint64_t> artpp_attach() const { return {pool->root(), pool->count()}; }
 
       // Opt-in bulk transport for map's cross-pool move assignment: adopt the source
       // pool's whole image (see line_pool::adopt). By providing this member the allocator

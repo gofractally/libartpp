@@ -12,6 +12,9 @@ before 1.0 a minor version may change the API.
 - Continuous integration: GCC and Clang on Linux (x86-64, ARM64), Apple Clang on
   macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer, plus an
   install-and-consume check.
+- `map::checkpoint()` / `set::checkpoint()` and the two-argument attach
+  constructor `map{alloc, artpp::attach}`: the lifecycle of a tree in a
+  file-backed `line_pool` without passing root handles and counts by hand.
 - `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
   an allocator returns a block the tree's handles cannot address.
 
@@ -99,9 +102,16 @@ before 1.0 a minor version may change the API.
   now not `restored()`: `root()` is the null handle (`line_pool::null_root`)
   and `count()` is 0, as for an anonymous pool, and attaching a count of 0
   always gives an empty map. The image format version is now 2 (#9).
+- File-backed `line_pool`: destroying a map after `checkpoint()` without
+  calling `detach()` freed every node into the pool's free lists, through the
+  mapped file; the store then reopened with the checkpointed root and count and
+  no keys. A map's destructor now never tears down a tree that lives in a
+  file-backed pool (for a trivially destructible mapped type), so `detach()` is
+  no longer part of the lifecycle and the order of checkpoint and destruction
+  does not matter. `clear()` still frees (#8).
 
 ### Known issues
-- Open bugs from the pre-release audit: #8, #10 and #17 (file-backed
+- Open bugs from the pre-release audit: #10 and #17 (file-backed
   `line_pool`). Reproducers are in `tests/known_bugs`.
 
 ## 0.1.0

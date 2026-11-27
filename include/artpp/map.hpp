@@ -466,6 +466,20 @@ namespace detail  // implementation types & node helpers — not part of the pub
        : std::true_type
    {
    };
+   // Opt-in: the allocator's storage is a PERSISTENT IMAGE that outlives the container (a
+   // file-backed line_pool). artpp_retains() says whether this allocator's storage is one
+   // right now; the container then leaves its tree in place when it is destroyed instead of
+   // freeing it node by node. artpp_checkpoint(root, count) records the tree as the image's
+   // content and artpp_attach() returns the {root, count} last recorded.
+   template <class A, class = void>
+   struct has_artpp_image_ : std::false_type
+   {
+   };
+   template <class A>
+   struct has_artpp_image_<A, std::void_t<decltype(std::declval<const A&>().artpp_retains())>>
+       : std::true_type
+   {
+   };
    // Optional allocator hook: a dedicated 16-byte-granular TERMINAL region (see
    // line_pool). Detected, never required — without it terminals share the node path.
    template <class A, class = void>
@@ -795,6 +809,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             return packed_ptr::from_term(t, k);
       }
+      // True when the destructor must leave the tree alone: see ~map.
+      bool retained_() const noexcept
+      {
+         if constexpr (has_artpp_image_<Allocator>::value && std::is_trivially_destructible_v<T>)
+            return alloc_.artpp_retains();
+         else
+            return false;
+      }
       // Cache the allocator's mapping bases (indexed handles only; a no-op for direct).
       void rebase_() noexcept
       {
@@ -885,14 +907,51 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::memcpy(root_.b, &raw, sizeof(root_.b));  // line_ptr is 4 bytes: reconstruct the root
       }
 
-      ~map() { free_all_(root_); }  // walk the tree, destroy every T and free every node
+      // Attach to the tree the allocator's persistent image holds (a file-backed line_pool):
+      // the tree of the last checkpoint(), or an empty map when the store is new. O(1).
+      map(const Allocator& a, attach_t) : alloc_(a)
+      {
+         static_assert(has_artpp_image_<Allocator>::value && indexed,
+                       "map attach needs an allocator with a persistent image (artpp::pool_alloc)");
+         static_assert(std::is_trivially_copyable_v<T>,
+                       "a persistent image stores T's bytes: T must be trivially copyable");
+         rebase_();
+         const auto [root_handle, count] = alloc_.artpp_attach();
+         if (count == 0) return;
+         const uint32_t raw = uint32_t(root_handle);
+         std::memcpy(root_.b, &raw, sizeof(root_.b));
+         count_ = size_type(count);
+      }
+      // Record this tree as the content of the allocator's persistent image: what a later
+      // attach — in this process or another — gets back. Everything the map holds at this
+      // point is part of the image; changes made afterwards are not, until the next call.
+      void checkpoint()
+      {
+         static_assert(has_artpp_image_<Allocator>::value && indexed,
+                       "checkpoint needs an allocator with a persistent image (artpp::pool_alloc)");
+         static_assert(std::is_trivially_copyable_v<T>,
+                       "a persistent image stores T's bytes: T must be trivially copyable");
+         alloc_.artpp_checkpoint(root_.raw(), count_);
+      }
+
+      // Walk the tree, destroy every T and free every node — unless the tree lives in a
+      // persistent image (a file-backed line_pool). The image outlives the map and belongs to
+      // the store: tearing it down would write free-list links through the mapped file and
+      // destroy what a checkpoint recorded, and it would page the whole store in to do so.
+      // So such a tree is left exactly as it is; clear() is how to give the space back.
+      // (A T with a destructor is still destroyed, and then the nodes are freed as well: a
+      // tree of such values cannot be attached again anyway.)
+      ~map()
+      {
+         if (!retained_()) free_all_(root_);
+      }
 
       // The root as a raw handle, for persisting via line_pool::checkpoint (indexed pools).
       uint64_t root_handle() const noexcept { return root_.raw(); }
-      // Release the structure WITHOUT freeing it: the nodes stay live in the pool (for a
-      // file-backed pool, in the file). Use before destroying an attached, already-checkpointed
-      // map so close is O(1) instead of walking the whole tree. The map is left empty; the pool
-      // image is untouched. (Anonymous pools reclaim everything on munmap regardless.)
+      // Release the structure WITHOUT freeing it: the nodes stay live in the pool and the map
+      // is left empty. Hands a tree over to a later attach in the same process (an anonymous
+      // pool; without it the destructor frees the nodes). Not needed for a file-backed pool,
+      // where the destructor never frees.
       void detach() noexcept
       {
          root_  = packed_ptr::null();
@@ -6132,8 +6191,12 @@ namespace detail
           : impl_(value_alloc(a), attach, root_handle, count)
       {
       }
-      // Persist/release helpers (indexed pools): the root as a raw handle for checkpoint, and
-      // detach() to release the structure WITHOUT freeing it (the nodes stay live in the file).
+      // Attach to the allocator's persistent image / record this set as its content: see
+      // map(const Allocator&, attach_t) and map::checkpoint().
+      set(const Allocator& a, attach_t) : impl_(value_alloc(a), attach) {}
+      void checkpoint() { impl_.checkpoint(); }
+      // Low-level helpers (indexed pools): the root as a raw handle for line_pool::checkpoint,
+      // and detach() to release the structure WITHOUT freeing it.
       uint64_t root_handle() const noexcept { return impl_.root_handle(); }
       void     detach() noexcept { impl_.detach(); }
 
