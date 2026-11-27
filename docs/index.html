@@ -84,7 +84,8 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
       <h3><span class="dot"></span>Prefixes live in the header line</h3>
       <p>A compressed run is stored <b>inside the cacheline the node already owns</b>; the
       pointer tag hints when it must be read, and a prefix-free node never touches it. A
-      separate prefix node exists only past 63 bytes — overflow, not the default. Path
+      separate prefix node exists only when the run does not fit the node's header line
+      (7 bytes in a sparse router, 63 in a full one) — overflow, not the default. Path
       compression at <b>zero extra lines</b>.</p>
     </div>
     <div class="card">
@@ -165,7 +166,7 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <code>line_pool</code> — a contiguous reservation handed out by a bump frontier with
     exact-size free lists, no per-node <code>malloc</code> — builds the same tree
     <b>1.1–1.4× faster than <code>std::allocator</code></b>, the allocator's
-    contribution cleanly isolated (both rows are on every insert chart).
+    contribution cleanly isolated (both rows are on the insert charts).
     Held to the <i>same</i> malloc class, artpp and libart build at similar rates:
     artpp leads on sequential and runs even on clustered, and libart's flatter node
     growth leads on the deeply-shared dictionary, where a radix does the most splitting
@@ -197,7 +198,8 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     <a href="results.csv">results.csv</a> · engine:
     <a href="https://github.com/gofractally/libartpp/blob/main/bench/engine.hpp">bench/engine.hpp</a>.
     A separate machine-calibrated <a href="https://github.com/gofractally/libartpp/blob/main/bench/perf_gate.cpp">ratio gate</a>
-    guards artpp-vs-libart regressions in CI fashion.
+    guards artpp-vs-libart regressions; it is run by hand on a quiet machine, not in CI,
+    and measures its own configuration (5M string keys, <code>std::allocator</code>).
   </p>
 </section>
 
@@ -355,7 +357,7 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
       <h3><span class="dot"></span>Allocators, all the way down</h3>
       <p>Every node <i>and value</i> goes through your allocator — PMR works. Index-based
       pool handles shrink branches to 4 bytes, back the map with an
-      <b>mmap'd file</b>, and make cross-pool moves a single <code>memcpy</code>.</p>
+      <b>mmap'd store directory</b>, and make cross-pool moves a single <code>memcpy</code>.</p>
     </div>
     <div class="card">
       <h3><span class="dot"></span>Whole-tree ops use structure</h3>
@@ -405,12 +407,14 @@ m.<span class="f">insert</span>( 2.25, <span class="s">"c"</span>);         <spa
     </div>
     <div class="cell">
       <h3>File-backed, 4-byte branches</h3>
-<pre><code><span class="t">artpp::line_pool</span> pool(<span class="s">"store.bin"</span>);  <span class="c">// mmap'd file</span>
+<pre><code><span class="t">artpp::line_pool</span> pool(<span class="s">"mystore"</span>);   <span class="c">// a store directory</span>
 <span class="k">using</span> <span class="t">A</span> = <span class="t">artpp::pool_alloc</span>&lt;<span class="t">uint64_t</span>&gt;;
 <span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
-           <span class="t">artpp::mode</span>::none, <span class="t">A</span>&gt; t{<span class="t">A</span>{&amp;pool}};
-<span class="c">// branches cost 4 bytes; the whole store is one</span>
-<span class="c">// relocatable range — moves are a memcpy</span></code></pre>
+           <span class="t">artpp::mode</span>::none, <span class="t">A</span>&gt; t{<span class="t">A</span>{&amp;pool}, <span class="t">artpp::attach</span>};
+t.<span class="f">insert</span>(<span class="s">"key"</span>, 42);
+t.<span class="f">checkpoint</span>();           <span class="c">// what the next open sees</span>
+<span class="c">// branches cost 4 bytes; reopening is O(1):</span>
+<span class="c">// handles are offsets, the bytes are the tree</span></code></pre>
     </div>
     <div class="cell">
       <h3>Pick the structure per workload</h3>
@@ -428,7 +432,9 @@ m.<span class="f">insert</span>( 2.25, <span class="s">"c"</span>);         <spa
   <h2>Get started in one minute</h2>
   <p class="sub">Header-only. Copy <code>include/artpp</code>, or:</p>
 <pre><code><span class="c"># CMake ≥ 3.20</span>
-FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libartpp.git)
+include(FetchContent)
+FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libartpp.git
+                     GIT_TAG main)
 FetchContent_MakeAvailable(artpp)
 target_link_libraries(your_target PRIVATE artpp::artpp)</code></pre>
   <br>
@@ -436,8 +442,9 @@ target_link_libraries(your_target PRIVATE artpp::artpp)</code></pre>
 git clone https://github.com/gofractally/libartpp && cd libartpp
 cmake -B build && cmake --build build -j && ctest --test-dir build
 cmake -B build -DARTPP_BENCHMARKS=ON      <span class="c"># the compare suite from this page</span></code></pre>
-  <p style="color:var(--muted);font-size:14.5px">Requirements: a C++20 compiler, little-endian
-  target (ARM64/x86-64; NEON and SSE2 paths included), GCC or Clang. Nothing else.
+  <p style="color:var(--muted);font-size:14.5px">Requirements: a C++20 compiler, a 64-bit
+  little-endian target (ARM64/x86-64; NEON and SSE2 paths included), GCC or Clang. Nothing else
+  (the optional psio key adapter needs C++23 and Boost headers).
   MIT licensed.
   Full API reference and contracts:
   <a href="https://github.com/gofractally/libartpp#readme">the README</a>.</p>

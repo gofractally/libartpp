@@ -2,10 +2,11 @@
 
 # libart++ — `artpp::map`, a header-only adaptive radix tree map for C++20
 
-**[Website & benchmark charts](https://gofractally.github.io/libartpp/)** ·
-with the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
-two regions): point lookups **1.2–2.0× faster than upstream libart on all four
-workloads** (plain radix — 2.0× sequential, 1.37× uniform, 1.32× clustered,
+**[Website & benchmark charts](https://gofractally.github.io/libartpp/)**
+
+With the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
+two regions), point lookups are **1.2–2.0× faster than upstream libart on all four
+workloads** in the run described under [Performance](#performance) (plain radix — 2.0× sequential, 1.37× uniform, 1.32× clustered,
 1.18× dictionary), 1.9–4.3× faster than `absl::btree_map`, and 2.1–7.6× faster
 than `std::map`. The invariant behind the numbers: **at
 most one cold cacheline per level of descent** — headerless tagged-pointer
@@ -27,6 +28,7 @@ with no comparisons and no rebalancing.
 
 ```c++
 #include "artpp/map.hpp"
+#include <iostream>
 
 artpp::map<std::string_view, uint64_t> t;
 t.insert("alpha", 1);             // insert or assign; true iff newly inserted
@@ -37,7 +39,7 @@ if (auto it = t.find("alpha"); it != t.end())
     use(it->first, it->second);
 
 for (const auto& [key, value] : t)         // ascending key order
-    std::println("{} = {}", key, value);
+    std::cout << key << " = " << value << '\n';
 
 t.erase("beta");
 ```
@@ -93,6 +95,7 @@ cmake -B build && cmake --build build && ctest --test-dir build
 As a dependency (`FetchContent` or `add_subdirectory`), link `artpp::artpp`:
 
 ```cmake
+include(FetchContent)
 FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libartpp.git
                      GIT_TAG main)
 FetchContent_MakeAvailable(artpp)
@@ -116,27 +119,32 @@ target_link_libraries(your_target PRIVATE artpp::artpp)
 |---|---|---|
 | `ARTPP_TESTS` | ON when top-level | The functional suite, run by `ctest` |
 | `ARTPP_BENCHMARKS` | OFF | The benchmark/compare suite: vendors upstream libart, uses `absl::btree_map` (installed or fetched) |
-| `ARTPP_WITH_PSIO` | OFF | The [psio](https://github.com/gofractally/psio) key-format codec adapter and its test |
+| `ARTPP_WITH_PSIO` | OFF | The [psio](https://github.com/gofractally/psio) key-format codec adapter and its test (needs C++23 and the Boost headers, as psio does) |
+| `ARTPP_FUZZER` | OFF | The coverage-guided libFuzzer target `artpp_fuzzer` ([Fuzzing](#fuzzing)) |
 | `ARTPP_PSIO_SOURCE_DIR` | — | Path to an existing psio checkout (skips the fetch) |
 
 ## Requirements
 
 - C++20 (`<bit>`, `requires`-clauses, `if constexpr`; `std::byteswap` when available, else a `__builtin_bswap` shim).
-- A little-endian target (statically asserted) with 48-bit virtual addresses for
+- A 64-bit, little-endian target (both statically asserted) with 48-bit virtual addresses for
   the default 6-byte handle; an allocator can select 8-byte handles to lift the
   VA assumption ([Allocators](#allocators)). The assumption is checked at run
   time, once per allocation: a block above 2^48 (top-byte pointer tagging such
   as HWASan or MTE, 5-level paging, 52-bit ARM addresses) makes the allocating
   operation throw `artpp::bad_allocation_address` instead of being truncated.
-- NEON (ARM64) or SSE2 (x86-64) for the SIMD router probes; both paths are
-  provided and selected automatically.
+- No particular instruction set: the router probes use NEON (ARM64) or SSE2
+  (x86-64) when the compiler targets them, selected automatically, with a
+  scalar fallback (the two-byte wide-stem probe is NEON or scalar).
 - No dependencies beyond the standard library. Header-only:
   `#include <artpp/map.hpp>` (and `artpp/pool.hpp` for the optional line pool).
+  The optional psio adapter is the exception: it needs psio, and with it C++23
+  and the Boost headers.
 - A POSIX system for `artpp::line_pool` (`mmap`); the map itself with
   `std::allocator` or any other allocator does not need it.
-- Tested in CI with GCC and Clang on Linux (x86-64 and ARM64) and Apple Clang
-  on macOS (ARM64), each also under AddressSanitizer and
-  UndefinedBehaviorSanitizer. MSVC is not supported.
+- Tested in CI with GCC and Clang on x86-64 Linux and Apple Clang on ARM64
+  macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer, and
+  with GCC on ARM64 Linux (no sanitizers). The psio adapter, the benchmarks and
+  the libFuzzer target are not built in CI. MSVC is not supported.
 
 ## Template parameters
 
@@ -154,23 +162,26 @@ class map;
 | `T` | The mapped type. Move-constructible required; copy/equality/default-constructibility are required only by the operations that use them (default construction: `operator[]` and `find_opt`). `alignof(T)` up to 128 ([Limits and guarantees](#limits-and-guarantees)). |
 | `Mode` | Structural policy flags, combinable with `\|` (below). |
 | `Allocator` | A standard allocator. Every node and every value is allocated and constructed through it ([Allocators](#allocators)). |
-| `ExpectedSize` | Optional capacity hint. When small (`0 < ExpectedSize ≤ ~3M`) it auto-selects the compact cnode density ladder — a perf-per-byte win for small maps (see [`compact_map`](#compact_map-capacity-hint)). `0` (unknown) leaves the fast flat default. |
+| `ExpectedSize` | Optional capacity hint. When small (`0 < ExpectedSize ≤ 3,000,000`) it auto-selects the compact cnode density ladder — a perf-per-byte win for small maps (see [`compact_map`](#compact_map-capacity-hint)). `0` (unknown) leaves the fast flat default. |
 
 ### Modes
 
 | Flag | Effect |
 |---|---|
 | `mode::none` | Pure radix: leaves, prefix nodes, and routers that widen `setlist → node_full`. The fastest default for point lookups. |
-| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary it runs point lookups ~1.16× faster than the default radix (77 vs 89 ns) and ordered scans ~2.9× faster (2.6 vs 7.4 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
+| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary (the run described under [Performance](#performance)) it runs point lookups ~1.16× faster than the default radix (77 vs 89 ns) and ordered scans ~2.9× faster (2.6 vs 7.4 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
 | `mode::adaptive` | Pure radix that watches its own descent: when leaf splits keep landing under deep, narrow paths, those split points collapse to buckets. A middle ground that keeps uniform data bucket-free. |
-| `mode::dense_tiers` | Forces the segmented-bitset cnode density ladder on (`setlist → c2 → c4 → node_full`): sparse fan-out routers stay compact cnodes instead of a sparse 14-line `node_full`. On the `line_pool` this is a **perf-per-byte win for small maps** — at ≤~2M keys ~40% less RAM and ~2× faster build — but the gain fades as the map grows (fan-out nodes densify toward `node_full` and leaves come to dominate the footprint), and past ~3M it only adds build churn + pool fragmentation. Usually reached via the `ExpectedSize` hint / [`compact_map`](#compact_map-capacity-hint) rather than set by hand. |
+| `mode::dense_tiers` | Forces the segmented-bitset cnode density ladder on (`setlist → c2 → c4 → node_full`): sparse fan-out routers stay compact cnodes instead of a sparse `node_full` (14 lines with the default handle, 10 on the `line_pool`). On the `line_pool` this is a **perf-per-byte win for small maps** — below ~3M keys ~40% less RAM and ~2× faster build, as measured by `artpp_widen_probe` — but the gain fades as the map grows (fan-out nodes densify toward `node_full` and leaves come to dominate the footprint), and past ~3M it only adds build churn + pool fragmentation. Usually reached via the `ExpectedSize` hint / [`compact_map`](#compact_map-capacity-hint) rather than set by hand. |
 | `mode::flat_full` | Forces the ladder **off** (`setlist → node_full` direct) even when a capacity hint would enable it — the plain-radix behavior, for find-only or large maps. Same as the default `mode::none`. |
 | `mode::ladder_c8` | Adds the `c8` rung to the ladder (`… → c4 → c8 → node_full`). Off by default — on bimodal data `c8` is ~never the final tier — and kept for testing adversarial mid-density-clustered fan-outs. Only meaningful combined with the ladder. |
 | `mode::wide_stems` | Sparse routers consume **two** key bytes per hop (`setlist_u16`), halving router-hop depth on deep sparse trees; nodes re-stride back to one-byte routers when they densify. |
 
 All modes share the same external semantics; the flags select internal
-representations only. Every mode is exercised against `std::map` by the test
-suite.
+representations only. The default, `buckets`, `adaptive`, `dense_tiers` (with
+and without `ladder_c8`) and `wide_stems` are each exercised against `std::map`
+by the test suite; `flat_full` and the capacity hint only choose between two of
+those representations and have shape checks, not differential runs of their
+own.
 
 ### `compact_map` (capacity hint)
 
@@ -183,10 +194,12 @@ artpp::compact_map<std::string_view, uint64_t, 500'000> small;  // → cnode den
 
 Declaring roughly how many keys you expect lets the map pick the better
 internal representation automatically. The default `map` widens sparse fan-out
-routers straight to a 14-line `node_full`; at small scale those nodes are
-genuinely sparse (~30 of 256 branches), so on the `line_pool` a `compact_map`
-stores them as 3–5-line cnodes instead — **~40% less RAM and ~2× faster to
-build below ~3M keys**, with point/ordered lookups within noise. Above the
+routers straight to a `node_full` (14 lines with the default handle, 10 on the
+`line_pool`); at small scale those nodes are genuinely sparse (~30 of 256
+branches), so on the `line_pool` a `compact_map` stores them as 2–4-line
+cnodes instead (3–5 lines with the default handle) — **~40% less RAM and ~2×
+faster to build below ~3M keys**, with point/ordered lookups within noise
+(measured with `artpp_widen_probe`, `bench/widen_probe.cpp`). Above the
 measured crossover the hint transparently falls back to the flat default
 (the ladder would only add build churn and pool fragmentation once fan-out
 nodes saturate toward `node_full` and leaf storage dominates the footprint).
@@ -249,10 +262,14 @@ artpp::map<double, int> d;          // doubles as keys, numeric order
 The opt-in is per type so the built-in codecs (zero-copy string views,
 single-byteswap integrals) keep their faster scratch-free paths.
 
+The adapter needs what psio needs: **C++23 and the Boost headers**
+(Boost.Preprocessor, for `PSIO_REFLECT`). The rest of the library stays C++20
+with no dependencies. The adapter and its test are not built in CI.
+
 ## API reference
 
-`map` is **move-only** (copying a large tree is never an accident; an
-explicit copy can be built from a range). All operations below are
+`map` is **move-only** (copying a large tree is never an accident; to copy,
+iterate and `insert` into a new map — there is no range constructor). All operations below are
 O(encoded-key-length) unless noted. `key` parameters take the `Key` type;
 cheap keys (`string_view`, integers) pass by value.
 
@@ -290,7 +307,7 @@ destroy-and-reconstruct, so a throwing assignment leaves a valid object behind.
 
 | Member | Semantics |
 |---|---|
-| `begin() / end() / cbegin() / cend()` | Bidirectional const iteration in ascending key order. `begin()` does not allocate. |
+| `begin() / end() / cbegin() / cend()` | Bidirectional const iteration in ascending key order. `begin()` does not allocate unless the first element is more than 16 nodes deep. |
 | `rbegin() / rend()` (+`cr` forms) | The same in descending order, through the container's own `const_reverse_iterator` (see [Iterators](#iterators)). |
 | `for_each(f)` | Recursive visitor `f(std::string_view key_bytes, const T&)` in ascending order — roughly 3× the iterator on cache-resident scans (no per-element resumption). |
 | `for_each_value(f)` | `f(const T&)` in ascending key order without materializing keys. |
@@ -364,7 +381,9 @@ the pointer bits of its branch — zero allocation, zero indirection. Such value
 have **no addressable object**, so the by-reference API (`at`, `find_ptr`,
 `operator[]`) is constrained away at compile time (`requires`-clauses); use the
 copy-out forms (`find(key, out)`, `find_opt`) instead. `map<K,T>::inlineable`
-reports the decision; `uint32_t` inlines, `uint64_t` does not.
+reports the decision; `uint32_t` inlines, `uint64_t` does not. That is with the
+default handle: under `line_pool`'s 4-byte handle the cap is 3 bytes, so a
+`uint32_t` is a real object there and the reference API is available.
 
 For everything else — strings, 8-byte integers, your structs — values are real
 objects constructed through the allocator inside leaf (or bucket) storage, and
@@ -408,20 +427,21 @@ handle — and throws `artpp::bad_allocation_address` (derived from
 reported on the first allocation rather than corrupting the tree. The check is
 on the allocation path only; lookups are unaffected.
 
-Beyond the standard protocol, an allocator can customize the tree through three
+Beyond the standard protocol, an allocator can customize the tree through
 **opt-in members** (detected, never required):
 
 | Member | Effect |
 |---|---|
 | `using artpp_handle = artpp::packed_ptr_t<N>;` | Selects the branch-handle width. Default is the 6-byte packed pointer (48-bit VA); `packed_ptr_t<8>` stores full pointers and drops the VA assumption. |
-| `using artpp_handle = artpp::detail::line_ptr;` + `artpp_base()` | Index-based handles: a 4-byte handle holding a 28-bit *line index* resolved against `artpp_base()`. Branches cost 4 bytes and the whole store becomes one relocatable range. |
+| `using artpp_handle = artpp::detail::line_ptr;` + `artpp_base()` + `artpp_term_base()` | Index-based handles: a 4-byte handle holding a 28-bit *line index* resolved against `artpp_base()` (nodes) or a 16-byte-aligned offset resolved against `artpp_term_base()` (leaves; the two may be the same address). Branches cost 4 bytes and the whole store becomes one relocatable range. |
 | `artpp_adopt(const A& src)` | Opts into bulk image adoption for cross-pool move assignment (see above). Providing it asserts the pool backs exactly one tree. |
 
 ### `artpp::line_pool`
 
-`artpp/pool.hpp` ships the reference index-based allocator: one contiguous
-reservation of 128-byte lines (up to 32 GB), addressed by 4-byte handles,
-committed in 4 MB steps, with exact-size free lists. It can be **anonymous or
+`artpp/pool.hpp` ships the reference index-based allocator: two contiguous
+reservations — 128-byte node lines (up to 32 GB) and 16-byte terminal units
+for leaves (up to 4 GB, one eighth of the node capacity) — addressed by 4-byte
+handles, committed in 4 MB steps, with exact-size free lists. It can be **anonymous or
 file-backed**:
 
 ```c++
@@ -470,8 +490,9 @@ using Map = artpp::map<std::string_view, uint64_t, artpp::mode::none, A>;
    forces nothing to disk; see [Sync level](#sync-level).
    **What a later open sees is what the last `checkpoint()` recorded.**
 4. Close by destroying the map and the pool, in that order. **Destroying a map
-   never tears down a tree in a file-backed pool**: the tree belongs to the
-   store, so the destructor leaves it in place (and is O(1)). It does not
+   of a trivially destructible mapped type never tears down a tree in a
+   file-backed pool**: the tree belongs to the store, so the destructor leaves
+   it in place (and is O(1)). It does not
    matter whether the map is destroyed before or after the checkpoint.
    `clear()` is how to give a tree's space back to the pool.
 
@@ -489,9 +510,11 @@ Rules that follow from this:
   scratch map that is destroyed with content leaves its nodes allocated in the
   store, and one destroyed after the checkpoint marks the store as modified).
 - `attach` and `checkpoint()` need a trivially copyable mapped type: the image
-  stores its bytes. (A map of any other type can still *use* a file-backed pool
-  as out-of-core memory; its destructor destroys the values and frees the
-  nodes, as with any allocator.)
+  stores its bytes. (A map whose mapped type has a non-trivial destructor can
+  still *use* a file-backed pool as out-of-core memory; its destructor destroys
+  the values and frees the nodes. A mapped type that is trivially destructible
+  but not trivially copyable is left in place like any other and cannot be
+  attached: `clear()` such a map before destroying it.)
 - `line_pool` is neither copyable nor movable; a map on it moves as usual and
   takes the tree, and the right to checkpoint it, along.
 - `pool.close()` does what the pool's destructor does and reports a failure,
@@ -571,16 +594,23 @@ Neither level is crash consistency: the image is updated in place, so a crash
 ## Limits and guarantees
 
 - **Key length** — at most `max_key_bytes` = **65535** encoded bytes (the node
-  formats use 16-bit length fields). Mutating operations throw
-  `std::length_error` *before any allocation or structural change*; lookups of
-  longer keys simply miss (no stored key can be that long), keeping the hot
-  path free of the check.
+  formats use 16-bit length fields). The inserting operations (`insert`,
+  `insert_or_assign`, `upsert`, `emplace`, `try_emplace`, `operator[]`) throw
+  `std::length_error` *before any allocation or structural change*; `update`,
+  `erase` / `remove` and lookups of a longer key simply miss (no stored key
+  can be that long), keeping the hot path free of the check.
 - **Value alignment** — `alignof(T)` up to **128** is supported. Up to 16 costs
   nothing; above that, leaves are allocated in `alignof(T)`-sized, `alignof(T)`-aligned
   units through the rebound allocator, which must honour that alignment
   (`std::allocator` and `std::pmr::polymorphic_allocator` do). `alignof(T) > 128`,
   or `alignof(T) > 16` with a `line_pool` allocator (its terminal region is
   16-byte granular), is rejected at compile time.
+- **`line_pool` capacity** — 2^28 node lines (32 GB) and 2^28 terminal units
+  (4 GB) at most, or what the pool was constructed with (the terminal region
+  is one eighth of the node capacity). Every leaf that is not stored inside
+  its router's line takes terminal units, so on large maps of long keys or
+  large values the 4 GB terminal region is the limit that is reached first;
+  the allocating operation then throws `artpp::pool_exhausted`.
 - **Stack use** — a tree can be as deep as its longest key: keys `a`, `aa`,
   `aaa`, … build one level per byte, up to 65,535. Depth costs heap, not stack,
   for every operation, in every mode: `find` / `contains` / `insert` /
@@ -621,19 +651,24 @@ Neither level is crash consistency: the image is updated in place, so a crash
   `insert_or_assign`, `emplace`, `operator[]`, `erase` by key and by iterator,
   `clear` and cross-allocator move over clustered, nested and oversized keys,
   repeated once per fault point — the allocator failing at each allocation in
-  turn, and `T`'s constructors throwing at each construction in turn — and
-  again with every 2nd to 13th one failing. After each failure the contents
-  are compared with a `std::map` oracle, and at the end blocks and live values
-  must balance. This runs in `mode::buckets` and `mode::adaptive`, alone and
-  with `dense_tiers`, `ladder_c8` and `wide_stems`, for 8-byte, in-handle
-  (4-byte), 120-byte, `std::string`, throwing-copy and move-only mapped
-  types; in the default, `dense_tiers` and `wide_stems` modes; and for
-  `artpp::set`. The paths the audit named (router widening, bucket overflow,
+  turn, and `T`'s constructors throwing at each construction in turn — and,
+  on further sequences twice as long, with every 2nd, 3rd, 5th, 7th and 13th
+  one failing. After each failure the contents are compared with a `std::map`
+  oracle, and at the end blocks and live values must balance. This runs in
+  `mode::buckets` and `mode::adaptive` for 8-byte, in-handle (4-byte),
+  120-byte, `std::string`, throwing-copy and move-only mapped types, and for a
+  sample of those types combined with `dense_tiers`, `dense_tiers | ladder_c8`
+  and `wide_stems`; each run injects either allocation or constructor failures
+  (both for the move-only type); in the default, `dense_tiers` and
+  `wide_stems` modes for a sample of the types; and for `artpp::set`. The paths the audit named (router widening, bucket overflow,
   bucket repacking on erase, leaf-to-bucket collapse) have their own sweeps on
-  top. Limits of the testing: these sequences do not produce wide
-  (`setlist_u16`) nodes, whose fusion and re-striding are fault-tested by a
-  bulk-insert sweep that checks validity and leaks rather than contents;
-  `line_pool` allocators and key codecs that throw are not fault-tested.
+  top. Limits of the testing: wide (`setlist_u16`) nodes hardly occur in
+  these sequences; their creation and re-striding are fault-tested by a
+  bulk-insert sweep that checks validity and leaks rather than contents, and
+  erase and cross-allocator move are not fault-tested on a tree that holds
+  one. `line_pool` is not put through the systematic sweep
+  (`artpp_pool_safety` checks a map that runs its pool dry); key codecs that
+  throw are not fault-tested.
 - **Thread safety** — that of a standard container: concurrent reads on a
   `const` tree are fine; any write requires exclusive access. No internal
   threads, no locks.
@@ -644,8 +679,9 @@ Neither level is crash consistency: the image is updated in place, so a crash
 
 ## Performance
 
-Measured on Apple M5, clang -O3, 1M keys, flagship `line_pool` allocator,
-point-lookup latency (fastest of five reps). How many times **faster** than
+Measured on Apple M5, clang -O3, flagship `line_pool` allocator, point-lookup
+latency (fastest of five reps); 236k dictionary words, 885k clustered strings,
+1M uniform and 1M sequential `uint64_t`. How many times **faster** than
 each baseline (higher is better):
 
 | workload | vs libart | vs `absl::btree_map` | vs `std::map` |
@@ -693,7 +729,7 @@ over a shuffled all-present probe (`bench/ordered_bench.cpp`):
 `std::set`. The trade is build cost and footprint: btree builds ~1.5× faster and
 stays denser on high-entropy keys (26 vs 94 B/key) — but `artpp::set` **ties** btree's
 bytes/key on short keys, where suffix-in-handle elides the leaf entirely. These use
-`operator new`; `line_pool` would widen the find lead further (node locality).
+`operator new`; the set has not been measured on the `line_pool`.
 
 ## Benchmark suite
 
@@ -703,7 +739,8 @@ key vectors, op sequences, and checksum accounting — so the comparison carries
 no per-library benchmark deviations. Contestants are thin adapters
 (`bench/contestants.hpp`):
 
-- `artpp::map` (and `mode::buckets` for the string workloads)
+- `artpp::map` three ways: on the `line_pool` (the flagship row), on the
+  `line_pool` with `mode::buckets`, and on `std::allocator`
 - upstream [libart](https://github.com/armon/libart), vendored under
   `external/libart` (bytes-only: integer workloads use the same big-endian
   bytes artpp's integral codec produces)
@@ -712,7 +749,8 @@ no per-library benchmark deviations. Contestants are thin adapters
 
 Workloads: `dict` (system word list), `clustered` (synthetic shared-prefix
 strings), `uniform` and `sequential` (typed `uint64_t`). Ops: insert, point
-hit, point miss, full ordered scan, erase. Results print as a table and land
+hit, point miss, `lower_bound`, full ordered scan, erase (libart has no
+`lower_bound`, so it has no row for it). Results print as a table and land
 in `results.csv` (one row per contestant × workload × op) for charting.
 
 ```sh
@@ -721,7 +759,10 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 ```
 
 `artpp_perf_gate` is the machine-calibrated artpp/libart ratio regression gate
-(`bench/perf_baseline.tsv`); run it alone on a quiet machine.
+(`bench/perf_baseline.tsv`); run it alone on a quiet machine. It is not run in
+CI, and it measures a different configuration from the tables above (5M
+string keys, `uint32_t` values, `std::allocator`), so its ratios are not
+comparable with them.
 
 ## Testing
 
@@ -729,15 +770,15 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 
 | binary | scope |
 |---|---|
-| `artpp_smoke` | API basics across all modes, allocator routing (counting, PMR, wide-handle, pool), typed keys, `std::map` API-conformance battery, randomized cross-checks |
-| `artpp_conformance` | STL-grade contracts: key-length limit, move/swap branches incl. pool image adoption and structural clone, exactly-once construction, move-only values, compile-time constraints, string_view key parameters, `erase(iterator)`, structural equality incl. shape-divergent trees, iterator edge cases, degenerate shapes, mixed-op differential fuzz vs `std::map` (all modes) |
+| `artpp_smoke` | API basics in the default, `dense_tiers`, `buckets` and `adaptive` modes, allocator routing (counting, PMR, wide-handle, pool), typed keys, `std::map` API-conformance battery, randomized cross-checks |
+| `artpp_conformance` | STL-grade contracts: key-length limit, move-construction and move-assignment branches incl. pool image adoption and structural clone, exactly-once construction, move-only values, compile-time constraints, string_view key parameters, `erase(iterator)`, structural equality incl. shape-divergent trees, iterator edge cases, degenerate shapes, mixed-op differential fuzz vs `std::map` (default, `buckets`, `adaptive`, `dense_tiers`, `wide_stems`) |
 | `artpp_reverse_iter` | Bidirectional iteration fuzz vs `std::map` and `std::set`: churn, full walks both directions, `--end()`, random `lower_bound` + backward steps, `++`/`--` ping-pong; the reverse iterators of map and set dereferenced directly (`string_view` keys, inline values), `base()`, std algorithms over the reverse range |
-| `artpp_exception_safety` | Exception safety under systematic fault injection, in every mode and for `artpp::set`: the allocator failing at every allocation point, and value constructors throwing at every construction, of random operation sequences (insert, assign, emplace, `operator[]`, erase, clear, cross-allocator move) and of targeted scenarios (leaf and prefix splits, router widening, bucket overflow, bucket repacking on erase, leaf-to-bucket collapse, structural clone); contents checked against a `std::map` oracle after every failure, with leak and double-destroy counters. `ARTPP_EH_SEEDS` / `ARTPP_EH_OPS` lengthen the run |
-| `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack in every mode, blocks the handle cannot address, `bool` keys, values without a default constructor) |
+| `artpp_exception_safety` | Exception safety under systematic fault injection, in the default, `buckets`, `adaptive`, `dense_tiers` and `wide_stems` modes (and combinations) and for `artpp::set`: the allocator failing at every allocation point, and value constructors throwing at every construction, of random operation sequences (insert, assign, emplace, `operator[]`, erase, clear, cross-allocator move) and of targeted scenarios (leaf and prefix splits, router widening, bucket overflow, bucket repacking on erase, leaf-to-bucket collapse, structural clone); contents checked against a `std::map` oracle after every failure (validity and leaks only for the bulk-insert and clone sweeps), with leak and double-destroy counters. `ARTPP_EH_SEEDS` / `ARTPP_EH_OPS` lengthen the run |
+| `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack in each of the five base modes, blocks the handle cannot address, `bool` keys, values without a default constructor) |
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
-| `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`) double / reflected-struct / optional keys vs `std::map` ordering oracles |
-| `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
-| `artpp_pool_safety` | the file-backed `line_pool` contract: never-checkpointed stores, map destruction after a checkpoint, repeated attach / mutate / checkpoint / reopen cycles; refusal of truncated, foreign, mismatched and field-corrupted stores without modifying them, of stores mutated after their last checkpoint (also by a writer that died), of a second opener, and of another map instantiation; page-size arithmetic and stores laid out for 64 KB and 1 MB pages; exhaustion at the capacity and at the 2^28-unit handle limits, size overflow, `errno` reporting, `close()` |
+| `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`; not built in CI) double and reflected-struct keys vs `std::map` ordering oracles; optional keys (nullopt first) |
+| `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further inserts verified through a second reopen (a final erase is checkpointed but not re-read); restores carving state + root with no relocation |
+| `artpp_pool_safety` | the file-backed `line_pool` contract: never-checkpointed stores, map destruction after a checkpoint, repeated attach / mutate / checkpoint / reopen cycles; both sync levels recording the same image (the reporting of a write error by `sync_level::flush` is not tested); refusal of truncated, foreign, mismatched and field-corrupted stores without modifying them, of stores mutated after their last checkpoint (also by a writer that died), of a second opener, and of another map instantiation; page-size arithmetic and stores laid out for 64 KB and 1 MB pages; exhaustion at the capacity and at the 2^28-unit handle limits, size overflow, `errno` reporting, `close()` |
 | `artpp_fuzz_map` | differential fuzzer vs `std::map` — every op mirrored on both, full forward/reverse/bound/size agreement; standalone seeded RNG runner (also replays corpus files) |
 | `artpp_fuzz_set` | differential fuzzer vs `std::set`, covering key suffixes packed in the handle; same seeded runner |
 | `artpp_set_smoke` | `artpp::set` basics: the facade over the map with no mapped value |
@@ -758,18 +799,21 @@ cmake -B build -DARTPP_FUZZER=ON && cmake --build build --target artpp_fuzzer
 
 The first input byte selects the config so one corpus exercises every mode (flat / dense_tiers /
 +ladder_c8 / buckets / adaptive / wide_stems), the `line_pool` allocator, and a `std::string` value
-(external leaves). Keys are drawn from a small alphabet and a recently-used key pool (extend /
+(external leaves). Keys are drawn from a small alphabet (or, per input, the full byte range) and a recently-used key pool (extend /
 truncate / mutate a prior key) to manufacture the shared prefixes and wide fan-out that drive the
 split / widen-ladder / bucket-burst / de-widen transitions; any divergence aborts with the input
 bytes for replay.
 
 ## Status and versioning
 
-The current version is **0.1.0**. Before 1.0 the API may change between minor
-versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The on-disk
-format of a file-backed `line_pool` is **specific to the library version**: a
-store is only guaranteed to open with the version that wrote it (see
-[What is not guaranteed](#what-is-not-guaranteed)).
+The current version is **0.1.0**, the first release. Before 1.0 the API may
+change between minor versions; changes are recorded in
+[CHANGELOG.md](CHANGELOG.md). The on-disk format of a file-backed `line_pool`
+is **specific to the library version**: a store is only guaranteed to open
+with the version that wrote it (see
+[What is not guaranteed](#what-is-not-guaranteed)). 0.1.0 writes store format
+version 2 (`line_pool::VERSION`); a store of any other format version is
+refused with `artpp::store_incompatible`.
 
 ## Contributing
 

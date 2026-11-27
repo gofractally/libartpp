@@ -3,15 +3,21 @@
 Notable changes to libart++. Versions follow [semantic versioning](https://semver.org);
 before 1.0 a minor version may change the API.
 
-## Unreleased
+## 0.1.0
+
+The first release: `artpp::map`, `artpp::set`, `artpp::line_pool`, the key
+codecs, the test suite, the benchmark suite and the website. Nothing was
+tagged before it; the entries below record what changed between the initial
+public code and this release, most of it found by the pre-release audit (#1).
+
 
 ### Added
 - MIT licence; the vendored libart's BSD 3-Clause licence text.
 - `find_package(artpp)` support: installed package config and version files.
 - `<artpp/version.hpp>` with `ARTPP_VERSION`.
-- Continuous integration: GCC and Clang on Linux (x86-64, ARM64), Apple Clang on
-  macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer, plus an
-  install-and-consume check.
+- Continuous integration: GCC and Clang on x86-64 Linux and Apple Clang on
+  macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer; GCC
+  on ARM64 Linux; plus an install-and-consume check.
 - `map::checkpoint()` / `set::checkpoint()` and the two-argument attach
   constructor `map{alloc, artpp::attach}`: the lifecycle of a tree in a
   file-backed `line_pool` without passing root handles and counts by hand.
@@ -27,7 +33,8 @@ before 1.0 a minor version may change the API.
 ### Changed
 - `checkpoint()` takes an `artpp::sync_level` and forces nothing to disk by
   default (`sync_level::none`); `sync_level::flush` writes the image out with
-  `msync` and reports write errors. Durability cost is opt-in.
+  `msync` and reports write errors. Durability cost is opt-in. (The initial
+  code flushed only the superblock, unconditionally, and ignored the result.)
 
 ### Removed
 - `docs/sal2.md`, a design note about another project.
@@ -146,7 +153,8 @@ before 1.0 a minor version may change the API.
   `std::runtime_error`), or `std::system_error` with the `errno` for a failed
   system call, instead of `std::bad_alloc`; it modifies and creates nothing.
   `line_pool::checkpoint` throws on a root handle that cannot belong to the
-  pool and on a failed write (it was `noexcept` and ignored `msync`) (#10).
+  pool and, with `sync_level::flush`, on a failed write (it was `noexcept` and
+  ignored `msync`) (#10).
 - File-backed `line_pool`: a store that was modified after its last
   checkpoint and then closed reopened with the superblock of the checkpoint
   over the pages of a different tree (half the keys missing, no error). The
@@ -178,10 +186,11 @@ before 1.0 a minor version may change the API.
   failure of the operating system to commit memory or grow a file throws
   `artpp::pool_commit_failed` with the `errno`; both derive from
   `std::bad_alloc`, which is what was thrown before, without a reason (#1).
-- `line_pool::checkpoint` flushes the data of both regions before the headers
-  and checks every `msync`, so a write error surfaces from `checkpoint()`
-  rather than being lost after a close that looked clean; it flushed only the
-  superblock and ignored the result (#1).
+- `line_pool::checkpoint` with `sync_level::flush` flushes the data of both
+  regions before the headers and checks every `msync`, so a write error
+  surfaces from `checkpoint()` rather than being lost after a close that
+  looked clean. With the default, `sync_level::none`, nothing is forced to
+  disk and a write error is not reported (see Changed) (#1).
 - File-backed `line_pool` could not be opened on a kernel with 64 KB pages
   (ppc64le, some arm64): the superblock reservation, which is the file offset
   of the mapped data, was a constant 32 KB. It is now computed from the page
@@ -191,8 +200,3 @@ before 1.0 a minor version may change the API.
   systems. Not run on a 64 KB-page kernel; the arithmetic is unit-tested for
   page sizes from 4 KB to 4 MB, and the whole path with a simulated page size
   (#17).
-
-## 0.1.0
-
-Initial public code: `artpp::map`, `artpp::set`, `artpp::line_pool`, the key
-codecs, the test suite, the benchmark suite and the website.

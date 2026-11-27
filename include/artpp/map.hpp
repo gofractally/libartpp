@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: MIT
-// map<T> — the headerless adaptive radix map.
+// artpp::map<Key, T, Mode, Allocator, ExpectedSize> and artpp::set — the headerless
+// adaptive radix map. The public contract is in README.md; this comment is a map of the
+// node kinds (detail::K in tagged_ptr.hpp), all of which are implemented here:
+//   leaf         value_ptr    — suffix (rest of key) + value, one terminal allocation
+//   (in handle)  value_inline — a small trivially copyable value (or, for a set, a short
+//                               key suffix) packed in the handle itself
+//   prefix_node  prefix_node  — long shared prefix + one next pointer: the overflow form
+//                               of path compression (short prefixes live in the router)
+//   setlist      setlist_u8   — sparse byte router, 1 cacheline, up to 16 branches, an
+//                               inline prefix of up to 7 bytes, small leaves in its tail
+//   setlist16    setlist_u16  — sparse router over TWO key bytes (mode::wide_stems)
+//   cnode<N>     c2 / c4 / c8 — segmented-bitset routers, the density ladder
+//                               (mode::dense_tiers or a capacity hint; c8: mode::ladder_c8)
+//   node_full    node_full    — dense direct-index router, full_lines_v lines, skip-CL0;
+//                               tagged pfxd when its header line carries a prefix
+//   bucket       bucket       — packed (suffix, value) page (mode::buckets / adaptive)
 //
-// Tiers implemented in this v1:
-//   leaf<T>      value_ptr  — suffix (rest of key) + value, one alloc (lazy expansion)
-//   prefix_node  prefix_node— long shared prefix + one next pointer (path compression)
-//   setlist      setlist_u8 — sparse byte router, 1 cacheline, up to 16 branches (R1)
-//   node_full    node_full  — dense direct-index router, full_lines_v lines, skip-CL0 (SFULL)
-//
-// Routing is off the pointer tag: setlist/prefix read the node (R1); node_full
-// computes the segment line from the key byte, PREFETCHES it, then reads the slot
-// (skip-CL0). Growth: a full setlist widens to node_full. Mutation is in place
-// (no COW). The narrow bitset tiers (r32/64/128, c2/c4/c8) and wide setlists are
-// the documented next step; the dispatch and growth scaffolding already fits them.
+// Routing is off the pointer tag: setlist/prefix read the node; node_full computes the
+// segment line from the key byte, prefetches it, then reads the slot (skip-CL0). Growth:
+// a full setlist widens to node_full directly, or through the cnode ladder when that is
+// enabled. Mutation is in place (no COW).
 #pragma once
 #include <bit>
 #include <cassert>
@@ -524,9 +532,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static constexpr bool HasValue = !std::is_same_v<T, detail::none_t>;
 
       // Hard limit on the ENCODED key length: every length field in the node formats
-      // (leaf suffix/prefix, prefix-node) is 16 bits. Mutating operations throw
-      // std::length_error past it; lookups of longer keys simply miss (no stored key
-      // can be that long, so a miss is the truthful answer at zero hot-path cost).
+      // (leaf suffix/prefix, prefix-node) is 16 bits. The INSERTING operations (insert,
+      // insert_or_assign, upsert, emplace, try_emplace, operator[]) throw std::length_error
+      // past it; update, erase/remove and lookups of a longer key simply miss (no stored
+      // key can be that long, so a miss is the truthful answer at zero hot-path cost).
       static constexpr size_type max_key_bytes = 65535;
 
      private:
@@ -6252,7 +6261,8 @@ using detail::map;  // re-export only the public class; impl stays in artpp::det
 
 // Capacity-hint convenience. Declaring the expected element count auto-selects the cnode density
 // ladder when that count is small enough to be a perf-per-byte win — compact sparse routers, on
-// the line_pool ~40% less RAM and ~2x faster build below ~3M keys (vs the flat default). Above the
+// the line_pool ~40% less RAM and ~2x faster build below ~3M keys (vs the flat default; measured
+// with bench/widen_probe.cpp). Above the
 // measured crossover it transparently stays flat, since the ladder would then only add build churn
 // and pool fragmentation. Ergonomic spelling of map<K, V, mode::none, Allocator, ExpectedN>; for
 // other modes (buckets, wide_stems, …) combine with mode::dense_tiers on the map<> template direct.

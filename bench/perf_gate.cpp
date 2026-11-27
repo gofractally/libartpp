@@ -3,8 +3,8 @@
 // Baselines (artpp ns, libart ns, ratio) live in bench/perf_baseline.tsv; the test flags any
 // metric whose ratio is worse than baseline by more than TOL.
 //
-//   ./artpp_perf                 compare against the committed baseline (exit 1 on regression)
-//   ./artpp_perf --update        re-measure and rewrite the baseline (run on a quiet machine)
+//   ./artpp_perf_gate                 compare against the committed baseline (exit 1 on regression)
+//   ./artpp_perf_gate --update        re-measure and rewrite the baseline (run on a quiet machine)
 extern "C" {
 #include "art.h"  // art_tree / art_insert / art_search
 }
@@ -112,7 +112,7 @@ int main(int argc, char** argv)
    std::vector<uint32_t> order(Q);
    for (size_t i = 0; i < Q; ++i) order[i] = uint32_t(rng() % N);
 
-   std::printf("artpp_perf  N=%zu  reps=%d  (gate = artpp/libart ratio, tol %.0f%%)\n", N, reps,
+   std::printf("artpp_perf_gate  N=%zu  reps=%d  (gate = artpp/libart ratio, tol %.0f%%)\n", N, reps,
                TOL * 100);
    workload u = run(uni, order, reps);
    workload c = run(clu, order, reps);
@@ -143,7 +143,7 @@ int main(int argc, char** argv)
    std::ifstream                 f(path);
    if (!f)
    {
-      std::printf("no baseline (%s) — run `artpp_perf --update` first\n", path);
+      std::printf("no baseline (%s) — run `artpp_perf_gate --update` first\n", path);
       return 0;  // don't gate without a baseline
    }
    std::string line;
@@ -165,6 +165,6 @@ int main(int argc, char** argv)
       std::printf("  %-18s artpp=%6.1f lib=%6.1f  ratio %.3f  base %.3f  %+5.1f%%  %s\n", name, r.artpp,
                   r.lib, cur, b, dev * 100, bad ? "REGRESSION" : (dev < -TOL ? "improved" : "ok"));
    }
-   std::printf(fails ? "\nartpp_perf: %d REGRESSION(S)\n" : "\nartpp_perf: OK\n", fails);
+   std::printf(fails ? "\nartpp_perf_gate: %d REGRESSION(S)\n" : "\nartpp_perf_gate: OK\n", fails);
    return fails ? 1 : 0;
 }

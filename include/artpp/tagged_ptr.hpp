@@ -2,8 +2,8 @@
 // artpp — the "headerless ART": the pointer is the micro-header.
 //
 // A branch is a single tagged handle (default: a 48-bit pointer in 6 bytes). Every node
-// and value blob is allocated 128-byte aligned, so the low 7 bits of an address are
-// always zero; the type tag (`K`) lives in the low 4 of them. Four bits is the whole tag
+// is allocated 128-byte aligned and every leaf at least 16-byte aligned, so the low 4 bits
+// of an address are always zero; the type tag (`K`) lives in them. Four bits is the whole tag
 // budget by contract — that is what lets a 32-bit INDEXED handle spend 28 bits on a
 // 128-byte-line index (2^28 lines = 32 GB). Descent routes off the tag alone — it never
 // reads a node header to learn the node's shape.
@@ -211,7 +211,7 @@ namespace artpp::detail
    };
 
    // Default branch handle: 6 bytes (48-bit). An allocator overrides the width per tree by
-   // exposing `artpp_handle` (see handle_of in tree.hpp); every node layout derives from sizeof(Ptr).
+   // exposing `artpp_handle` (see handle_of in map.hpp); every node layout derives from sizeof(Ptr).
    using packed_ptr = packed_ptr_t<6>;
    static_assert(sizeof(packed_ptr) == 6, "packed_ptr is exactly 6 bytes");
 

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
-// artpp::line_pool — the Stage C allocation policy: one contiguous reservation of 128-byte
-// lines, addressed by a 4-byte handle (28-bit line index + 4-bit tag → 2^28 lines = 32 GB).
-// deref is base + (index << 7) — address-space independent, so the SAME store works over
-// anonymous memory or a memory-mapped file. The full virtual range is reserved up front
-// (base never moves); memory is committed in 4 MB steps as the frontier grows; freed nodes
-// recycle through exact-size free lists (sizes are line counts).
+// artpp::line_pool — the index-handle allocation policy: two contiguous reservations, one
+// of 128-byte node lines and one of 16-byte terminal units (leaves), both addressed by a
+// 4-byte handle (28-bit index + 4-bit tag → 2^28 lines = 32 GB of nodes, 2^28 units = 4 GB
+// of leaves; the terminal region is 1/8th of the node capacity). deref is base +
+// (index << 7), or term_base + (index << 4) for a leaf — address-space independent, so the
+// SAME store works over anonymous memory or memory-mapped files. The full virtual ranges
+// are reserved up front (the bases never move); memory is committed in 4 MB steps as the
+// frontiers grow; freed blocks recycle through exact-size free lists (sizes are unit
+// counts).
 //
 // Backing is BOTH out-of-core storage (page eviction, >RAM data sets) AND a store that survives
 // a clean close/reopen. A file-backed pool is a DIRECTORY with one dense file per address region
@@ -30,7 +33,8 @@
 //     msync and reports write errors; its cost grows with what changed.
 //   * The format is specific to this version of the library.
 //
-// MEASURED vs std::allocator (M5, 5M keys, artpp_pool_ab INTERLEAVED per rep): inserts
+// MEASURED vs std::allocator (M5, 5M keys, an A/B harness that is not in this repository,
+// contestants INTERLEAVED per rep; the published comparison is bench/bench_main.cpp): inserts
 // recover the malloc cost and more (uniform u64 0.81x, clustered 0.94x), queries are
 // neutral-to-better (u64 0.98x; u32 0.91x — bump allocation lays children near parents,
 // node_full drops to 10 lines, and the deref add is fused), despite losing the DMP
@@ -161,7 +165,8 @@ namespace artpp
       using store_error::store_error;
    };
    // A store, but not one this build can use: another format version, byte order, geometry or
-   // page size.
+   // page size — or, thrown when a container attaches (bind), a store written by a different
+   // map/set instantiation.
    class store_incompatible : public store_error
    {
      public:
@@ -292,13 +297,12 @@ namespace artpp
       uint64_t root() const noexcept { return uroot_; }
       uint64_t count() const noexcept { return ucount_; }
       // Throws std::invalid_argument when `root` cannot be the root of a tree in this pool (a
-      // count of 0 records the empty tree, whatever `root` is), std::system_error when the
-      // image cannot be written.
+      // count of 0 records the empty tree, whatever `root` is), std::logic_error when the
+      // pool is closed, and — with sync_level::flush — std::system_error when the image
+      // cannot be written.
       //
-      // This two-argument form is the low-level call: it records the stamp of the container
-      // that is bound to the store (see bind) — and NO stamp when none is, in which case
-      // the image can later be attached by any instantiation. map::checkpoint() always
-      // records its own.
+      // This form, with a stamp, is what map::checkpoint() calls: it records the tree as
+      // belonging to the container instantiation `stamp` describes.
       void checkpoint(uint64_t root, uint64_t count, const image_stamp& stamp,
                       sync_level sync = sync_level::none)
       {
@@ -328,6 +332,9 @@ namespace artpp
          stamp_     = stamp;
          has_stamp_ = bound_ = true;
       }
+      // The form without a stamp is the low-level call: it records the stamp of the container
+      // that is bound to the store (see bind) — and NO stamp when none is, in which case
+      // the image can later be attached by any instantiation.
       void checkpoint(uint64_t root, uint64_t count, sync_level sync = sync_level::none)
       {
          if (dead_) throw std::logic_error("artpp::line_pool::checkpoint: the pool is closed");

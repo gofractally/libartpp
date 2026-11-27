@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tools/coverage.sh — systematic source-coverage of include/artpp/ by the test suite.
 #
-# Builds every test TU with clang source-based coverage (-fprofile-instr-generate
+# Builds the test TUs listed in TESTS below (not yet pool_safety, regression, the set tests
+# or fuzz_set) with clang source-based coverage (-fprofile-instr-generate
 # -fcoverage-mapping), runs them (fuzz_map gets a heavy iteration count), merges the
 # profiles, and reports REGION / LINE / BRANCH coverage of the headers — the code that
 # matters, since the library is header-only. Pass a path/regex to drill in, e.g.

@@ -107,7 +107,7 @@ if(ARTPP_TESTS)
 endif()
 
 # ── coverage-guided fuzzer (opt-in; needs a clang with the fuzzer runtime) ─────
-# Same source as the artpp_fuzz ctest binary, but built as a libFuzzer target with
+# Same source as the artpp_fuzz_map ctest binary, but built as a libFuzzer target with
 # ASan+UBSan: `cmake -DARTPP_FUZZER=ON …` then `bin/artpp_fuzzer -max_total_time=60`.
 if(ARTPP_FUZZER)
    # libFuzzer needs the compiler's fuzzer runtime — Apple Command Line Tools clang ships none.
