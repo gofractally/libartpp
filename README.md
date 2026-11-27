@@ -444,6 +444,12 @@ cache across a clean reopen.
   `std::length_error` *before any allocation or structural change*; lookups of
   longer keys simply miss (no stored key can be that long), keeping the hot
   path free of the check.
+- **Value alignment** — `alignof(T)` up to **128** is supported. Up to 16 costs
+  nothing; above that, leaves are allocated in `alignof(T)`-sized, `alignof(T)`-aligned
+  units through the rebound allocator, which must honour that alignment
+  (`std::allocator` and `std::pmr::polymorphic_allocator` do). `alignof(T) > 128`,
+  or `alignof(T) > 16` with a `line_pool` allocator (its terminal region is
+  16-byte granular), is rejected at compile time.
 - **Exception safety** — mutating operations provide the basic guarantee with
   **zero leaks** (fault-injection-tested: every allocation point swept, leak
   and double-destroy counters asserted). Single-leaf inserts and the

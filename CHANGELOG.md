@@ -33,6 +33,10 @@ before 1.0 a minor version may change the API.
 - Inserting below a small inline value (a trivially copyable `T` of at most 5
   bytes) no longer leaks a 128-byte node when the second allocation of the
   split fails (#13).
+- Values with `alignof(T) > 16` were stored misaligned (undefined behaviour).
+  Leaves for such types are now allocated in `alignof(T)`-aligned units;
+  alignments the storage cannot provide (above 128, or above 16 with
+  `line_pool`) fail a `static_assert` (#14).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <random>
 #include <set>
@@ -395,6 +396,114 @@ static void regression_assign_present_key()
    }
 }
 
+// ── audit #14: values with alignof(T) > 16 ───────────────────────────────────────
+// Leaves came from a 16-byte-granular terminal allocation while the value sits at offset
+// alignof(T) inside the leaf, so an alignas(32) value landed on a 16-byte boundary about
+// half the time (UB; an aligned AVX load faults). The terminal unit now follows alignof(T).
+// Every address the map hands out for a value must be aligned, in every place a value can
+// live: external leaves, a router's term, a setlist's inline leaves, bucket entries.
+struct alignas(32) V32
+{
+   double d[4];
+   bool   operator==(const V32& o) const { return d[0] == o.d[0] && d[3] == o.d[3]; }
+   bool   operator<(const V32& o) const { return d[0] < o.d[0]; }
+};
+struct alignas(64) V64
+{
+   uint64_t a;
+   char     pad[40];
+   bool     operator==(const V64& o) const { return a == o.a; }
+   bool     operator<(const V64& o) const { return a < o.a; }
+};
+static_assert(alignof(V32) == 32 && alignof(V64) == 64);
+template <class V>
+static V over_val(int x)
+{
+   if constexpr (std::is_same_v<V, V32>) return V32{{double(x), 2, 3, double(x) + 0.5}};
+   else { V64 v{}; v.a = uint64_t(x); return v; }
+}
+// An allocator that returns storage aligned to alignof(T) and NOT to 2*alignof(T): a
+// conforming allocator may do exactly that, and it makes the test independent of how
+// generously the platform's malloc happens to align (macOS' default allocator hid the bug).
+template <class T>
+struct exact_align_alloc
+{
+   using value_type = T;
+   exact_align_alloc() = default;
+   template <class U>
+   exact_align_alloc(const exact_align_alloc<U>&) noexcept {}
+   T* allocate(std::size_t n)
+   {
+      const std::size_t A   = alignof(T);
+      char*             raw = static_cast<char*>(::operator new(n * sizeof(T) + 3 * A + sizeof(void*)));
+      std::uintptr_t    u   = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+      u                     = (u + 2 * A - 1) / (2 * A) * (2 * A) + A;  // == A (mod 2A)
+      std::memcpy(reinterpret_cast<char*>(u) - sizeof(void*), &raw, sizeof(void*));
+      return reinterpret_cast<T*>(u);
+   }
+   void deallocate(T* p, std::size_t) noexcept
+   {
+      char* raw;
+      std::memcpy(&raw, reinterpret_cast<char*>(p) - sizeof(void*), sizeof(void*));
+      ::operator delete(raw);
+   }
+   template <class U>
+   bool operator==(const exact_align_alloc<U>&) const noexcept { return true; }
+};
+template <class V, mode M>
+static void overaligned(const char* where)
+{
+   using Tree = map<std::string_view, V, M, exact_align_alloc<V>>;
+   Tree                     t;
+   std::map<std::string, V> oracle;
+   std::vector<std::string> keys;
+   for (int i = 0; i < 64; ++i) keys.push_back("key" + std::to_string(i));       // leaf splits, a wide router
+   for (int i = 0; i < 6; ++i) keys.push_back(std::string(size_t(i), 'p'));      // terms ("" included)
+   for (int i = 0; i < 40; ++i) keys.push_back(std::string("q") + char('a' + i % 5) + char('a' + i));
+   keys.push_back(std::string(700, 'L'));                                        // a multi-unit leaf
+   auto aligned = [&] {
+      size_t mis = 0, n = 0;
+      for (auto& kv : oracle)
+      {
+         const V* p = t.find_ptr(kv.first);
+         CHECK(p != nullptr);
+         if (!p) continue;
+         mis += reinterpret_cast<uintptr_t>(p) % alignof(V) != 0;
+         CHECK(*p == kv.second);
+      }
+      for (auto it = t.begin(); it != t.end(); ++it, ++n)
+         mis += reinterpret_cast<uintptr_t>(&it.value()) % alignof(V) != 0;
+      t.for_each([&](std::string_view, const V& v) { mis += reinterpret_cast<uintptr_t>(&v) % alignof(V) != 0; });
+      CHECK(mis == 0);
+      CHECK(n == oracle.size());
+   };
+   int x = 0;
+   for (auto& k : keys) { const V v = over_val<V>(x++); t.insert_or_assign(k, v); oracle[k] = v; }
+   aligned();
+   agree<Tree, V>(t, oracle, where);
+   for (size_t i = 0; i < keys.size(); i += 2) CHECK(t.erase(keys[i]) == oracle.erase(keys[i]));
+   aligned();
+   for (auto& k : keys) { const V v = over_val<V>(x++); t.insert_or_assign(k, v); oracle[k] = v; }
+   aligned();
+   agree<Tree, V>(t, oracle, where);
+   Tree moved(std::move(t));  // steals; values stay put
+   CHECK(moved.size() == oracle.size());
+   for (auto& k : keys) CHECK(moved.erase(k) == 1);
+   CHECK(moved.empty());
+}
+static void regression_overaligned_values()
+{
+   overaligned<V32, mode::none>("alignas(32)");
+   overaligned<V32, mode::dense_tiers>("alignas(32) dense");
+   overaligned<V32, mode::wide_stems>("alignas(32) wide");
+   overaligned<V32, mode::adaptive>("alignas(32) adaptive");
+   overaligned<V32, mode::buckets>("alignas(32) buckets");
+   overaligned<V64, mode::none>("alignas(64)");
+   overaligned<V64, mode::dense_tiers>("alignas(64) dense");
+   overaligned<V64, mode::adaptive>("alignas(64) adaptive");
+   overaligned<V64, mode::buckets>("alignas(64) buckets");
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
@@ -403,6 +512,7 @@ int main()
    regression_walk_dense_routers();
    regression_erase_cascade_past_window();
    regression_assign_present_key();
+   regression_overaligned_values();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;

@@ -639,13 +639,27 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // not a whole line. Allocators with a terminal region (line_pool) get it routed
       // there; others serve 16-byte blocks from their normal path. Either way the
       // terminal working set shrinks up to 8x vs one-line-per-leaf.
-      struct alignas(16) term_block
+      //
+      // OVER-ALIGNED VALUES: a leaf is [header | pad to alignof(T) | T | key bytes], so the
+      // value is aligned only if the leaf's base is. For alignof(T) > 16 the terminal unit
+      // therefore grows to alignof(T) (size and alignment), which the rebound allocator must
+      // honour like any other over-aligned type. Everything else that
+      // holds a T — a setlist's inline leaves, bucket entries — sits at an alignof(T)-aligned
+      // offset inside a 128-byte-aligned node, hence the 128 ceiling. A terminal-region
+      // allocator (line_pool) hands out 16-byte-granular storage only.
+      static_assert(alignof(T) <= node_block_bytes,
+                    "artpp::map: alignof(mapped_type) must not exceed 128 (the node alignment)");
+      static_assert(!has_term_region_<Allocator>::value || alignof(T) <= 16,
+                    "artpp::map: this allocator's terminal region is 16-byte aligned; a mapped_type "
+                    "with alignof > 16 needs an ordinary allocator (e.g. std::allocator)");
+      static constexpr size_t term_unit = (HasValue && alignof(T) > 16) ? alignof(T) : 16;
+      struct alignas(term_unit) term_block
       {
-         std::byte raw[16];
+         std::byte raw[term_unit];
       };
       using term_alloc_t = typename std::allocator_traits<Allocator>::template rebind_alloc<term_block>;
       using term_at      = std::allocator_traits<term_alloc_t>;
-      static constexpr size_t tunits_(size_t n) noexcept { return (n + 15) / 16; }
+      static constexpr size_t tunits_(size_t n) noexcept { return (n + term_unit - 1) / term_unit; }
       void* term_alloc_(size_t n)  // throws bad_alloc — same fault point as node_alloc_
       {
          if constexpr (has_term_region_<Allocator>::value)
