@@ -1,12 +1,20 @@
-// Exception-safety conformance via exhaustive fault injection. A throwing allocator
-// fails on a countdown; we sweep the countdown over every allocation an insert makes and,
-// on each induced throw, check the STRONG guarantee: the container is unchanged. std::map
-// is the oracle (single-element insert is strong) — run the identical generic harness on
-// it and on map; the deltas are artpp's bugs.
+// Exception-safety conformance via exhaustive fault injection. A throwing allocator fails
+// on a countdown, and value types throw from their constructors on another; each sweep
+// moves the countdown over every allocation (or construction) an operation makes and, on
+// each induced throw, checks the guarantee the README states: the container is unchanged
+// (single-key inserts are strong), erase and clear never throw, nothing leaks, no value is
+// destroyed twice or not at all. std::map is the oracle, and the first battery runs the
+// identical harness on std::map itself: a difference there is the harness's bug.
+//
+// Layout: targeted single-insert / bulk / value / clone / erase sweeps (all modes); then
+// the paths the pre-release audit named in the bucket and adaptive modes (#4 to #7), one
+// faulted operation at a time against the oracle; then random operation sequences with
+// every fault point failed in turn, for every mode and for artpp::set.
 #include "artpp/map.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <new>
@@ -21,6 +29,17 @@ struct fail_counter
 {
    long countdown = -1;  // -1 = never fail; else throw bad_alloc when it reaches 0
    long allocs = 0, frees = 0;
+   long period = 0;      // > 0: after failing, fail again every `period` allocations
+   // The countdown this allocator obeys: its own, or another counter's, so that two
+   // unequal allocators (a cross-allocator move) fail on one shared schedule.
+   fail_counter* sched = this;
+   bool          due()
+   {
+      fail_counter& s = *sched;
+      if (s.countdown < 0 || s.countdown-- != 0) return false;
+      s.countdown = s.period > 0 ? s.period - 1 : -1;
+      return true;
+   }
 };
 
 // Value type that counts live instances, so a SKIPPED destructor on a throwing path shows up
@@ -50,7 +69,7 @@ struct throwing_alloc
    throwing_alloc(const throwing_alloc<U>& o) noexcept : fc(o.fc) {}
    T* allocate(std::size_t n)
    {
-      if (fc->countdown >= 0 && fc->countdown-- == 0) throw std::bad_alloc();
+      if (fc->due()) throw std::bad_alloc();
       ++fc->allocs;
       return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(alignof(T))));
    }
@@ -174,11 +193,18 @@ static void eh_bulk(const char* cont, const char* scen, const std::vector<std::s
 // insert(k, const T&) makes, the move into the leaf, and the move of an OLD value when a
 // leaf splits. A leaf allocated for a value whose constructor then throws must be freed.
 static long g_vcountdown = -1;  // -1 = never; else the constructor that finds 0 throws
+static long g_vperiod    = 0;   // > 0: after throwing, throw again every g_vperiod constructions
 struct value_error {};
+static void value_tick()
+{
+   if (g_vcountdown < 0 || g_vcountdown-- != 0) return;
+   g_vcountdown = g_vperiod > 0 ? g_vperiod - 1 : -1;
+   throw value_error{};
+}
 struct tvalue
 {
    std::string s;
-   static void tick() { if (g_vcountdown >= 0 && g_vcountdown-- == 0) throw value_error{}; }
+   static void tick() { value_tick(); }
    tvalue() { tick(); ++g_live; }
    tvalue(std::string v) : s(std::move(v)) { tick(); ++g_live; }
    tvalue(const char* a, int n) : s(std::string(a) + std::to_string(n)) { tick(); ++g_live; }  // emplace args
@@ -193,6 +219,41 @@ struct tvalue
    tvalue& operator=(tvalue&&)      = default;
    ~tvalue() { --g_live; }
    operator std::string() const { return s; }
+};
+
+// The same value, 120 bytes wide: a bucket page holds three or four, so pages overflow and
+// are repacked constantly, and two entries often cannot share one page at all.
+struct tbig : tvalue
+{
+   char pad[96] = {};
+   using tvalue::tvalue;
+   tbig()                       = default;
+   tbig(const tbig&)            = default;
+   tbig(tbig&&)                 = default;
+   tbig& operator=(const tbig&) = default;
+   tbig& operator=(tbig&&)      = default;
+};
+
+// Move-only, and the move can throw: the one kind of type the tree cannot relocate safely
+// (nothing to copy, and a move that fails half-way through a batch cannot be undone). The
+// tree never relocates such values on erase, and promises only the basic guarantee where an
+// insert has to move existing ones. A moved-from tmoveonly holds "".
+struct tmoveonly
+{
+   std::string s;
+   tmoveonly() { ++g_live; }
+   tmoveonly(std::string v) : s(std::move(v)) { ++g_live; }
+   tmoveonly(tmoveonly&& o)  // throws BEFORE touching the source
+   {
+      value_tick();
+      s = std::move(o.s);
+      o.s.clear();
+      ++g_live;
+   }
+   tmoveonly& operator=(tmoveonly&& o) noexcept { s = std::move(o.s); return *this; }
+   tmoveonly(const tmoveonly&)            = delete;
+   tmoveonly& operator=(const tmoveonly&) = delete;
+   ~tmoveonly() { --g_live; }
 };
 
 // op 0: emplace(nk, "E", 7)   op 1: insert_or_assign(nk, const tvalue&)   op 2: insert(nk, tvalue&&)
@@ -413,12 +474,12 @@ static void eh_clone(const char* cont, const char* scen, const std::vector<std::
                by_value ? "value" : "alloc", ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
 }
 
-// ── erase under allocation failure (radix modes) ─────────────────────────────────
+// ── erase under allocation failure ───────────────────────────────────────────────
 // erase shrinks the structure on the way out, and some of that allocates: re-homing a
-// collapsed router's prefix in a prefix node, de-widening a sparse dense node to a setlist.
-// Those steps are best-effort — on bad_alloc the tree simply stays unshrunk — so in the
-// radix modes erase must never throw, must always remove the key, and must leave every
-// other key in place, whichever of its allocations fails.
+// collapsed router's prefix in a prefix node, de-widening a sparse dense node to a setlist,
+// repacking a bucket of non-trivial values. Those steps are best-effort — on bad_alloc the
+// tree simply stays unshrunk — so erase must never throw, must always remove the key, and
+// must leave every other key in place, whichever of its allocations fails.
 template <class Map>
 static void eh_erase(const char* cont, const char* scen, const std::vector<std::string>& keys,
                      size_t erase_every)
@@ -476,8 +537,8 @@ static void eh_erase(const char* cont, const char* scen, const std::vector<std::
 
 // ── bucket and adaptive modes: one faulted operation against a std::map oracle ────
 // (audit #4 to #7 and the sweep that followed.) `build` fills the map and the oracle; `op`
-// performs ONE mutating call on the map and, only once that has returned, the same change on
-// the oracle. The sweep fails the n-th allocation of `op` (or throws from the n-th value
+// makes one mutating call on the map (or a few) and, only once a call has returned, the same
+// change on the oracle. The sweep fails the n-th allocation of `op` (or throws from the n-th value
 // construction) for every n until the fault no longer fires. After each run:
 //   * an operation that threw left the contents exactly as they were (keys AND values);
 //   * one that returned made its change, whatever best-effort allocation failed inside;
@@ -503,6 +564,7 @@ static V mkv(uint64_t x)
 [[maybe_unused]] static std::string vstr(uint64_t v) { return std::to_string(v); }
 [[maybe_unused]] static std::string vstr(uint32_t v) { return std::to_string(v); }
 [[maybe_unused]] static std::string vstr(const tvalue& v) { return v.s; }
+[[maybe_unused]] static std::string vstr(const tmoveonly& v) { return v.s; }
 template <class V>
 static std::string mks(uint64_t x) { return vstr(mkv<V>(x)); }
 
@@ -523,33 +585,99 @@ static bool same_as(const Map& m, const oracle_t& want)
    }
    return true;
 }
-// Keep using a map that has been through a fault: it must behave like any other.
-template <class Map>
-static bool still_usable(Map& m, oracle_t& o)
+// The helpers below work on artpp::map and on artpp::set alike (for a set the oracle's values
+// are empty), so the same sweeps drive both.
+template <class C>
+constexpr bool is_map_v = requires { typename C::mapped_type; };
+static int g_sweep_viol = 0;  // checks made inside an operation (cross-allocator move)
+
+struct fault_pause  // the harness's own bookkeeping must not trip the fault it has armed
 {
-   using V = typename Map::mapped_type;
+   fail_counter& fc;
+   long          a, v;
+   explicit fault_pause(fail_counter& f) : fc(f), a(f.countdown), v(g_vcountdown) { fc.countdown = g_vcountdown = -1; }
+   ~fault_pause() { fc.countdown = a; g_vcountdown = v; }
+};
+template <class C>
+static std::string c_value(uint64_t x)
+{
+   if constexpr (is_map_v<C>) return mks<typename C::mapped_type>(x);
+   else return std::string();
+}
+template <class C>
+static void c_insert(C& m, oracle_t& o, const std::string& k, uint64_t x)  // insert-or-assign by move
+{
+   if constexpr (is_map_v<C>)
+   {
+      auto v = mkv<typename C::mapped_type>(x);
+      m.insert(k, std::move(v));
+   }
+   else m.insert(k);
+   o[k] = c_value<C>(x);
+}
+// `weak`: the type is move-only with a throwing move, so a value the tree had to move while
+// an insert failed may be left moved-from (empty); its key must still be there.
+template <class C>
+static bool c_same(const C& m, const oracle_t& want, bool weak = false)
+{
+   if constexpr (is_map_v<C>)
+   {
+      if (!weak) return same_as(m, want);
+      if (m.size() != want.size()) return false;
+      auto w = want.begin();
+      for (auto it = m.begin(); it != m.end(); ++it, ++w)
+      {
+         if (w == want.end() || it.key_bytes() != w->first) return false;
+         const std::string got = vstr(it.value());
+         if (!got.empty() && got != w->second) return false;
+         if (!m.contains(w->first)) return false;
+      }
+      return w == want.end();
+   }
+   else
+   {
+      if (m.size() != want.size()) return false;
+      auto w = want.begin();
+      for (auto it = m.begin(); it != m.end(); ++it, ++w)
+         if (w == want.end() || it.key_bytes() != w->first) return false;
+      if (w != want.end()) return false;
+      for (auto& kv : want)
+         if (!m.contains(kv.first) || m.find(kv.first) == m.end()) return false;
+      return true;
+   }
+}
+template <class C>
+static void c_restore_values(C& m, const oracle_t& o)  // after a failure that may leave values moved-from
+{
+   if constexpr (is_map_v<C>)
+      for (auto& kv : o)
+         if (auto it = m.find(kv.first); it != m.end() && vstr(it.value()) != kv.second)
+         {
+            using V = typename C::mapped_type;
+            if constexpr (!std::is_arithmetic_v<V>) m.insert(kv.first, V(kv.second));
+         }
+}
+// Keep using a container that has been through a fault: it must behave like any other.
+template <class C>
+static bool c_still_usable(C& m, oracle_t& o)
+{
    std::vector<std::string> keys;
    for (auto& kv : o) keys.push_back(kv.first);
    uint64_t x = 5000;
    for (size_t i = 0; i < keys.size(); ++i)
    {
       if (i % 3 == 0) { m.erase(keys[i]); o.erase(keys[i]); }
-      else if (i % 3 == 1) { m.insert_or_assign(keys[i], mkv<V>(++x)); o[keys[i]] = mks<V>(x); }
-      else { const std::string k = keys[i] + "+"; m.insert(k, mkv<V>(++x)); o[k] = mks<V>(x); }
+      else if (i % 3 == 1) c_insert(m, o, keys[i], ++x);
+      else c_insert(m, o, keys[i] + "+", ++x);
    }
-   for (int i = 0; i < 24; ++i)
-   {
-      const std::string k = std::string("~after/") + char('a' + i % 6) + std::string(size_t(i), 'q');
-      m.insert(k, mkv<V>(++x));
-      o[k] = mks<V>(x);
-   }
-   if (!same_as(m, o)) return false;
+   for (int i = 0; i < 24; ++i) c_insert(m, o, std::string("~after/") + char('a' + i % 6) + std::string(size_t(i), 'q'), ++x);
+   if (!c_same(m, o)) return false;
    m.clear();
    o.clear();
-   m.insert("again", mkv<V>(1));
-   o["again"] = mks<V>(1);
-   return same_as(m, o);
+   c_insert(m, o, "again", 1);
+   return c_same(m, o);
 }
+
 enum class fault { alloc, value };
 struct tally
 {
@@ -577,8 +705,7 @@ static void eh_point(tally& t, fault f, Build build, Op op, bool may_throw = tru
          oracle_t                     o;
          build(m, o);
          if (!same_as(m, o)) ++t.violations;
-         const oracle_t before = o;
-         bool           threw  = false;
+         bool threw = false;
          (f == fault::alloc ? fc.countdown : g_vcountdown) = n;
          try { op(m, o); }
          catch (const std::bad_alloc&) { threw = true; }
@@ -587,9 +714,10 @@ static void eh_point(tally& t, fault f, Build build, Op op, bool may_throw = tru
          fc.countdown = g_vcountdown = -1;
          t.threw += threw;
          if (threw && !may_throw) ++t.violations;
-         if (!same_as(m, threw ? before : o)) ++t.violations;
-         if (threw) o = before;
-         if (!still_usable(m, o)) ++t.violations;
+         // The oracle holds exactly the steps of `op` that returned: a call that threw must
+         // have changed nothing, a call that returned must have done all of its work.
+         if (!same_as(m, o)) ++t.violations;
+         if (!c_still_usable(m, o)) ++t.violations;
       }
       if (fc.allocs != fc.frees) ++t.leaks;
       if (g_live != vbase) ++t.vleaks;
@@ -666,6 +794,42 @@ static void eh_bucket_burst(const char* cont, fault f = fault::alloc)
       eh_point<Map>(cont, pfx.size() < 9 ? "burst: term+prefix+fan" : "burst: term+long prefix", f,
                     put_keys<Map>(page, 0), put_keys<Map>({next}, 99));
    }
+}
+
+// A bucket directly below a prefix node (erase leaves that shape when a router is down to
+// one branch) that bursts into a router too wide for a setlist: the prefix then belongs in
+// the new node_full's header, and insert fuses it there and re-descends from the prefix
+// node's slot. The fusion frees the prefix node the descent was standing in.
+template <class Map>
+static void eh_burst_under_prefix(const char* cont)
+{
+   using V = typename Map::mapped_type;
+   const std::string        tail(40, 't');
+   std::vector<std::string> first, small;
+   for (int c = 0; c < 12; ++c) first.push_back(std::string("xyz") + char('A' + c) + tail);
+   for (int c = 0; c < 40; ++c) small.push_back(std::string("xyzA") + char('0' + c));
+   auto build = [&](Map& m, oracle_t& o) {
+      put_keys<Map>(first, 0)(m, o);  // bursts the root: router "xyz" over one bucket per letter
+      for (size_t i = 1; i < first.size(); ++i) { m.erase(first[i]); o.erase(first[i]); }  // → prefix "xyzA" over a bucket
+   };
+   {
+      fail_counter fc;
+      Map          m{typename Map::allocator_type(&fc)};
+      oracle_t     o;
+      build(m, o);
+      const auto before = m.debug_stats();
+      put_keys<Map>(small, 100)(m, o);
+      const auto after = m.debug_stats();
+      // before: the prefix node is there; after: it is fused into the node_full's header
+      const bool ok = before.prefix == 1 && before.setlist + before.full + before.fullp == 0 && after.prefix == 0 &&
+                      after.fullp == 1 && same_as(m, o);
+      if (!ok) ++g_fail;
+      std::printf("  %-18s %-24s        %s  (prefix nodes %llu -> %llu, fused fulls %llu -> %llu)\n", cont,
+                  "burst under prefix: shape", ok ? "OK  " : "FAIL", (unsigned long long)before.prefix,
+                  (unsigned long long)after.prefix, (unsigned long long)before.fullp, (unsigned long long)after.fullp);
+      (void)sizeof(V);
+   }
+   eh_point<Map>(cont, "burst under prefix node", fault::alloc, build, put_keys<Map>(small, 100));
 }
 
 // audit #4: a router that is full takes one more child by widening, in one step or (dense
@@ -773,6 +937,250 @@ static void eh_adaptive_collapse(const char* cont, fault f)
    t.report(cont, "leaf -> bucket collapse", f);
 }
 
+// ── bucket and adaptive modes: random operation sequences under systematic faults ─────
+// The scenarios above each aim at one audited path. This sweep does not know the paths: it
+// runs a fixed pseudo-random sequence of insert / insert_or_assign / emplace / operator[] /
+// erase(key) / erase(iterator) / clear / cross-allocator move over clustered keys (shared
+// prefixes, nested keys, keys longer than a bucket page, 0x00 and 0xFF bytes) and
+//   * single faults: repeats the whole sequence once per fault point, failing the n-th
+//     allocation (or throwing from the n-th value construction the map performs) for every
+//     n until a run completes without the fault firing — every point of the sequence;
+//   * periodic faults: one run in which every p-th allocation / construction fails, so
+//     operations fail back to back on a tree that has already been through failures.
+// After every operation that throws: the contents equal the std::map oracle, which only
+// learns of a change once the map's call has returned (the strong guarantee); erase and
+// clear never throw. After every run: contents equal the oracle, the map survives further
+// use (still_usable), and every block and every value is accounted for.
+// The same code drives artpp::set (the oracle's values are then empty).
+struct sweep_op
+{
+   int         kind;  // 0 insert(T&&)  1 emplace  2 erase(key)  3 insert_or_assign(const T&)
+   std::string key;   // 4 operator[]   5 erase(iterator)  6 clear  7 move to another allocator and back
+   uint64_t    v;
+};
+// Even seeds cluster the keys under six prefixes (deep, narrow trees); odd seeds put most of
+// them under one prefix or none, with up to 64 different next bytes, so routers fill up and
+// widen (with and without a prefix to carry).
+static std::vector<sweep_op> gen_ops(uint64_t seed, int nops)
+{
+   const bool fan = seed % 2 == 1;
+   uint64_t x    = seed * 0x9E3779B97F4A7C15ull + 0x1234567;
+   auto     rnd  = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };  // xorshift: same everywhere
+   static const char* const pfx[] = {"", "pre", "prefixlong_", "p", "prefixlong_and_longer_still_", "pre\xff"};
+   std::vector<sweep_op>    ops;
+   std::vector<std::string> seen;
+   for (int i = 0; i < nops; ++i)
+   {
+      sweep_op o;
+      o.v         = rnd() % 100000;
+      const int r = int(rnd() % 40);
+      if (r == 0) o.kind = 6;
+      else if (r == 1 || r == 2) o.kind = 7;
+      else if (r < 11 && !seen.empty())
+      {
+         o.kind = (r < 8) ? 2 : 5;
+         o.key  = seen[rnd() % seen.size()];
+      }
+      else
+      {
+         o.kind = (r < 22) ? 0 : (r < 28) ? 1 : (r < 35) ? 3 : 4;
+         const int shape = int(rnd() % 16);
+         if (shape < 3 && !seen.empty())  // a neighbour of an existing key: its prefix, or an extension
+         {
+            o.key = seen[rnd() % seen.size()];
+            if (rnd() % 2 && !o.key.empty()) o.key.pop_back();
+            else o.key.push_back(char('a' + rnd() % 3));
+         }
+         else if (shape == 3)  // longer than a bucket page: stored as a plain leaf in bucket mode
+            o.key = std::string(pfx[rnd() % 6]) + std::string(520 + rnd() % 40, 'L') + char('a' + rnd() % 4);
+         else if (shape == 4)  // a nested chain
+            o.key = std::string(pfx[rnd() % 6]) + std::string(1 + rnd() % 40, 'n');
+         else if (fan)
+         {
+            const int w = int(rnd() % 8);
+            o.key       = w < 5 ? "pre" : w < 7 ? "" : "prefixlong_and_longer_still_";
+            o.key.push_back(char('0' + rnd() % 64));
+            const int tl = int(rnd() % 4);
+            for (int j = 0; j < tl; ++j) o.key.push_back(char('a' + rnd() % 2));
+         }
+         else
+         {
+            o.key = pfx[rnd() % 6];
+            o.key.push_back(char(shape == 5 ? rnd() % 256 : 'A' + rnd() % 40));
+            const int tl = (rnd() % 4 == 0) ? int(rnd() % 60) : int(rnd() % 6);
+            for (int j = 0; j < tl; ++j) o.key.push_back(char('a' + rnd() % 2));
+         }
+         seen.push_back(o.key);
+      }
+      ops.push_back(std::move(o));
+   }
+   return ops;
+}
+// One operation on the container, then (only if it returned) the same change on the oracle.
+template <class C>
+static void c_apply(C& m, oracle_t& o, const sweep_op& op, fail_counter& fc, fail_counter& side)
+{
+   const std::string& k = op.key;
+   switch (op.kind)
+   {
+      case 0: c_insert(m, o, k, op.v); break;
+      case 1:
+         if constexpr (is_map_v<C>)
+         {
+            using V = typename C::mapped_type;
+            if constexpr (std::is_same_v<V, tvalue>)
+            {
+               if (m.emplace(k, "E", int(op.v))) o[k] = "E" + std::to_string(op.v);  // built in place
+            }
+            else
+            {
+               V v = mkv<V>(op.v);
+               if (m.emplace(k, std::move(v))) o[k] = mks<V>(op.v);
+            }
+         }
+         else if (m.emplace(k).second) o[k];
+         break;
+      case 2:
+         if (m.erase(k) != o.erase(k)) ++g_sweep_viol;
+         break;
+      case 3:
+         if constexpr (is_map_v<C>)
+         {
+            using V = typename C::mapped_type;
+            if constexpr (std::is_copy_constructible_v<V>)
+            {
+               const V v = mkv<V>(op.v);
+               m.insert_or_assign(k, v);  // copies inside the map
+               o[k] = mks<V>(op.v);
+            }
+            else c_insert(m, o, k, op.v);
+         }
+         else c_insert(m, o, k, op.v);
+         break;
+      case 4:
+         if constexpr (requires { m[k]; })  // not offered for a value stored in the handle
+         {
+            using V = typename C::mapped_type;
+            V  v   = mkv<V>(op.v);
+            V& ref = m[k];  // may insert a default-constructed value (and throw doing so) …
+            ref    = std::move(v);  // … the assignment itself cannot throw
+            o[k]   = mks<V>(op.v);
+         }
+         else c_insert(m, o, k, op.v);
+         break;
+      case 5:
+         if (auto it = m.find(k); it != m.end())
+         {
+            m.erase(it);
+            if (o.erase(k) != 1) ++g_sweep_viol;
+         }
+         else if (o.count(k)) ++g_sweep_viol;
+         break;
+      case 6:
+         m.clear();
+         o.clear();
+         break;
+      case 7:
+      {
+         // Unequal allocators: each assignment clones node by node into the target's
+         // allocator. A clone that fails must leave the target empty and the source with
+         // all its keys (its values may have been moved from: restored below so the
+         // sequence can go on), and must leak nothing — then the failure is reported.
+         C other{typename C::allocator_type(&side)};
+         try { other = std::move(m); }
+         catch (...)
+         {
+            fault_pause p(fc);
+            if (!other.empty() || !c_same(m, o, true)) ++g_sweep_viol;
+            c_restore_values(m, o);
+            throw;
+         }
+         if (!m.empty()) ++g_sweep_viol;
+         try { m = std::move(other); }
+         catch (...)
+         {
+            fault_pause p(fc);
+            if (!m.empty() || !c_same(other, o, true)) ++g_sweep_viol;
+            c_restore_values(other, o);
+            m = std::move(other);  // faults paused: the trip back completes
+            throw;
+         }
+         if (!other.empty()) ++g_sweep_viol;
+         break;
+      }
+   }
+}
+// period == 0: sweep every fault point of the sequence. period > 0: one run, every period-th.
+template <class C>
+static void eh_sweep(tally& t, uint64_t seed, int nops, fault f, int period, bool weak = false)
+{
+   const std::vector<sweep_op> ops = gen_ops(seed, nops);
+   for (int n = 0;; ++n)
+   {
+      fail_counter fc, side;
+      side.sched       = &fc;
+      bool       fired = false;
+      const long vbase = g_live;
+      g_sweep_viol     = 0;
+      {
+         C        m{typename C::allocator_type(&fc)};
+         oracle_t o;
+         long&    cd = (f == fault::alloc ? fc.countdown : g_vcountdown);
+         (f == fault::alloc ? fc.period : g_vperiod) = period;
+         cd = period ? period - 1 : n;
+         for (size_t i = 0; i < ops.size(); ++i)
+         {
+            const long armed = cd;
+            bool       threw = false;
+            try { c_apply(m, o, ops[i], fc, side); }
+            catch (const std::bad_alloc&) { threw = true; }
+            catch (const value_error&) { threw = true; }
+            if (threw || (!period && armed >= 0 && cd < 0) || (period && i % 16 == 15))
+            {
+               // the fault fired in this operation (or, periodic, some time recently)
+               fault_pause p(fc);
+               fired = fired || threw || cd < 0;
+               t.threw += threw;
+               const int kind = ops[i].kind;
+               if (threw && (kind == 2 || kind == 5 || kind == 6)) ++t.violations;  // erase/clear threw
+               if (!c_same(m, o, weak)) { ++t.violations; break; }
+               if (weak && threw) c_restore_values(m, o);
+            }
+         }
+         fired        = fired || cd < 0;
+         fc.countdown = g_vcountdown = -1;
+         fc.period = g_vperiod = 0;
+         if (!c_same(m, o, weak)) ++t.violations;
+         if (weak) c_restore_values(m, o);
+         if (!c_still_usable(m, o)) ++t.violations;
+         t.violations += g_sweep_viol;
+      }
+      if (fc.allocs != fc.frees || side.allocs != side.frees) ++t.leaks;
+      if (g_live != vbase) ++t.vleaks;
+      ++t.points;
+      if (period || !fired) break;
+   }
+}
+// ctest runs 2 sequences of 120 operations per container with every fault point failed, and
+// 15 periodic runs of twice that length. For a longer soak set ARTPP_EH_SEEDS (sequences)
+// and ARTPP_EH_OPS (operations each); the cost grows with seeds x ops^2.
+static int env_int(const char* name, int dflt)
+{
+   const char* v = std::getenv(name);
+   return v && *v ? std::atoi(v) : dflt;
+}
+template <class C>
+static void run_sweep(const char* cont, fault f, bool weak = false)
+{
+   static const int seeds = env_int("ARTPP_EH_SEEDS", 2), nops = env_int("ARTPP_EH_OPS", 120);
+   tally single, periodic;
+   for (int seed = 1; seed <= seeds; ++seed) eh_sweep<C>(single, uint64_t(seed), nops, f, 0, weak);
+   for (int seed = 1; seed <= seeds + 1; ++seed)
+      for (int period : {2, 3, 5, 7, 13}) eh_sweep<C>(periodic, uint64_t(1000 + seed), 2 * nops, f, period, weak);
+   single.report(cont, "sequence, each point", f);
+   periodic.report(cont, "sequence, every p-th", f);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -835,9 +1243,9 @@ int main()
    eh_bulk<HkvDense>("artpp-dense", "fanout", wide);
    eh_bulk<HkvWide>("artpp-wide", "fanout", wide);
 
-   // Throwing value constructors (audit #12). The radix modes are swept in full; the bucket
-   // and adaptive insert paths have open exception-safety issues of their own (#4 to #7,
-   // tests/known_bugs), so there only the paths #12 fixed are asserted.
+   // Throwing value constructors (audit #12), every mode. (When this was written the bucket
+   // and adaptive modes could only be given the three paths #12 itself fixed; those are kept
+   // below, and since #4 to #7 the full battery runs there as well.)
    using TRef   = std::map<std::string, tvalue, std::less<>, throwing_alloc<std::pair<const std::string, tvalue>>>;
    using TRadix = map<std::string_view, tvalue, mode::none, throwing_alloc<tvalue>>;
    using TDense = map<std::string_view, tvalue, mode::dense_tiers, throwing_alloc<tvalue>>;
@@ -849,6 +1257,8 @@ int main()
    run_value_scenarios<TRadix>("artpp-radix");
    run_value_scenarios<TDense>("artpp-dense");
    run_value_scenarios<TWide>("artpp-wide");
+   run_value_scenarios<TBkt>("artpp-bucket");
+   run_value_scenarios<TAdp>("artpp-adapt");
    for (int opk = 0; opk < 3; ++opk)
    {
       eh_value<TBkt>("artpp-bucket", "empty->x", {}, "x", opk);                    // make_bucket_branch
@@ -862,8 +1272,7 @@ int main()
    eh_value_repeat<TBkt>("artpp-bucket", true);
    eh_value_repeat<TAdp>("artpp-adapt", false);
 
-   // erase with each of its (best-effort) allocations failing — radix modes; the bucket-mode
-   // erase path has an open issue of its own (#6).
+   // erase with each of its (best-effort) allocations failing, every mode.
    std::printf("\nerase under bad_alloc injection (never throws, always removes):\n");
    {
       std::vector<std::string> shrink = cluster;  // collapses, prefix re-homing, de-widening
@@ -877,6 +1286,8 @@ int main()
          eh_erase<HkvWide>("artpp-wide", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
          eh_erase<map<std::string_view, counted, mode::dense_tiers, throwing_alloc<counted>>>(
              "artpp-dense", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
+         eh_erase<HkvBkt>("artpp-bucket", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
+         eh_erase<HkvAdp>("artpp-adapt", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
       }
    }
 
@@ -920,6 +1331,8 @@ int main()
    eh_bucket_burst<BTv>("bucket/tvalue");
    eh_bucket_burst<BTv>("bucket/tvalue", fault::value);
    eh_bucket_burst<BDenseU64>("bucket+dense/u64");
+   eh_burst_under_prefix<BU64>("bucket/u64");
+   eh_burst_under_prefix<BU32>("bucket/u32");
    eh_bucket_widen<BU64>("bucket/u64");
    eh_bucket_widen<BDenseU64>("bucket+dense/u64");
    eh_bucket_widen<BDense8U64>("bucket+dense+c8/u64");
@@ -933,6 +1346,51 @@ int main()
    eh_adaptive_collapse<AStr>("adaptive/string", fault::alloc);
    eh_adaptive_collapse<AU64>("adaptive/u64", fault::alloc);
    eh_adaptive_collapse<AU32>("adaptive/u32", fault::alloc);
+
+   // Bucket and adaptive modes, every flag combination that changes their node kinds, and
+   // artpp::set: random operation sequences with every fault point failed in turn.
+   std::printf("\nbucket and adaptive modes, operation sequences against a std::map oracle:\n");
+   {
+      using mode_bd  = decltype(mode::buckets);
+      constexpr mode_bd B = mode::buckets, A = mode::adaptive, D = mode::dense_tiers, W = mode::wide_stems,
+                        C8 = mode::ladder_c8;
+      using sv = std::string_view;
+      using TMo = tmoveonly;
+      run_sweep<map<sv, uint64_t, B, throwing_alloc<uint64_t>>>("bucket/u64", fault::alloc);
+      run_sweep<map<sv, uint32_t, B, throwing_alloc<uint32_t>>>("bucket/u32", fault::alloc);
+      run_sweep<map<sv, std::string, B, throwing_alloc<std::string>>>("bucket/string", fault::alloc);
+      run_sweep<map<sv, tvalue, B, throwing_alloc<tvalue>>>("bucket/tvalue", fault::value);
+      run_sweep<map<sv, TMo, B, throwing_alloc<TMo>>>("bucket/move-only", fault::alloc, true);
+      run_sweep<map<sv, TMo, B, throwing_alloc<TMo>>>("bucket/move-only", fault::value, true);
+      run_sweep<map<sv, uint64_t, A, throwing_alloc<uint64_t>>>("adaptive/u64", fault::alloc);
+      run_sweep<map<sv, uint32_t, A, throwing_alloc<uint32_t>>>("adaptive/u32", fault::alloc);
+      run_sweep<map<sv, std::string, A, throwing_alloc<std::string>>>("adaptive/string", fault::alloc);
+      run_sweep<map<sv, tvalue, A, throwing_alloc<tvalue>>>("adaptive/tvalue", fault::value);
+      run_sweep<map<sv, TMo, A, throwing_alloc<TMo>>>("adaptive/move-only", fault::alloc, true);
+      run_sweep<map<sv, TMo, A, throwing_alloc<TMo>>>("adaptive/move-only", fault::value, true);
+      run_sweep<map<sv, tbig, B, throwing_alloc<tbig>>>("bucket/120-byte", fault::value);
+      run_sweep<map<sv, tbig, A, throwing_alloc<tbig>>>("adaptive/120-byte", fault::alloc);
+      run_sweep<map<sv, uint64_t, B | D, throwing_alloc<uint64_t>>>("bucket+dense/u64", fault::alloc);
+      run_sweep<map<sv, std::string, B | D, throwing_alloc<std::string>>>("bucket+dense/string", fault::alloc);
+      run_sweep<map<sv, tvalue, B | D | C8, throwing_alloc<tvalue>>>("bucket+dense+c8/tvalue", fault::value);
+      run_sweep<map<sv, uint64_t, A | D | C8, throwing_alloc<uint64_t>>>("adapt+dense+c8/u64", fault::alloc);
+      run_sweep<map<sv, std::string, A | D, throwing_alloc<std::string>>>("adapt+dense/string", fault::alloc);
+      run_sweep<map<sv, tvalue, A | D, throwing_alloc<tvalue>>>("adapt+dense/tvalue", fault::value);
+      run_sweep<map<sv, uint64_t, B | W, throwing_alloc<uint64_t>>>("bucket+wide/u64", fault::alloc);
+      run_sweep<map<sv, std::string, A | W, throwing_alloc<std::string>>>("adapt+wide/string", fault::alloc);
+      // the radix modes, for comparison under the same sequences
+      run_sweep<map<sv, uint64_t, mode::none, throwing_alloc<uint64_t>>>("radix/u64", fault::alloc);
+      run_sweep<map<sv, tvalue, mode::none, throwing_alloc<tvalue>>>("radix/tvalue", fault::value);
+      run_sweep<map<sv, std::string, D, throwing_alloc<std::string>>>("dense/string", fault::alloc);
+      run_sweep<map<sv, uint64_t, W, throwing_alloc<uint64_t>>>("wide/u64", fault::alloc);
+      // strict even for the move-only type: the radix modes move one existing value per
+      // insert at most, last, so a throwing move leaves everything as it was
+      run_sweep<map<sv, TMo, mode::none, throwing_alloc<TMo>>>("radix/move-only", fault::value);
+      run_sweep<map<sv, TMo, W, throwing_alloc<TMo>>>("wide/move-only", fault::value);
+      run_sweep<artpp::set<sv, mode::none, throwing_alloc<sv>>>("set", fault::alloc);
+      run_sweep<artpp::set<sv, B, throwing_alloc<sv>>>("set bucket", fault::alloc);
+      run_sweep<artpp::set<sv, A, throwing_alloc<sv>>>("set adaptive", fault::alloc);
+   }
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");

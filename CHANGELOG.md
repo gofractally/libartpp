@@ -87,12 +87,16 @@ before 1.0 a minor version may change the API.
   in place but, for a mapped type that is not trivially copyable, with
   moved-from values: their contents were lost. Bursting a bucket is now
   all-or-nothing (#1).
+- Exception safety is now tested in `mode::buckets` and `mode::adaptive` (and
+  their combinations with `dense_tiers`, `ladder_c8`, `wide_stems`) and for
+  `artpp::set` the way it was in the radix modes, and beyond: random operation
+  sequences with every allocation and every value construction failed in turn,
+  checked against a `std::map` oracle. The README's exception-safety section
+  states the guarantee per operation and what the tests cover (#1).
 
 ### Known issues
-- Open bugs from the pre-release audit: #4 to #7 (exception safety in
-  `mode::buckets` and `mode::adaptive`), #8 to #10 and #17 (file-backed
-  `line_pool`), and the `mode::buckets` insert recursion left from #15.
-  Reproducers are in `tests/known_bugs`.
+- Open bugs from the pre-release audit: #8 to #10 and #17 (file-backed
+  `line_pool`). Reproducers are in `tests/known_bugs`.
 
 ## 0.1.0
 

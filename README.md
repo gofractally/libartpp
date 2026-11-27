@@ -464,26 +464,58 @@ cache across a clean reopen.
   16-byte granular), is rejected at compile time.
 - **Stack use** — a tree can be as deep as its longest key: keys `a`, `aa`,
   `aaa`, … build one level per byte, up to 65,535. Depth costs heap, not stack,
-  for everything on this list: `find` / `contains` / `insert` / `emplace` /
-  `update` / `erase` (loops), iterators and `lower_bound` / `upper_bound`
-  (heap-backed descent stack), `clear` and the destructor (constant stack, no
-  allocation), and move assignment between unequal allocators (heap work
-  list). `for_each`, `for_each_value` and `operator==` recurse for the first
-  64 levels and hand anything deeper to the iterator: at most about 13 KB of
-  stack in an optimized build, about 100 KB unoptimized. Two operations still
-  recurse once per tree level — roughly 180 bytes per level optimized, several
-  times that unoptimized: **`insert` / `emplace` in `mode::buckets`**, and the
-  diagnostic `debug_stats()`. Give those a stack sized for your longest
-  nested-key chain, or avoid `mode::buckets` for such key sets.
-- **Exception safety** — mutating operations provide the basic guarantee with
-  **zero leaks**; single-key inserts and the pre-mutation checks are strong.
-  `erase` does not throw in the radix modes (its shrinking steps that allocate
-  are best-effort). This is fault-injection-tested in the radix modes
-  (default, `dense_tiers`, `wide_stems`): the allocator fails at every
-  allocation point of `insert`, `erase` and cross-allocator move assignment,
-  and value constructors throw at every construction of `emplace` and
-  `insert`, with leak and double-destroy counters asserted. `mode::buckets`
-  and `mode::adaptive` do not meet this yet; see [Known issues](#known-issues).
+  for every operation, in every mode: `find` / `contains` / `insert` /
+  `emplace` / `update` / `erase` (loops), iterators and `lower_bound` /
+  `upper_bound` (heap-backed descent stack), `clear` and the destructor
+  (constant stack, no allocation), move assignment between unequal allocators
+  and the diagnostic `debug_stats()` (heap work lists). `for_each`,
+  `for_each_value` and `operator==` recurse for the first 64 levels and hand
+  anything deeper to the iterator: at most about 13 KB of stack in an
+  optimized build, about 100 KB unoptimized.
+- **Exception safety** — an operation that throws leaves the container valid
+  and leaks nothing: no node, and no value's destructor skipped or run twice.
+  In every mode:
+  - `insert`, `insert_or_assign`, `upsert`, `emplace`, `try_emplace` and
+    `operator[]` are **strong**: if one throws (`bad_alloc`, or an exception
+    from `T`'s constructors), the contents are exactly what they were — every
+    key and every value. An rvalue passed to `insert` may have been moved from.
+  - `erase(key)` / `remove` and `clear` **do not throw**. The steps of an
+    erase that allocate (collapsing a router, repacking a bucket) are
+    best-effort: if one fails the key is still removed and the tree is merely
+    less compact. (`erase(key)` is not declared `noexcept` only because a
+    user-supplied key codec may throw while encoding the key. `erase(pos)`
+    never fails through the tree's allocator either, but it copies the key
+    and builds the iterator it returns, which for long keys and deep trees
+    takes memory from the global heap.)
+  - Move assignment between unequal allocators gives the **basic** guarantee:
+    if the clone fails, the target is empty, and the source keeps all its keys,
+    with values that are not trivially copyable possibly moved-from.
+  - One documented exception to "strong", in `mode::buckets` and
+    `mode::adaptive` only: a mapped type that is **move-only and has a throwing
+    move constructor**. Existing values are relocated when a bucket overflows
+    or a leaf is collapsed into one; the tree moves them if the move cannot
+    throw and copies them otherwise (the `std::vector` rule), so nothing is
+    lost. A type that can do neither keeps all its keys if such a move throws,
+    but values already moved are left moved-from.
+
+  What is tested (`artpp_exception_safety`): random sequences of insert,
+  `insert_or_assign`, `emplace`, `operator[]`, `erase` by key and by iterator,
+  `clear` and cross-allocator move over clustered, nested and oversized keys,
+  repeated once per fault point — the allocator failing at each allocation in
+  turn, and `T`'s constructors throwing at each construction in turn — and
+  again with every 2nd to 13th one failing. After each failure the contents
+  are compared with a `std::map` oracle, and at the end blocks and live values
+  must balance. This runs in `mode::buckets` and `mode::adaptive`, alone and
+  with `dense_tiers`, `ladder_c8` and `wide_stems`, for 8-byte, in-handle
+  (4-byte), 120-byte, `std::string`, throwing-copy and move-only mapped
+  types; in the default, `dense_tiers` and `wide_stems` modes; and for
+  `artpp::set`. The paths the audit named (router widening, bucket overflow,
+  bucket repacking on erase, leaf-to-bucket collapse) have their own sweeps on
+  top. Limits of the testing: these sequences do not produce wide
+  (`setlist_u16`) nodes, whose fusion and re-striding are fault-tested by a
+  bulk-insert sweep that checks validity and leaks rather than contents;
+  `line_pool` allocators (see [Known issues](#known-issues)) and key codecs
+  that throw are not fault-tested.
 - **Thread safety** — that of a standard container: concurrent reads on a
   `const` tree are fine; any write requires exclusive access. No internal
   threads, no locks.
@@ -582,8 +614,8 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 | `artpp_smoke` | API basics across all modes, allocator routing (counting, PMR, wide-handle, pool), typed keys, `std::map` API-conformance battery, randomized cross-checks |
 | `artpp_conformance` | STL-grade contracts: key-length limit, move/swap branches incl. pool image adoption and structural clone, exactly-once construction, move-only values, compile-time constraints, string_view key parameters, `erase(iterator)`, structural equality incl. shape-divergent trees, iterator edge cases, degenerate shapes, mixed-op differential fuzz vs `std::map` (all modes) |
 | `artpp_reverse_iter` | Bidirectional iteration fuzz vs `std::map`: churn, full walks both directions, `--end()`, random `lower_bound` + backward steps, `++`/`--` ping-pong |
-| `artpp_exception_safety` | Exception safety under systematic fault injection: the allocator failing at every allocation point of insert, erase and cross-allocator move; value constructors throwing at every construction; in-handle and non-trivial values; leak/corruption/double-destroy counters vs a `std::map` oracle. Radix modes in full; bucket and adaptive modes for the paths without open issues |
-| `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack, blocks the handle cannot address, `bool` keys, values without a default constructor) |
+| `artpp_exception_safety` | Exception safety under systematic fault injection, in every mode and for `artpp::set`: the allocator failing at every allocation point, and value constructors throwing at every construction, of random operation sequences (insert, assign, emplace, `operator[]`, erase, clear, cross-allocator move) and of targeted scenarios (leaf and prefix splits, router widening, bucket overflow, bucket repacking on erase, leaf-to-bucket collapse, structural clone); contents checked against a `std::map` oracle after every failure, with leak and double-destroy counters. `ARTPP_EH_SEEDS` / `ARTPP_EH_OPS` lengthen the run |
+| `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack in every mode, blocks the handle cannot address, `bool` keys, values without a default constructor) |
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
 | `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`) double / reflected-struct / optional keys vs `std::map` ordering oracles |
 | `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
@@ -622,11 +654,6 @@ A pre-release audit found bugs that are open in the
 [issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
 fixed:
 
-- **Exception safety:** the guarantees under [Limits and guarantees](#limits-and-guarantees)
-  do not hold in `mode::buckets` and `mode::adaptive` (#4 to #7).
-- **Deep trees in `mode::buckets`:** `insert` still recurses once per tree
-  level there and can overflow the stack on long chains of nested keys (the
-  rest of #15 is fixed; see [Limits and guarantees](#limits-and-guarantees)).
 - **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
   stale or never-checkpointed store is not detected (#8 to #10).
 

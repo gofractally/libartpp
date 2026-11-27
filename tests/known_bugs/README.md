@@ -10,11 +10,9 @@ Build one from the repository root:
 
 ```sh
 c++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-    -Iinclude tests/known_bugs/fault.cpp -o fault
+    -Iinclude tests/known_bugs/pool_tests.cpp -o pool_tests
 ```
 
 | File | Issue | Run |
 |---|---|---|
-| `repro_eh.cpp` | #4, #5, #6, #7 exception paths (scenario 4 was #13, now fixed) | `./repro_eh 2 1`, `7 9`, `1 0`, `5 -1` |
-| `fault.cpp` | #5, #6 allocation and value fault sweep (bucket mode) | `./fault 1 1 1 250` |
 | `pool_tests.cpp` | #8, #9, #10 file-backed `line_pool` | `./pool_tests 1` to `6` |
