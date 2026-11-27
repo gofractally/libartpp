@@ -39,6 +39,13 @@ public code and this release, most of it found by the pre-release audit (#1).
 ### Removed
 - `docs/sal2.md`, a design note about another project.
 
+### Documentation
+- Benchmark text in the README and on the website now matches the committed
+  data (`docs/results.csv`). The earlier text claimed `line_pool` lookups were
+  faster than libart on all four workloads; in the data they are slower on
+  uniform random integers, and the all-four result belongs to the default
+  allocator. Insert and scan claims are corrected the same way.
+
 ### Fixed
 - `rbegin()` / `rend()` were `std::reverse_iterator` over the container's
   iterator, which dereferences a temporary copy: with `std::string_view` keys

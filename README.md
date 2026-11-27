@@ -4,11 +4,12 @@
 
 **[Website & benchmark charts](https://gofractally.github.io/libartpp/)**
 
-With the flagship `line_pool` allocator (anonymous mapping, u32-index handles,
-two regions), point lookups are **1.2–2.0× faster than upstream libart on all four
-workloads** in the run described under [Performance](#performance) (plain radix — 2.0× sequential, 1.37× uniform, 1.32× clustered,
-1.18× dictionary), 1.9–4.3× faster than `absl::btree_map`, and 2.1–7.6× faster
-than `std::map`. The invariant behind the numbers: **at
+With the default allocator, point lookups are **1.2–2.0× faster than upstream
+libart on all four benchmark workloads**, 2.0–4.4× faster than
+`absl::btree_map` and 2.4–7.2× faster than `std::map`, in the run described
+under [Performance](#performance) (one machine, Apple silicon). The bundled
+`line_pool` allocator is faster again on three of the four and slower on one.
+The invariant behind the numbers: **at
 most one cold cacheline per level of descent** — headerless tagged-pointer
 dispatch; prefixes fused into the node's own header line; small values inline
 in the handle; a small leaf living **inside the routing node's cacheline** (the
@@ -169,7 +170,7 @@ class map;
 | Flag | Effect |
 |---|---|
 | `mode::none` | Pure radix: leaves, prefix nodes, and routers that widen `setlist → node_full`. The fastest default for point lookups. |
-| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary (the run described under [Performance](#performance)) it runs point lookups ~1.16× faster than the default radix (77 vs 89 ns) and ordered scans ~2.9× faster (2.6 vs 7.4 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
+| `mode::buckets` | Terminals are *buckets* — packed (suffix, value) pages whose index is kept in total suffix order by insertion, collapsing sparse or deep key tails into one node. Routers appear only when a bucket overflows and bursts. The preferred mode for clustered string keys: on the 236k-word dictionary (the run described under [Performance](#performance)) it runs point lookups ~1.14× faster than the default radix (78 vs 89 ns) and ordered scans ~2.8× faster (2.6 vs 7.3 ns/element — contiguous pages out-scan pointer-chased leaves), and its scans even rival `absl::btree_map` on clustered keys. Buckets cost nothing when off: the engine dead-strips from other modes. |
 | `mode::adaptive` | Pure radix that watches its own descent: when leaf splits keep landing under deep, narrow paths, those split points collapse to buckets. A middle ground that keeps uniform data bucket-free. |
 | `mode::dense_tiers` | Forces the segmented-bitset cnode density ladder on (`setlist → c2 → c4 → node_full`): sparse fan-out routers stay compact cnodes instead of a sparse `node_full` (14 lines with the default handle, 10 on the `line_pool`). On the `line_pool` this is a **perf-per-byte win for small maps** — below ~3M keys ~40% less RAM and ~2× faster build, as measured by `artpp_widen_probe` — but the gain fades as the map grows (fan-out nodes densify toward `node_full` and leaves come to dominate the footprint), and past ~3M it only adds build churn + pool fragmentation. Usually reached via the `ExpectedSize` hint / [`compact_map`](#compact_map-capacity-hint) rather than set by hand. |
 | `mode::flat_full` | Forces the ladder **off** (`setlist → node_full` direct) even when a capacity hint would enable it — the plain-radix behavior, for find-only or large maps. Same as the default `mode::none`. |
@@ -309,7 +310,7 @@ destroy-and-reconstruct, so a throwing assignment leaves a valid object behind.
 |---|---|
 | `begin() / end() / cbegin() / cend()` | Bidirectional const iteration in ascending key order. `begin()` does not allocate unless the first element is more than 16 nodes deep. |
 | `rbegin() / rend()` (+`cr` forms) | The same in descending order, through the container's own `const_reverse_iterator` (see [Iterators](#iterators)). |
-| `for_each(f)` | Recursive visitor `f(std::string_view key_bytes, const T&)` in ascending order — roughly 3× the iterator on cache-resident scans (no per-element resumption). |
+| `for_each(f)` | Recursive visitor `f(std::string_view key_bytes, const T&)` in ascending order — faster than the iterator on cache-resident scans (no per-element resumption; not benchmarked in the suite). |
 | `for_each_value(f)` | `f(const T&)` in ascending key order without materializing keys. |
 
 ### Capacity, comparison, management
@@ -679,35 +680,58 @@ Neither level is crash consistency: the image is updated in place, so a crash
 
 ## Performance
 
-Measured on Apple M5, clang -O3, flagship `line_pool` allocator, point-lookup
-latency (fastest of five reps); 236k dictionary words, 885k clustered strings,
-1M uniform and 1M sequential `uint64_t`. How many times **faster** than
-each baseline (higher is better):
+One run: Apple M5 Max, Apple clang -O3, June 2026, `artpp_bench` (the data is
+[docs/results.csv](docs/results.csv), the charts on the website are drawn from
+it). 236k dictionary words, 885k clustered strings, 1M uniform and 1M
+sequential `uint64_t`; point-lookup latency, fastest of five repetitions. The
+ratios were re-measured on the 0.1.0 code on the same machine under load and
+agree to within about 10%; the absolute times did not, so treat the times as
+indicative. Nothing here has been measured on x86.
 
-| workload | vs libart | vs `absl::btree_map` | vs `std::map` |
-|---|---|---|---|
-| dictionary words | **1.18×** | 1.93× | 2.14× |
-| clustered strings | **1.32×** | 2.36× | 3.72× |
-| uniform `u64` | **1.37×** | 2.89× | 5.47× |
-| sequential `u64` | **2.02×** | 4.32× | 7.63× |
+How many times **faster** point lookups are than each baseline (higher is
+better; below 1 is slower):
 
-Bucket mode is faster still on the dictionary (1.16× over the default radix)
-and its scans rival `absl::btree_map`. The headerless tagged-pointer dispatch
-is the structural reason reads win: libart loads a node header on every hop
-before it can route; artpp routes from the pointer itself, and a small leaf
-often rides in the routing node's own cacheline.
+| workload | allocator | vs libart | vs `absl::btree_map` | vs `std::map` |
+|---|---|---|---|---|
+| dictionary words | `std::allocator` | **1.24×** | 2.04× | 2.39× |
+| | `line_pool` | **1.29×** | 2.12× | 2.49× |
+| clustered strings | `std::allocator` | **1.22×** | 2.22× | 3.17× |
+| | `line_pool` | **1.33×** | 2.42× | 3.47× |
+| uniform `u64` | `std::allocator` | **1.23×** | 2.82× | 4.74× |
+| | `line_pool` | **0.73×** | 1.68× | 2.82× |
+| sequential `u64` | `std::allocator` | **1.98×** | 4.37× | 7.23× |
+| | `line_pool` | **2.21×** | 4.87× | 8.05× |
 
-**Inserts** are allocator-bound, so the honest comparison holds the tree fixed
-and swaps the allocator: `line_pool` builds the same tree **1.1–1.4× faster
-than `std::allocator`** (bump placement, children next to parents). Held to the
-same malloc class, artpp and libart build at similar rates — artpp leads on
-sequential keys, libart's flatter node growth leads on the deeply-shared
-dictionary (a radix splits more there). With the pool, builds beat
-`absl::btree_map` 1.7–2.8× and `std::map` 2.4–7.2×. Reproduce with
-`-DARTPP_BENCHMARKS=ON` (`bench/`); the per-process regression gate lives in
-`bench/perf_gate.cpp`.
+- **`line_pool` is not uniformly a win for lookups.** It is the faster
+  allocator on three workloads and clearly slower on uniform random integers
+  (52 ns against 31 ns with `std::allocator`, and 38 ns for libart). The likely
+  cause, not isolated, is that its 4-byte index handles are not pointers, so the
+  processor's pointer prefetcher does not follow them. Measure your own
+  workload before choosing it for lookup speed.
+- **Bucket mode** is the fastest on the dictionary (78 ns, 1.14× the default
+  radix) and its ordered scans are 2–5× faster than the radix modes, close to
+  `absl::btree_map` on clustered strings (6.5 against 6.8 ns per element);
+  btree still scans the dictionary and the integer workloads faster.
+- The structural reason reads win: libart loads a node header on every hop
+  before it can route; artpp routes from the pointer itself, and a small leaf
+  often rides in the routing node's own cacheline.
 
-`for_each` scans are ~3× iterator scans when cache-resident; value-only
+**Inserts** depend on the allocator and the workload:
+
+| workload | `line_pool` vs `std::allocator` | `line_pool` vs libart | vs `absl::btree_map` | vs `std::map` |
+|---|---|---|---|---|
+| dictionary words | 1.00× | 0.71× | 0.63× | 1.14× |
+| clustered strings | 1.19× | 1.09× | 1.65× | 2.39× |
+| uniform `u64` | 1.32× | 1.16× | 2.32× | 4.60× |
+| sequential `u64` | 1.30× | 1.72× | 2.55× | 7.05× |
+
+On the dictionary, libart and `absl::btree_map` build faster than artpp: a
+radix splits more on deeply shared prefixes. With `std::allocator`, artpp
+builds faster than libart only on sequential keys (1.32×) and is 0.71–0.91×
+elsewhere. Reproduce with `-DARTPP_BENCHMARKS=ON` (`bench/`); the per-process
+regression gate lives in `bench/perf_gate.cpp`.
+
+`for_each` scans are faster than iterator scans when cache-resident; value-only
 iteration (`for_each_value` or an un-keyed iterator walk) is cheaper still.
 
 ### `artpp::set` — keys-only ordered set
@@ -739,7 +763,7 @@ key vectors, op sequences, and checksum accounting — so the comparison carries
 no per-library benchmark deviations. Contestants are thin adapters
 (`bench/contestants.hpp`):
 
-- `artpp::map` three ways: on the `line_pool` (the flagship row), on the
+- `artpp::map` three ways: on the `line_pool` (the `artpp::map` row), on the
   `line_pool` with `mode::buckets`, and on `std::allocator`
 - upstream [libart](https://github.com/armon/libart), vendored under
   `external/libart` (bytes-only: integer workloads use the same big-endian

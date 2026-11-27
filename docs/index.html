@@ -115,9 +115,9 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   Reproduce with <code>-DARTPP_BENCHMARKS=ON</code>.</p>
 
   <div class="stats">
-    <div class="stat"><div class="n">1.2–2.0×</div><div class="l">faster point lookups than the original libart — on all four workloads (plain radix): 2.0× sequential, 1.37× uniform, 1.32× clustered, 1.18× dictionary</div></div>
-    <div class="stat"><div class="n">1.9–4.3×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads</div></div>
-    <div class="stat"><div class="n">2.1–7.6×</div><div class="l">faster point lookups than std::map</div></div>
+    <div class="stat"><div class="n">1.2–2.0×</div><div class="l">faster point lookups than the original libart on all four workloads with the default allocator: 1.98× sequential, 1.23× uniform, 1.22× clustered, 1.24× dictionary. With <code>line_pool</code>: 2.21×, 0.73× (slower), 1.33×, 1.29×</div></div>
+    <div class="stat"><div class="n">2.0–4.4×</div><div class="l">faster point lookups than absl::btree_map, across all four workloads (default allocator)</div></div>
+    <div class="stat"><div class="n">2.4–7.2×</div><div class="l">faster point lookups than std::map (default allocator)</div></div>
     <div class="stat"><div class="n">1.2–1.6×</div><div class="l">faster <code>lower_bound</code> than absl::btree_map on clustered &amp; integer keys — an ordered query libart has no API for</div></div>
   </div>
 
@@ -133,10 +133,14 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
     level of descent touches at most one cold line: the node kind is in the tagged
     pointer (no header read to route), a compressed run lives in that line instead of a
     separate node, and a small leaf can ride in the routing node's own line rather than
-    a line of its own. Against libart that's <b>2.0×</b> on sequential integers,
-    <b>1.37×</b> uniform, <b>1.32×</b> clustered, and <b>1.18×</b> on dictionary words;
-    against the comparison-based maps, 1.9–4.3× over <code>absl::btree_map</code> and
-    2.1–7.6× over <code>std::map</code>.
+    a line of its own. With the default allocator that is <b>1.98×</b> libart on sequential integers,
+    <b>1.23×</b> uniform, <b>1.22×</b> clustered, and <b>1.24×</b> on dictionary words;
+    against the comparison-based maps, 2.0–4.4× over <code>absl::btree_map</code> and
+    2.4–7.2× over <code>std::map</code>. The charts' <code>artpp::map</code> row is the
+    <code>line_pool</code> allocator: faster again on three workloads (2.21×, 1.33×,
+    1.29× libart) and <b>slower on uniform random integers</b> (52 ns against libart's
+    38 and the default allocator's 31) — its 4-byte index handles are not pointers,
+    which is the likely reason.
   </p>
 
   <h3 style="margin:38px 0 14px"><code>lower_bound</code> <span style="color:var(--muted);font-weight:400">(the ordered query a hash map can't answer — and libart has no API for)</span></h3>
@@ -162,33 +166,35 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   </div>
   <p class="method">
     A bulk build is dominated by where the nodes come from, so the honest insert
-    comparison holds the tree fixed and swaps the allocator. The flagship
+    comparison holds the tree fixed and swaps the allocator. The bundled
     <code>line_pool</code> — a contiguous reservation handed out by a bump frontier with
     exact-size free lists, no per-node <code>malloc</code> — builds the same tree
-    <b>1.1–1.4× faster than <code>std::allocator</code></b>, the allocator's
+    <b>1.0–1.3× faster than <code>std::allocator</code></b>, the allocator's
     contribution cleanly isolated (both rows are on the insert charts).
-    Held to the <i>same</i> malloc class, artpp and libart build at similar rates:
-    artpp leads on sequential and runs even on clustered, and libart's flatter node
-    growth leads on the deeply-shared dictionary, where a radix does the most splitting
+    Held to the <i>same</i> malloc class, artpp builds faster than libart on sequential
+    keys (1.32×) and slower elsewhere (0.71–0.91×); libart's flatter node
+    growth leads most on the deeply-shared dictionary, where a radix does the most splitting
     — the up-front structuring that buys the lookup, scan, and ordered-iteration wins
-    above. Net with the pool: builds beat <code>absl::btree_map</code> (1.7–2.8×) and
-    <code>std::map</code> (2.4–7.2×) on every workload.
+    above. Net with the pool: builds beat <code>absl::btree_map</code> (1.7–2.6×) and
+    <code>std::map</code> (2.4–7.1×) on the clustered and integer workloads; on dictionary
+    words <code>absl::btree_map</code> (1.6×) and libart (1.4×) build faster, and
+    <code>std::map</code> is 1.14× slower than artpp.
   </p>
 
   <h3 style="margin:38px 0 14px">Ordered scans <span style="color:var(--muted);font-weight:400">(bucket mode keeps pace with B-trees)</span></h3>
   <div class="figs">
-    <div class="fig"><img src="charts/dict_scan.svg" alt="Ordered scan, dictionary words: bucket mode 2.6 ns/element, 2.2x faster than libart"></div>
+    <div class="fig"><img src="charts/dict_scan.svg" alt="Ordered scan, dictionary words: bucket mode 2.6 ns/element, 2.4x faster than libart"></div>
     <div class="fig"><img src="charts/clustered_scan.svg" alt="Ordered scan, clustered strings: bucket mode 6.5 ns/element, faster than both libart and absl::btree_map"></div>
   </div>
   <p class="method">
-    <b>Bucket mode</b> scans the packed (suffix, value) pages contiguously: <b>2.2×
-    faster than libart</b> on dictionary keys (2.6 vs 5.6 ns/element), and on clustered
-    strings it <b>edges absl::btree_map itself</b> (6.5 vs 8.9 ns/element). For the
+    <b>Bucket mode</b> scans the packed (suffix, value) pages contiguously: <b>2.4×
+    faster than libart</b> on dictionary keys (2.6 vs 6.2 ns/element), and on clustered
+    strings it <b>edges absl::btree_map itself</b> (6.5 vs 6.8 ns/element). For the
     absolute crown on dense integer keys, a B-tree's fully contiguous leaves lead — so
     pick bucket mode when a workload both looks up <i>and</i> scans, and the default
     radix when it's lookup-dominated.<br><br>
-    Methodology: Apple M5, clang -O3, quiet machine, one process. The
-    <code>artpp::map</code> rows run the library's flagship allocator —
+    Methodology: one run in June 2026 on an Apple M5 Max, clang -O3, quiet machine, one process; nothing here has been measured on x86. The ratios were re-checked on the 0.1.0 code and agree to within about 10%. The
+    <code>artpp::map</code> rows run the library's bundled allocator —
     <code>line_pool</code> over an <b>anonymous mapping</b> (4-byte u32-index branch
     handles, bump placement laying children near parents); the
     <code>std::allocator</code> row shows zero-setup behavior. Workloads: 236k
@@ -299,8 +305,9 @@ m.<span class="f">try_emplace</span>(<span class="s">"beta"</span>, 2);         
   <table>
     <tr><th></th><th>libart (C)</th><th>libart++ (<code>artpp::map</code>)</th></tr>
     <tr><td>Point lookups</td><td>the bar to beat</td>
-        <td><b>faster on all four workloads</b>, plain radix: <b>2.0×</b> sequential,
-        <b>1.37×</b> uniform, <b>1.32×</b> clustered, <b>1.18×</b> dictionary</td></tr>
+        <td><b>faster on all four workloads</b> with the default allocator: <b>1.98×</b> sequential,
+        <b>1.23×</b> uniform, <b>1.22×</b> clustered, <b>1.24×</b> dictionary
+        (<code>line_pool</code>: faster on three, slower on uniform)</td></tr>
     <tr><td>Small leaves</td><td>a malloc'd node per key</td>
         <td>a leaf that fits goes <b>inside the routing node's cacheline</b> — the byte
         that selects it and the value it yields are one line, so the lookup ends without
@@ -421,8 +428,8 @@ t.<span class="f">checkpoint</span>();           <span class="c">// what the nex
 <pre><code><span class="c">// dictionary-shaped keys? pack the tails:</span>
 <span class="t">artpp::map</span>&lt;<span class="t">std::string_view</span>, <span class="t">uint64_t</span>,
            <span class="t">artpp::mode</span>::buckets&gt; dict;
-<span class="c">// 77 ns dictionary lookups — 3.5x faster</span>
-<span class="c">// than std::map; scans rival absl::btree</span></code></pre>
+<span class="c">// 78 ns dictionary lookups — 2.8x faster</span>
+<span class="c">// than std::map; scans near absl::btree</span></code></pre>
     </div>
   </div>
 </section>
