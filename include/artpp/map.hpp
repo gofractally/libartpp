@@ -613,6 +613,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static constexpr bool inline_children_ok = std::is_trivially_copyable_v<T>;
 
      private:
+      // A T materialized from its BYTES, for the places that read a trivially copyable value
+      // out of a handle or a leaf by memcpy: storage of T's size and alignment, no constructor.
+      // (A `T tmp;` there would demand a default constructor of every small trivial T, which
+      // the container otherwise never needs.) memcpy into `b` starts the T's lifetime
+      // (implicit object creation), after which ref() names it.
+      struct raw_value_
+      {
+         alignas(T) unsigned char b[sizeof(T)];
+         T&       ref() noexcept { return *std::launder(reinterpret_cast<T*>(b)); }
+         const T& ref() const noexcept { return *std::launder(reinterpret_cast<const T*>(b)); }
+      };
       // Per-node allocation. Every node/value blob is a run of 128-byte-aligned blocks taken
       // straight from the tree's Allocator (rebound to a 128-byte unit), so the low 7 bits stay
       // free for the pointer tag and sizes round up to whole blocks. There is no pool: each node
@@ -1397,7 +1408,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if constexpr (inlineable)  // value_inline exists only for an inlineable T
                {
                   const uint64_t shifted = raw >> 8;
-                  std::memcpy(out, &shifted, inline_bytes);
+                  std::memcpy(static_cast<void*>(out), &shifted, inline_bytes);
                   return true;
                }
                return false;  // unreachable for a non-inlineable T (no value_inline nodes)
@@ -1802,7 +1813,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          uint32_t                   full_len_ = 0;
          // Non-inline T: point at the real stored object (no copy → value() is a true
          // reference into the tree). Inline T: keep a local copy (no addressable object).
-         std::conditional_t<inlineable, T, const T*> val_{};
+         std::conditional_t<inlineable, raw_value_, const T*> val_{};
          bool                                        end_ = true;
 
          // The inline-suffix buffer is per-iterator: when sfx_ points into the SOURCE's
@@ -1857,7 +1868,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          void set_ptr_(const T* p)
          {
             if constexpr (inlineable)
-               copy_value(val_, p);
+               std::memcpy(val_.b, p, sizeof(T));
             else
                val_ = p;
          }
@@ -2566,7 +2577,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          friend map;  // for_each's deep-subtree fallback drives an iterator over a subtree
          const T& val_ref_() const noexcept  // value() without the HasValue constraint
          {
-            if constexpr (inlineable) return val_;
+            if constexpr (inlineable) return val_.ref();
             else return *val_;
          }
 
@@ -2641,7 +2652,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             requires(HasValue)
          {
             if constexpr (inlineable)
-               return val_;
+               return val_.ref();
             else
                return *val_;
          }
@@ -2955,9 +2966,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             else
             {
-               T ov{};  // overwritten by unpack_inline; initialised so GCC can see it is never read unset
+               raw_value_ ov{};  // overwritten by unpack_inline; initialised so GCC can see it is never read unset
                unpack_inline(cur, ov);
-               [[maybe_unused]] const int r0 = bkt_insert_entry(b, std::string_view{}, std::move(ov));
+               [[maybe_unused]] const int r0 = bkt_insert_entry(b, std::string_view{}, std::move(ov.ref()));
                assert(r0 == 1);
             }
          }
@@ -3845,22 +3856,22 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
          else if constexpr (inlineable)
          {
-            T x{}, y{};
+            raw_value_ x{}, y{};
             if (ia) unpack_inline(a, x);
             else
             {
                const char* L = static_cast<const char*>(deref_term_(a));
                if (leaf_slen(L)) return 0;  // a non-empty suffix is not a terminal-at-end
-               copy_value(x, leaf_val(L));
+               std::memcpy(x.b, leaf_val(L), sizeof(T));
             }
             if (ib) unpack_inline(b, y);
             else
             {
                const char* L = static_cast<const char*>(tb.deref_term_(b));
                if (leaf_slen(L)) return 0;
-               copy_value(y, leaf_val(L));
+               std::memcpy(y.b, leaf_val(L), sizeof(T));
             }
-            return x == y ? 1 : 0;
+            return x.ref() == y.ref() ? 1 : 0;
          }
          else
          {
@@ -4140,19 +4151,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if constexpr (inlineable)
             if (p.tag() == K::value_inline)
             {
-               T tmp;
+               raw_value_ tmp;
                unpack_inline(p, tmp);
-               f(key, static_cast<const T&>(tmp));
+               f(key, static_cast<const T&>(tmp.ref()));
                return;
             }
          f(key, static_cast<const T&>(*leaf_val(static_cast<char*>(deref_term_(p)))));
       }
 
       // Value of a terminal pointer (value_ptr leaf or value_inline), into tmp if inline.
-      const T* val_of_(packed_ptr p, T& tmp) const
+      const T* val_of_(packed_ptr p, raw_value_& tmp) const
       {
          if constexpr (inlineable)
-            if (p.tag() == K::value_inline) { unpack_inline(p, tmp); return &tmp; }
+            if (p.tag() == K::value_inline) { unpack_inline(p, tmp); return &tmp.ref(); }
          return leaf_val(static_cast<char*>(deref_term_(p)));
       }
       // The recursive scans (for_each / for_each_value / operator=='s structural walk) recurse
@@ -4197,7 +4208,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                f(static_cast<const T&>(*leaf_val(static_cast<char*>(deref_term_(cur)))));
                return;
             case K::value_inline:
-               if constexpr (inlineable) { T tmp; unpack_inline(cur, tmp); f(static_cast<const T&>(tmp)); }
+               if constexpr (inlineable) { raw_value_ tmp; unpack_inline(cur, tmp); f(static_cast<const T&>(tmp.ref())); }
                return;
             case K::prefix_node:
                walk_v_child_(pn_next<Ptr>(static_cast<char*>(deref_(cur))), f, lvl);
@@ -4213,7 +4224,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             default:
             {
                const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-               if (!rh->term.is_null()) { T tmp; f(*val_of_(rh->term, tmp)); }
+               if (!rh->term.is_null()) { raw_value_ tmp; f(*val_of_(rh->term, tmp)); }
                auto recurse = [&](uint8_t, packed_ptr ch) { walk_v_child_(ch, f, lvl); };
                switch (k)
                {
@@ -4487,11 +4498,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::memcpy(p.b + 1, &v, inline_bytes);  // value in bytes [1..1+sizeof)
          return p;
       }
+      static void unpack_inline(packed_ptr p, raw_value_& out) noexcept
+      {
+         if constexpr (inlineable) std::memcpy(out.b, p.b + 1, inline_bytes);
+      }
       static void unpack_inline(packed_ptr p, T& out) noexcept
       {
          // Only ever called on a value_inline slot, which exists only for an inlineable T; the
          // `if constexpr` keeps the memcpy from instantiating for a non-inlineable T (dead here).
-         if constexpr (inlineable) std::memcpy(&out, p.b + 1, inline_bytes);
+         if constexpr (inlineable) std::memcpy(static_cast<void*>(&out), p.b + 1, inline_bytes);
       }
 
       // ── suffix-in-handle (SET only) ────────────────────────────────────────────────
@@ -4530,7 +4545,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       static void copy_value(T& out, const T* src)
       {
          if constexpr (std::is_trivially_copyable_v<T>)
-            std::memcpy(&out, src, sizeof(T));
+            std::memcpy(static_cast<void*>(&out), src, sizeof(T));
          else
             out = *src;
       }
@@ -5452,14 +5467,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if constexpr (Assign) return pack_inline(vf_make(std::forward<VF>(val)));
                   else return cur;
                }
-               T oldv;
+               raw_value_ oldv;
                unpack_inline(cur, oldv);  // inlineable T is trivially copyable
                inserted = true;
                setlist*    r       = new_setlist();
                packed_ptr  partial = pack_(r, K::setlist_u8);
                build_guard g{this, &partial};  // the new key's leaf allocation can throw: reclaim r
                setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
-               set_term(&r->rh, std::move(oldv));  // old key terminates here (inline: cannot throw)
+               set_term(&r->rh, std::move(oldv.ref()));  // old key terminates here (inline: cannot throw)
                g.release();
                sl_inline_compact_(r);  // pull the small leaf child into this line
                return partial;         // c == 0, no prefix node needed

@@ -150,8 +150,8 @@ class map;
 
 | Parameter | Meaning |
 |---|---|
-| `Key` | Any type with a `key_codec` specialization. Built in: `std::string`, `std::string_view`, `std::vector<uint8_t>`, all integral types. |
-| `T` | The mapped type. Move-constructible required; copy/equality/default-constructibility are required only by the operations that use them. |
+| `Key` | Any type with a `key_codec` specialization. Built in: `std::string`, `std::string_view`, `std::vector<uint8_t>`, all integral types (including `bool`, which orders `false` before `true`, and the character types). |
+| `T` | The mapped type. Move-constructible required; copy/equality/default-constructibility are required only by the operations that use them (default construction: `operator[]` and `find_opt`). `alignof(T)` up to 128 ([Limits and guarantees](#limits-and-guarantees)). |
 | `Mode` | Structural policy flags, combinable with `\|` (below). |
 | `Allocator` | A standard allocator. Every node and every value is allocated and constructed through it ([Allocators](#allocators)). |
 | `ExpectedSize` | Optional capacity hint. When small (`0 < ExpectedSize ≤ ~3M`) it auto-selects the compact cnode density ladder — a perf-per-byte win for small maps (see [`compact_map`](#compact_map-capacity-hint)). `0` (unknown) leaves the fast flat default. |
@@ -476,10 +476,14 @@ cache across a clean reopen.
   diagnostic `debug_stats()`. Give those a stack sized for your longest
   nested-key chain, or avoid `mode::buckets` for such key sets.
 - **Exception safety** — mutating operations provide the basic guarantee with
-  **zero leaks** (fault-injection-tested: every allocation point swept, leak
-  and double-destroy counters asserted). Single-leaf inserts and the
-  pre-mutation checks are strong. `remove` is nothrow in practice for POD
-  values in radix mode (documented per overload in the header).
+  **zero leaks**; single-key inserts and the pre-mutation checks are strong.
+  `erase` does not throw in the radix modes (its shrinking steps that allocate
+  are best-effort). This is fault-injection-tested in the radix modes
+  (default, `dense_tiers`, `wide_stems`): the allocator fails at every
+  allocation point of `insert`, `erase` and cross-allocator move assignment,
+  and value constructors throw at every construction of `emplace` and
+  `insert`, with leak and double-destroy counters asserted. `mode::buckets`
+  and `mode::adaptive` do not meet this yet; see [Known issues](#known-issues).
 - **Thread safety** — that of a standard container: concurrent reads on a
   `const` tree are fine; any write requires exclusive access. No internal
   threads, no locks.
@@ -578,7 +582,8 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 | `artpp_smoke` | API basics across all modes, allocator routing (counting, PMR, wide-handle, pool), typed keys, `std::map` API-conformance battery, randomized cross-checks |
 | `artpp_conformance` | STL-grade contracts: key-length limit, move/swap branches incl. pool image adoption and structural clone, exactly-once construction, move-only values, compile-time constraints, string_view key parameters, `erase(iterator)`, structural equality incl. shape-divergent trees, iterator edge cases, degenerate shapes, mixed-op differential fuzz vs `std::map` (all modes) |
 | `artpp_reverse_iter` | Bidirectional iteration fuzz vs `std::map`: churn, full walks both directions, `--end()`, random `lower_bound` + backward steps, `++`/`--` ping-pong |
-| `artpp_exception_safety` | Exception safety under systematic fault injection (throwing values + failing allocator at every allocation point), leak/corruption/double-destroy counters vs a `std::map` oracle |
+| `artpp_exception_safety` | Exception safety under systematic fault injection: the allocator failing at every allocation point of insert, erase and cross-allocator move; value constructors throwing at every construction; in-handle and non-trivial values; leak/corruption/double-destroy counters vs a `std::map` oracle. Radix modes in full; bucket and adaptive modes for the paths without open issues |
+| `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack, blocks the handle cannot address, `bool` keys, values without a default constructor) |
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
 | `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`) double / reflected-struct / optional keys vs `std::map` ordering oracles |
 | `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
@@ -619,6 +624,9 @@ fixed:
 
 - **Exception safety:** the guarantees under [Limits and guarantees](#limits-and-guarantees)
   do not hold in `mode::buckets` and `mode::adaptive` (#4 to #7).
+- **Deep trees in `mode::buckets`:** `insert` still recurses once per tree
+  level there and can overflow the stack on long chains of nested keys (the
+  rest of #15 is fixed; see [Limits and guarantees](#limits-and-guarantees)).
 - **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
   stale or never-checkpointed store is not detected (#8 to #10).
 

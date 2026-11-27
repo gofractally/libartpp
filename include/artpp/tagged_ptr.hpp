@@ -10,10 +10,16 @@
 #pragma once
 #include <bit>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <type_traits>
+
+// Handles hold 48-bit (or wider) addresses and the pool reserves tens of gigabytes of
+// address space: a 64-bit target is assumed throughout, so say so once, clearly.
+static_assert(sizeof(std::size_t) == 8 && sizeof(void*) == 8,
+              "artpp requires a 64-bit target (64-bit size_t and pointers)");
 
 namespace artpp
 {

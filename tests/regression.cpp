@@ -687,6 +687,109 @@ static void regression_unaddressable_blocks()
    }
 }
 
+// ── audit #18: README claims — bool keys, no default constructor needed ──────────
+// "Built in: … all integral types": map<bool, T> did not compile (make_unsigned<bool>).
+// "default-constructibility [is] required only by the operations that use [it]": a small
+// trivially copyable T without a default constructor could not insert or iterate (the
+// in-handle value was unpacked into a `T tmp;`), and no T without one compiled at all in
+// mode::adaptive. Both are compile-time defects, so instantiating these is most of the test.
+struct small_nd  // trivially copyable, 2 bytes → stored in the handle; no default constructor
+{
+   uint16_t x;
+   explicit small_nd(uint16_t v) : x(v) {}
+   bool operator==(const small_nd& o) const { return x == o.x; }
+   bool operator<(const small_nd& o) const { return x < o.x; }
+};
+static_assert(!std::is_default_constructible_v<small_nd> && std::is_trivially_copyable_v<small_nd>);
+struct big_nd  // non-trivial, lives in leaves; no default constructor
+{
+   std::string s;
+   explicit big_nd(std::string v) : s(std::move(v)) {}
+   bool operator==(const big_nd& o) const { return s == o.s; }
+   bool operator<(const big_nd& o) const { return s < o.s; }
+};
+static_assert(!std::is_default_constructible_v<big_nd>);
+template <class V>
+static V nd_val(int x)
+{
+   if constexpr (std::is_same_v<V, small_nd>) return small_nd(uint16_t(x));
+   else return big_nd("v" + std::to_string(x));
+}
+template <class V, mode M>
+static void no_default_ctor(const char* where)
+{
+   using Tree = map<std::string_view, V, M>;
+   static_assert(Tree::inlineable == std::is_same_v<V, small_nd>);
+   Tree                     t;
+   std::map<std::string, V> oracle;
+   std::vector<std::string> keys = {"", "a", "ab", "abc", "abcd", "abd", "b", "ba", "apple", "apricot"};
+   for (int i = 0; i < 40; ++i) keys.push_back(std::string("k") + char('a' + i % 7) + char('A' + i));
+   int x = 0;
+   for (auto& k : keys)
+   {
+      const V v = nd_val<V>(x++);
+      if (x % 3 == 0) CHECK(t.emplace(k, v) == oracle.emplace(k, v).second);
+      else { t.insert_or_assign(k, v); oracle.insert_or_assign(k, v); }
+   }
+   for (auto& k : keys)  // every read path, none of which may need V()
+   {
+      V out = nd_val<V>(-1);
+      CHECK(t.find(k, out) && out == oracle.at(k));
+      CHECK(t.contains(k));
+      auto it = t.find(k);
+      CHECK(it != t.end() && it.value() == oracle.at(k));
+   }
+   agree<Tree, V>(t, oracle, where);  // iterators both ways + for_each_value
+   size_t n = 0;
+   t.for_each([&](std::string_view k, const V& v) { ++n; CHECK(v == oracle.at(std::string(k))); });
+   CHECK(n == oracle.size());
+   {
+      Tree u;
+      for (auto& kv : oracle) u.insert(kv.first, kv.second);
+      CHECK(u == t);
+      const V nv = nd_val<V>(9999);
+      CHECK(u.update("abc", nv));
+      CHECK(u != t);
+      Tree w(std::move(u));
+      CHECK(w.size() == oracle.size());
+   }
+   for (size_t i = 0; i < keys.size(); i += 2) CHECK(t.erase(keys[i]) == oracle.erase(keys[i]));
+   agree<Tree, V>(t, oracle, where);
+}
+static void regression_readme_claims()
+{
+   {  // bool keys: one byte, false before true
+      map<bool, int> m;
+      CHECK(m.insert(true, 1));
+      CHECK(m.insert(false, 0));
+      CHECK(!m.insert(true, 11));
+      CHECK(m.size() == 2);
+      auto it = m.begin();
+      CHECK(it.key() == false && it.value() == 0 && it.key_bytes().size() == 1);
+      ++it;
+      CHECK(it.key() == true && it.value() == 11);
+      ++it;
+      CHECK(it == m.end());
+      int v = -1;
+      CHECK(m.find(false, v) && v == 0);
+      CHECK(m.lower_bound(true).key() == true);
+      CHECK(m.erase(false) == 1 && m.begin().key() == true);
+      artpp::set<bool> s;
+      CHECK(s.insert(true).second && s.insert(false).second && !s.insert(true).second);
+      CHECK(*s.begin() == false && s.size() == 2);
+   }
+   no_default_ctor<small_nd, mode::none>("no default ctor, inline");
+   no_default_ctor<small_nd, mode::dense_tiers>("no default ctor, inline, dense");
+   no_default_ctor<small_nd, mode::wide_stems>("no default ctor, inline, wide");
+   no_default_ctor<small_nd, mode::adaptive>("no default ctor, inline, adaptive");
+   no_default_ctor<small_nd, mode::buckets>("no default ctor, inline, buckets");
+   no_default_ctor<big_nd, mode::none>("no default ctor, leaf");
+   no_default_ctor<big_nd, mode::dense_tiers>("no default ctor, leaf, dense");
+   no_default_ctor<big_nd, mode::wide_stems>("no default ctor, leaf, wide");
+   no_default_ctor<big_nd, mode::adaptive>("no default ctor, leaf, adaptive");
+   no_default_ctor<big_nd, mode::buckets>("no default ctor, leaf, buckets");
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
@@ -698,6 +801,7 @@ int main()
    regression_overaligned_values();
    regression_deep_tree_small_stack();
    regression_unaddressable_blocks();
+   regression_readme_claims();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;

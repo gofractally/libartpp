@@ -12,7 +12,6 @@ before 1.0 a minor version may change the API.
 - Continuous integration: GCC and Clang on Linux (x86-64, ARM64), Apple Clang on
   macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer, plus an
   install-and-consume check.
-
 - `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
   an allocator returns a block the tree's handles cannot address.
 
@@ -51,10 +50,23 @@ before 1.0 a minor version may change the API.
   only caught by `assert`; a release build silently truncated the address.
   Both are now checked on every allocation and reported by throwing
   `artpp::bad_allocation_address` (#16).
+- `map<bool, T>` and `set<bool>` did not compile; `bool` is now a built-in key
+  type (one byte, `false` before `true`) (#18).
+- A mapped type without a default constructor could not be used if it was
+  small and trivially copyable (stored in the handle), nor at all in
+  `mode::adaptive`. Only `operator[]` and `find_opt` need a default
+  constructor now, as documented (#18).
+- A 32-bit target is rejected with a `static_assert` instead of miscompiling
+  (#18).
+- README: the fault-injection and exception-safety statements now say what is
+  tested; the test suite gained throwing-value, erase and cross-allocator-move
+  fault sweeps to back them (#18).
 
 ### Known issues
-- Open bugs from the pre-release audit: #4 to #18. Reproducers are in
-  `tests/known_bugs`.
+- Open bugs from the pre-release audit: #4 to #7 (exception safety in
+  `mode::buckets` and `mode::adaptive`), #8 to #10 and #17 (file-backed
+  `line_pool`), and the `mode::buckets` insert recursion left from #15.
+  Reproducers are in `tests/known_bugs`.
 
 ## 0.1.0
 

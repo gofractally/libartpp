@@ -71,10 +71,24 @@ namespace artpp
    // as scratch — no std::string resize/SSO machinery on the hot path. MEASURED (M5, 2M
    // random u64 keys, alternating-binary A/B vs the string-scratch + shift-loop version):
    // find 51.3 -> 29.9 ns/op (-42%), insert 79.8 -> 65.1 (-18%) — encode runs on every op.
+   namespace detail
+   {
+      // The unsigned carrier of an integral key. std::make_unsigned rejects bool, which
+      // encodes as one byte, 0x00 or 0x01 (false sorts before true).
+      template <class I>
+      struct key_uint : std::make_unsigned<I>
+      {
+      };
+      template <>
+      struct key_uint<bool>
+      {
+         using type = std::uint8_t;
+      };
+   }  // namespace detail
    template <class I>
    struct key_codec<I, std::enable_if_t<std::is_integral_v<I>>>
    {
-      using U                 = std::make_unsigned_t<I>;
+      using U                 = typename detail::key_uint<std::remove_cv_t<I>>::type;
       static constexpr U SIGN = U(1) << (sizeof(U) * 8 - 1);
       struct scratch
       {

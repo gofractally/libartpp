@@ -409,6 +409,67 @@ static void eh_clone(const char* cont, const char* scen, const std::vector<std::
                by_value ? "value" : "alloc", ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
 }
 
+// ── erase under allocation failure (radix modes) ─────────────────────────────────
+// erase shrinks the structure on the way out, and some of that allocates: re-homing a
+// collapsed router's prefix in a prefix node, de-widening a sparse dense node to a setlist.
+// Those steps are best-effort — on bad_alloc the tree simply stays unshrunk — so in the
+// radix modes erase must never throw, must always remove the key, and must leave every
+// other key in place, whichever of its allocations fails.
+template <class Map>
+static void eh_erase(const char* cont, const char* scen, const std::vector<std::string>& keys,
+                     size_t erase_every)
+{
+   int violations = 0, leaks = 0, vleaks = 0, swept = 0;
+   for (int n = 0;; ++n)
+   {
+      fail_counter fc;
+      bool         all_points = false;
+      const long   vbase      = g_live;
+      {
+         typename Map::allocator_type       al(&fc);
+         Map                                m(al);
+         std::map<std::string, std::string> oracle;
+         for (size_t i = 0; i < keys.size(); ++i)
+         {
+            const std::string v(8, char('a' + (i & 15)));
+            m.insert_or_assign(keys[i], v);
+            oracle[keys[i]] = v;
+         }
+         fc.countdown = n;  // the (n+1)-th allocation made by ANY of the erases below fails
+         for (size_t i = 0; i < keys.size(); ++i)
+         {
+            if (i % erase_every == 0) continue;  // survivors
+            try
+            {
+               if (m.erase(keys[i]) != oracle.erase(keys[i])) ++violations;
+            }
+            catch (...) { ++violations; }
+         }
+         all_points   = fc.countdown >= 0;  // never fired: every allocation point has been failed
+         fc.countdown = -1;
+         auto d = dump(m);
+         if (d.size() != oracle.size() || m.size() != oracle.size()) ++violations;
+         else
+         {
+            size_t i = 0;
+            for (auto& kv : oracle)
+            {
+               if (d[i].first != kv.first || d[i].second != kv.second) ++violations;
+               ++i;
+            }
+         }
+      }
+      if (fc.allocs != fc.frees) ++leaks;
+      if (g_live != vbase) ++vleaks;
+      ++swept;
+      if (all_points) break;
+   }
+   const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
+   if (!ok) ++g_fail;
+   std::printf("  %-10s %-14s  %s  (%d points, %d violations, %d mem-leak, %d dtor-leak)\n", cont, scen,
+               ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -496,6 +557,24 @@ int main()
    eh_value_repeat<TDense>("artpp-dense", false);
    eh_value_repeat<TBkt>("artpp-bucket", true);
    eh_value_repeat<TAdp>("artpp-adapt", false);
+
+   // erase with each of its (best-effort) allocations failing — radix modes; the bucket-mode
+   // erase path has an open issue of its own (#6).
+   std::printf("\nerase under bad_alloc injection (never throws, always removes):\n");
+   {
+      std::vector<std::string> shrink = cluster;  // collapses, prefix re-homing, de-widening
+      shrink.insert(shrink.end(), wide.begin(), wide.end());
+      for (int i = 0; i < 20; ++i) shrink.push_back("0123456789ABCDEF" + std::string(1, char('a' + i)) + "t");
+      shrink.push_back("0123456789ABCDEF");
+      for (int i = 1; i <= 90; ++i) shrink.push_back("z" + std::string(size_t(i), 'd'));  // a deep chain
+      for (size_t every : {2u, 5u, 1000000u})
+      {
+         eh_erase<HkvRadix>("artpp-radix", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
+         eh_erase<HkvWide>("artpp-wide", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
+         eh_erase<map<std::string_view, counted, mode::dense_tiers, throwing_alloc<counted>>>(
+             "artpp-dense", every == 2 ? "erase-half" : every == 5 ? "erase-most" : "erase-all", shrink, every);
+      }
+   }
 
    // Cross-allocator move assignment: the node-by-node clone, every allocation / value move failed.
    std::printf("\nmove assignment across unequal allocators (structural clone) under fault:\n");
