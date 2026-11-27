@@ -670,6 +670,41 @@ static void eh_bucket_widen(const char* cont)
    }
 }
 
+// audit #6: removing an entry from a bucket of non-trivial values destroyed the value and
+// THEN allocated the page the survivors are repacked into. When that allocation failed the
+// destroyed value was still indexed: the next read, or the destructor, used a dead object.
+// erase must not throw at all, must remove the key and must keep every other key and value,
+// whichever allocation fails and (for a T whose copy can throw) whichever copy throws.
+template <class Map>
+static void eh_bucket_erase(const char* cont, fault f)
+{
+   const std::vector<std::vector<std::string>> sets = {
+       {"alpha", "beta", "gamma", "delta", "epsilon"},                                   // one page
+       {"a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdx", "abcdy"},                 // deep and narrow
+       {"k/one", "k/two", "k/three", "k/" + std::string(70, 'w'), "k/four", "k/five"},  // mixed entry sizes
+   };
+   tally one, all;
+   for (auto& keys : sets)
+   {
+      for (auto& victim : keys)
+         eh_point<Map>(one, f, put_keys<Map>(keys, 0),
+                       [&](Map& m, oracle_t& o) { if (m.erase(victim) != o.erase(victim)) throw std::bad_alloc(); },
+                       false);
+      for (int dir = 0; dir < 2; ++dir)  // empty the map key by key, forwards and backwards
+         eh_point<Map>(all, f, put_keys<Map>(keys, 0),
+                       [&](Map& m, oracle_t& o) {
+                          for (size_t i = 0; i < keys.size(); ++i)
+                          {
+                             const std::string& k = keys[dir ? keys.size() - 1 - i : i];
+                             if (m.erase(k) != o.erase(k)) throw std::bad_alloc();
+                          }
+                       },
+                       false);
+   }
+   one.report(cont, "erase one key", f);
+   all.report(cont, "erase every key", f);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -800,6 +835,10 @@ int main()
    // Bucket and adaptive modes: the audited fault paths (#4 to #7), one operation at a time.
    using BU64 = map<std::string_view, uint64_t, mode::buckets, throwing_alloc<uint64_t>>;
    using BU32 = map<std::string_view, uint32_t, mode::buckets, throwing_alloc<uint32_t>>;
+   using BStr = map<std::string_view, std::string, mode::buckets, throwing_alloc<std::string>>;
+   using BTv  = map<std::string_view, tvalue, mode::buckets, throwing_alloc<tvalue>>;
+   using AStr = map<std::string_view, std::string, mode::adaptive, throwing_alloc<std::string>>;
+   using ATv  = map<std::string_view, tvalue, mode::adaptive, throwing_alloc<tvalue>>;
    using BDenseU64  = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers, throwing_alloc<uint64_t>>;
    using BDense8U64 = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers | mode::ladder_c8,
                           throwing_alloc<uint64_t>>;
@@ -809,6 +848,11 @@ int main()
    eh_bucket_widen<BU64>("bucket/u64");
    eh_bucket_widen<BDenseU64>("bucket+dense/u64");
    eh_bucket_widen<BDense8U64>("bucket+dense+c8/u64");
+   eh_bucket_erase<BStr>("bucket/string", fault::alloc);
+   eh_bucket_erase<BTv>("bucket/tvalue", fault::alloc);
+   eh_bucket_erase<BTv>("bucket/tvalue", fault::value);
+   eh_bucket_erase<AStr>("adaptive/string", fault::alloc);
+   eh_bucket_erase<ATv>("adaptive/tvalue", fault::value);
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");

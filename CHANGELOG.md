@@ -70,6 +70,12 @@ before 1.0 a minor version may change the API.
   child (a widen) dropped the inline prefix of the router, so every key below
   it changed and could no longer be found; with `mode::dense_tiers` a failure
   after the first widening step left the parent pointing at a freed node (#4).
+- `mode::buckets` and `mode::adaptive`: `erase` of a key held in a bucket, for
+  a mapped type that is not trivially copyable, destroyed the value and then
+  allocated; when that allocation failed, `erase` threw and the destroyed
+  value was still in the map (use-after-free, double destruction). `erase`
+  no longer throws in any mode: it repacks the bucket before destroying
+  anything and, if that cannot be done, removes the entry in place (#6).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #7 (exception safety in

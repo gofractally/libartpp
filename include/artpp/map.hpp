@@ -3039,9 +3039,58 @@ namespace detail  // implementation types & node helpers — not part of the pub
          assert(bkt_index_sorted_(b) && "artpp: bucket index must stay in total suffix order");
          return 1;
       }
+      // How an existing value is carried to a new home when the old one must survive a
+      // failure (repacking a page, bursting it, collapsing a leaf into one): MOVED when T's
+      // move constructor cannot throw, else COPIED when T can be copied — the std::vector
+      // rule (std::move_if_noexcept). Either way a throw part-way leaves every original
+      // intact. Only a T that is move-only AND has a throwing move falls outside it.
+      static constexpr bool relocate_safe_ =
+          std::is_nothrow_move_constructible_v<T> || std::is_copy_constructible_v<T>;
+      static decltype(auto) relocate_src_(T& v) noexcept { return std::move_if_noexcept(v); }
+
+      // The entries of `b` except index `skip`, repacked into a fresh page with no dead
+      // space; `b` itself is left exactly as it was (for a moved T: holding moved-from
+      // values the caller then destroys). BEST-EFFORT and noexcept: returns nullptr when the
+      // page cannot be allocated, when a copy throws, or when T cannot be relocated safely.
+      bucket* bkt_repacked_without_(bucket* b, int skip) noexcept
+      {
+         if constexpr (!relocate_safe_) { (void)b; (void)skip; return nullptr; }
+         else
+         {
+            bucket* nb = nullptr;
+            try
+            {
+               nb = new_bucket();
+               for (int i = 0; i < b->nent; ++i)
+               {
+                  if (i == skip) continue;
+                  char*            e = bkt_entry(b, i);
+                  std::string_view s(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
+                  [[maybe_unused]] const int r = bkt_insert_entry(nb, s, relocate_src_(*bkt_val(e)));
+                  assert(r == 1 && "artpp: a subset of a page fits a page");
+               }
+            }
+            catch (...)  // no page, or a throwing COPY (a move that can throw is never used)
+            {
+               if (nb)
+               {
+                  for (int i = 0; i < nb->nent; ++i) v_destroy(alloc_, bkt_val(bkt_entry(nb, i)));
+                  node_free_(nb, sizeof(bucket));
+               }
+               return nullptr;
+            }
+            return nb;
+         }
+      }
       // Remove (s) and RECLAIM its tail space (artpp has no background compactor). bp may
       // be updated (non-POD path rebuilds into a fresh bucket). Returns true if removed.
-      bool bkt_remove_entry(packed_ptr& bp, std::string_view suf)
+      // NEVER throws, and the removal never fails: for a non-trivial T the survivors are
+      // repacked into a fresh page FIRST and the removed value destroyed only once that has
+      // succeeded; if it cannot be done (no memory, a copy threw) the entry is dropped in
+      // place instead — its bytes stay unused inside the page until the page is next
+      // rebuilt (a later erase, or the burst when it fills). A value is never destroyed
+      // while the index still refers to it.
+      bool bkt_remove_entry(packed_ptr& bp, std::string_view suf) noexcept
       {
          bucket*        b   = static_cast<bucket*>(deref_(bp));
          const uint16_t q2  = bkt_stem2(suf);
@@ -3058,43 +3107,45 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (pos >= b->nent || d[pos] != q2)
             return false;
 
-         char* const base_end = reinterpret_cast<char*>(b->data) + (bucket::PAGE - 4);
-         char*       dead     = base_end - bkt_slot(b)[pos];
-         v_destroy(alloc_, bkt_val(dead));  // run T's destructor
+         char* const    base_end   = reinterpret_cast<char*>(b->data) + (bucket::PAGE - 4);
+         char*          dead       = base_end - bkt_slot(b)[pos];
+         const size_t   E          = bkt_esize(bkt_slen(dead));
+         char*          tail_start = base_end - b->tail_used;
+         auto drop_index_pair = [&]() noexcept {
+            std::memmove(d + pos, d + pos + 1, size_t(b->nent - 1 - pos) * 2);
+            std::memmove(d + b->nent - 1, d + b->nent, size_t(pos) * 2);
+            std::memmove(d + b->nent - 1 + pos, d + b->nent + pos + 1, size_t(b->nent - 1 - pos) * 2);
+            --b->nent;
+         };
 
          if constexpr (std::is_trivially_copyable_v<T>)
          {
             // compact the tail in place: shift the entries below the hole up by E.
-            const uint16_t S          = bkt_slot(b)[pos];
-            const size_t   E          = bkt_esize(bkt_slen(dead));
-            char*          tail_start = base_end - b->tail_used;
+            const uint16_t S = bkt_slot(b)[pos];
             std::memmove(tail_start + E, tail_start, size_t(dead - tail_start));
             b->tail_used -= uint16_t(E);
             uint16_t* sl = bkt_slot(b);
             for (int i = 0; i < b->nent; ++i)
                if (sl[i] > S) sl[i] -= uint16_t(E);
-            // drop the index pair at pos
-            std::memmove(d + pos, d + pos + 1, size_t(b->nent - 1 - pos) * 2);
-            std::memmove(d + b->nent - 1, d + b->nent, size_t(pos) * 2);
-            std::memmove(d + b->nent - 1 + pos, d + b->nent + pos + 1, size_t(b->nent - 1 - pos) * 2);
-            --b->nent;
+            drop_index_pair();
             return true;
          }
          else
          {
-            // non-POD: can't byte-shift T objects → rebuild a fresh tight bucket
-            // (copy-construct live entries, destruct originals). Avoids any relocation.
-            bucket* nb = new_bucket();
-            for (int i = 0; i < b->nent; ++i)
-            {
-               if (i == pos) continue;
-               char*            e = bkt_entry(b, i);
-               std::string_view s(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
-               bkt_insert_entry(nb, s, std::move(*bkt_val(e)));  // MOVE into nb
-               v_destroy(alloc_, bkt_val(e));
-            }
-            node_free_(b, sizeof(bucket));
-            bp = pack_(nb, K::bucket);
+            // non-POD: T objects can't be byte-shifted. If the entry is the lowest in the
+            // tail (the newest), or the only one, dropping it leaves no hole: do it in
+            // place, no allocation. Otherwise repack the survivors into a fresh tight page.
+            if (dead != tail_start && b->nent > 1)
+               if (bucket* nb = bkt_repacked_without_(b, pos))
+               {
+                  for (int i = 0; i < b->nent; ++i) v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
+                  node_free_(b, sizeof(bucket));
+                  bp = pack_(nb, K::bucket);
+                  return true;
+               }
+            v_destroy(alloc_, bkt_val(dead));
+            if (dead == tail_start) b->tail_used -= uint16_t(E);  // else: a hole, until the next rebuild
+            drop_index_pair();
             return true;
          }
       }
@@ -3593,8 +3644,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // collapses are best-effort: on bad_alloc the tree simply stays unshrunk. A cascade of
       // dying single-child nodes may be any length: the deepest 64 levels unwind from the
       // recorded path, a longer one continues by re-descent (rm_unwind_deep_).
-      // NOTE: not noexcept — removing a non-POD value from a bucket rebuilds it (allocates),
-      // and a custom key_codec may allocate. Nothrow in practice for POD values / radix mode.
+      // NOTE: not noexcept only because a custom key_codec may allocate while encoding the
+      // key. The removal itself never throws in any mode: repacking a bucket of non-trivial
+      // values allocates, but like the collapses above it is best-effort.
       bool remove(key_param k)
       {
          scratch_t ks_;
