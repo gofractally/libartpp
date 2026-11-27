@@ -78,6 +78,9 @@ m.insert(7, "pos");                       // iteration yields -5 before 7
 - [Performance](#performance)
 - [Benchmark suite](#benchmark-suite)
 - [Testing](#testing)
+- [Status and versioning](#status-and-versioning)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Building and integrating
 
@@ -90,10 +93,24 @@ cmake -B build && cmake --build build && ctest --test-dir build
 As a dependency (`FetchContent` or `add_subdirectory`), link `artpp::artpp`:
 
 ```cmake
-FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libart++.git)
+FetchContent_Declare(artpp GIT_REPOSITORY https://github.com/gofractally/libartpp.git
+                     GIT_TAG main)
 FetchContent_MakeAvailable(artpp)
 target_link_libraries(your_target PRIVATE artpp::artpp)
 ```
+
+Or install it and use `find_package`:
+
+```sh
+cmake -B build -DARTPP_TESTS=OFF && cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(artpp 0.1 REQUIRED)
+target_link_libraries(your_target PRIVATE artpp::artpp)
+```
+
+`<artpp/version.hpp>` defines `ARTPP_VERSION` (and `_MAJOR`, `_MINOR`, `_PATCH`, `_STRING`).
 
 | CMake option | Default | Effect |
 |---|---|---|
@@ -112,6 +129,11 @@ target_link_libraries(your_target PRIVATE artpp::artpp)
   provided and selected automatically.
 - No dependencies beyond the standard library. Header-only:
   `#include <artpp/map.hpp>` (and `artpp/pool.hpp` for the optional line pool).
+- A POSIX system for `artpp::line_pool` (`mmap`); the map itself with
+  `std::allocator` or any other allocator does not need it.
+- Tested in CI with GCC and Clang on Linux (x86-64 and ARM64) and Apple Clang
+  on macOS (ARM64), each also under AddressSanitizer and
+  UndefinedBehaviorSanitizer. MSVC is not supported.
 
 ## Template parameters
 
@@ -548,3 +570,23 @@ The first input byte selects the config so one corpus exercises every mode (flat
 truncate / mutate a prior key) to manufacture the shared prefixes and wide fan-out that drive the
 split / widen-ladder / bucket-burst / de-widen transitions; any divergence aborts with the input
 bytes for replay.
+
+## Status and versioning
+
+The current version is **0.1.0**. Before 1.0 the API may change between minor
+versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The layout of a
+file-backed `line_pool` image is not a stable format: an image is only
+guaranteed to reopen with the library version that wrote it.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests go to the
+[issue tracker](https://github.com/gofractally/libartpp/issues).
+
+## License
+
+MIT; see [LICENSE](LICENSE).
+
+The benchmark suite (not the library) vendors upstream
+[libart](https://github.com/armon/libart) under the BSD 3-Clause license; see
+[external/libart/LICENSE](external/libart/LICENSE).

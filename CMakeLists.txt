@@ -34,10 +34,26 @@ target_include_directories(artpp INTERFACE
     $<INSTALL_INTERFACE:include>)
 target_compile_features(artpp INTERFACE cxx_std_20)
 
-include(GNUInstallDirs)
-install(DIRECTORY include/artpp TYPE INCLUDE)
-install(TARGETS artpp EXPORT artppTargets)
-install(EXPORT artppTargets NAMESPACE artpp:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/artpp)
+# Install rules only when top-level: embedded via FetchContent/add_subdirectory the
+# parent decides what it installs. After `cmake --install`, consumers use
+#   find_package(artpp 0.1 REQUIRED)  +  target_link_libraries(... artpp::artpp)
+if(ARTPP_TOPLEVEL)
+   include(GNUInstallDirs)
+   include(CMakePackageConfigHelpers)
+   set(ARTPP_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/artpp)
+   install(DIRECTORY include/artpp TYPE INCLUDE)
+   install(TARGETS artpp EXPORT artppTargets)
+   install(EXPORT artppTargets NAMESPACE artpp:: DESTINATION ${ARTPP_CMAKE_DIR})
+   configure_package_config_file(cmake/artppConfig.cmake.in
+       ${CMAKE_CURRENT_BINARY_DIR}/artppConfig.cmake INSTALL_DESTINATION ${ARTPP_CMAKE_DIR})
+   # header-only: the package is the same for every architecture
+   write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/artppConfigVersion.cmake
+       VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion ARCH_INDEPENDENT)
+   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/artppConfig.cmake
+                 ${CMAKE_CURRENT_BINARY_DIR}/artppConfigVersion.cmake
+           DESTINATION ${ARTPP_CMAKE_DIR})
+   install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/artpp)
+endif()
 
 # ── optional: psio key-format adapter ────────────────────────────────────────
 if(ARTPP_WITH_PSIO)

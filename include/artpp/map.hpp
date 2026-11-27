@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // map<T> — the headerless adaptive radix map of design4.md.
 //
 // Tiers implemented in this v1:
@@ -2810,7 +2811,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             else
             {
-               T ov;
+               T ov{};  // overwritten by unpack_inline; initialised so GCC can see it is never read unset
                unpack_inline(cur, ov);
                [[maybe_unused]] const int r0 = bkt_insert_entry(b, std::string_view{}, std::move(ov));
                assert(r0 == 1);
@@ -4708,6 +4709,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::bucket: case K::null:
                assert(false); __builtin_unreachable();
          }
+         __builtin_unreachable();  // every case returns; GCC does not see that through the switch
       }
       // ONE typed visitor for the byte-router family: switch on the tag once, hand the
       // TYPED node to f. Every byte-router dispatcher below is a packed_ptr -> typed-overload
@@ -4736,6 +4738,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             case K::setlist_u16: case K::bucket: case K::null:
                assert(false && "byte-routers only"); __builtin_unreachable();
          }
+         __builtin_unreachable();  // every case returns; GCC does not see that through the switch
       }
 
       // byte -> child (read step), per tier and dispatched.

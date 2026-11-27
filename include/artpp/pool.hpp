@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // artpp::line_pool — the Stage C allocation policy: one contiguous reservation of 128-byte
 // lines, addressed by a 4-byte handle (28-bit line index + 4-bit tag → 2^28 lines = 32 GB).
 // deref is base + (index << 7) — address-space independent, so the SAME store works over

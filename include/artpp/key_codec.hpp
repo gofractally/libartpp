@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // key_codec<Key> — the customization point that turns a typed key into the byte string
 // the radix indexes on, and back. Specialize it for your own key types:
 //

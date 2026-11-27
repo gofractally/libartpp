@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,         os: ubuntu-24.04, cxx: g++-14,     flags: "" }
+          - { name: linux-clang,       os: ubuntu-24.04, cxx: clang++-18, flags: "" }
+          - { name: linux-gcc-asan,    os: ubuntu-24.04, cxx: g++-14,     flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
+          - { name: linux-clang-asan,  os: ubuntu-24.04, cxx: clang++-18, flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
+          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cxx: g++-14, flags: "" }
+          - { name: macos-clang,       os: macos-14,     cxx: clang++,    flags: "" }
+          - { name: macos-clang-asan,  os: macos-14,     cxx: clang++,    flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+      - name: build
+        run: cmake --build build --parallel
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  package:
+    name: install and find_package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          cmake -S . -B build -DARTPP_TESTS=OFF
+          cmake --install build --prefix "$PWD/stage"
+      - name: consume
+        run: |
+          mkdir consumer && cd consumer
+          cat > CMakeLists.txt <<'CM'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer CXX)
+          find_package(artpp 0.1 REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE artpp::artpp)
+          CM
+          cat > main.cpp <<'CPP'
+          #include <artpp/map.hpp>
+          #include <artpp/version.hpp>
+          #include <string_view>
+          int main()
+          {
+             artpp::map<std::string_view, int> m;
+             m.insert("a", 1);
+             return m.find("a") != m.end() && ARTPP_VERSION > 0 ? 0 : 1;
+          }
+          CPP
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$PWD/../stage"
+          cmake --build build
+          ./build/consumer

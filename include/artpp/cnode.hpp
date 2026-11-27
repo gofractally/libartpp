@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Dense segmented bitset routers (design4 node_c2 / c4 / c8): the tier between a
 // sparse setlist and the direct-index node_full. The 256-byte key range is split
 // into NSEG equal segment cachelines (2x128 / 4x64 / 8x32). Each segment is a

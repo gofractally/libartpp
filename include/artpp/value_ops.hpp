@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Value lifecycle for the user type T, per the rule:
 //   * trivially-copyable (POD) T  -> memcpy
 //   * everything else             -> copy/move constructor, destructor

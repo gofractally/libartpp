@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // artpp/psio_codec.hpp — OPTIONAL adapter: psio's `key` format as an artpp key codec.
 //
 // psio::key (https://github.com/gofractally/psio) emits memcmp-sortable bytes for

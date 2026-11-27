@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // artpp — the design4.md "headerless ART": the pointer is the micro-header.
 //
 // A branch is a single tagged handle (default: a 48-bit pointer in 6 bytes). Every node
