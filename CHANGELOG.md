@@ -109,6 +109,21 @@ before 1.0 a minor version may change the API.
   file-backed pool (for a trivially destructible mapped type), so `detach()` is
   no longer part of the lifecycle and the order of checkpoint and destruction
   does not matter. `clear()` still frees (#8).
+- File-backed `line_pool`: opening a store validated only its magic number and
+  version. A truncated `terms` or `nodes` file was extended with zeros and
+  used (tens of thousands of keys missing, no error), a `terms` file from
+  another checkpoint or another store was accepted, superblock fields were
+  trusted, and a small unrelated file named `nodes` was overwritten with a new
+  superblock. An existing store is now validated before anything is mapped or
+  written: identity and layout fields, every geometry and free-list field
+  against the others, the root handle, the file sizes against what the
+  checkpoint committed, and that both files carry the same store identity and
+  checkpoint generation. A refused open throws `artpp::store_corrupt` or
+  `artpp::store_incompatible` (both `artpp::store_error`, a
+  `std::runtime_error`), or `std::system_error` with the `errno` for a failed
+  system call, instead of `std::bad_alloc`; it modifies and creates nothing.
+  `line_pool::checkpoint` throws on a root handle that cannot belong to the
+  pool and on a failed write (it was `noexcept` and ignored `msync`) (#10).
 
 ### Known issues
 - Open bugs from the pre-release audit: #10 and #17 (file-backed

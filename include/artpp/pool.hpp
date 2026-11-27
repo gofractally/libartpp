@@ -29,14 +29,18 @@
 #pragma once
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include <fcntl.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -97,6 +101,30 @@ namespace artpp
       static_assert(sizeof(line_ptr) == 4, "line_ptr is exactly 4 bytes");
    }  // namespace detail
 
+   // ── what opening a store directory can refuse ───────────────────────────────────────
+   // All derive from store_error (a std::runtime_error) and name the store and the reason in
+   // what(). A failed open never modifies a file. Operating-system failures (open, mmap,
+   // ftruncate, msync, ...) are reported as std::system_error with the errno of the call.
+   class store_error : public std::runtime_error
+   {
+     public:
+      using std::runtime_error::runtime_error;
+   };
+   // The files are not a store, or not a whole one: a foreign file, a truncated file, a
+   // superblock field out of range, or `nodes` and `terms` from different checkpoints.
+   class store_corrupt : public store_error
+   {
+     public:
+      using store_error::store_error;
+   };
+   // A store, but not one this build can use: another format version, byte order, geometry or
+   // page size.
+   class store_incompatible : public store_error
+   {
+     public:
+      using store_error::store_error;
+   };
+
    // The line store. Single-threaded, like the tree. Not copyable/movable — every handle
    // in every tree on this pool encodes an offset from base_.
    class line_pool
@@ -106,19 +134,41 @@ namespace artpp
       static constexpr size_t chunk_bytes = size_t(4) << 20;  // commit/grow unit
       static constexpr size_t max_bytes   = size_t(1) << 35;  // 32 GB — the 28-bit index cap
 
-      explicit line_pool(size_t cap = max_bytes) { init_(nullptr, cap); }  // anonymous
-      // File-backed: `dir` is a STORE DIRECTORY; the pool creates/reopens one dense file per
-      // region inside it (`nodes` + `terms`). Reopen-or-create — a prior checkpoint() is restored.
-      explicit line_pool(const char* dir, size_t cap = max_bytes) { init_(dir, cap); }
+      explicit line_pool(size_t cap = max_bytes)  // anonymous
+      {
+         try
+         {
+            set_caps_(cap);
+            reserve_();
+            reset_lists_();
+         }
+         catch (...)
+         {
+            destroy_();  // a throwing constructor has no destructor
+            throw;
+         }
+      }
+      // File-backed: `dir` is a STORE DIRECTORY holding one dense file per region (`nodes` +
+      // `terms`). Opens the store that is there, or creates one when there is none (no files,
+      // or two empty ones); `cap` only applies to a store being created. An existing store is
+      // validated before anything is mapped or written, and the open throws — store_corrupt,
+      // store_incompatible (see above) or std::system_error — rather than use, repair or
+      // overwrite files it cannot vouch for.
+      explicit line_pool(const char* dir, size_t cap = max_bytes)
+      {
+         try
+         {
+            open_store_(dir, cap);
+         }
+         catch (...)
+         {
+            destroy_();
+            throw;
+         }
+      }
       line_pool(const line_pool&)            = delete;
       line_pool& operator=(const line_pool&) = delete;
-      ~line_pool()
-      {
-         if (nbase_) ::munmap(nbase_, node_resv_);
-         if (tbase_) ::munmap(tbase_, term_resv_);
-         if (nfd_ >= 0) ::close(nfd_);
-         if (tfd_ >= 0) ::close(tfd_);
-      }
+      ~line_pool() { destroy_(); }
 
       // Terminal region: 16-byte-granular storage for leaves (tag K::value_ptr). A
       // terminal is pure payload — suffix bytes + value — with no branch slots, so it
@@ -129,7 +179,7 @@ namespace artpp
       static constexpr size_t term_unit      = 16;
       static constexpr size_t max_term_bytes = size_t(1) << 32;  // 4 GB — u32 offsets
 
-      bool       file_backed() const noexcept { return sb_bytes_ != 0; }
+      bool       file_backed() const noexcept { return hdr_ != 0; }
       std::byte* base() const noexcept { return base_; }
       std::byte* term_base() const noexcept { return tbase_; }
       size_t     committed() const noexcept { return committed_; }
@@ -137,8 +187,8 @@ namespace artpp
       size_t     used_lines() const noexcept { return frontier_; }
       size_t     used_term_units() const noexcept { return tfrontier_; }
       // Total on-disk bytes across the store's region files. Each region is its own dense
-      // file (no sparse holes), so this is just the committed extents + the header.
-      size_t file_extent() const noexcept { return sb_bytes_ + committed_ + tcommitted_; }
+      // file (no sparse holes), so this is just the committed extents + the two headers.
+      size_t file_extent() const noexcept { return 2 * hdr_ + committed_ + tcommitted_; }
 
       // ── persistence (file-backed, clean-close durability) ────────────────────────
       // checkpoint() stamps the current carving state + the tree's root handle and count
@@ -156,10 +206,20 @@ namespace artpp
       bool     restored() const noexcept { return restored_; }
       uint64_t root() const noexcept { return uroot_; }
       uint64_t count() const noexcept { return ucount_; }
-      void     checkpoint(uint64_t root, uint64_t count) noexcept
+      // Throws std::invalid_argument when `root` cannot be the root of a tree in this pool (a
+      // count of 0 records the empty tree, whatever `root` is), std::system_error when the
+      // image cannot be written.
+      void checkpoint(uint64_t root, uint64_t count)
       {
+         if (count == 0)
+            root = null_root;
+         else if (!root_ok_(root, frontier_, tfrontier_))
+            throw std::invalid_argument(
+                "artpp::line_pool::checkpoint: the root handle does not address this pool");
+         if (file_backed()) write_image_(root, count, checkpoints_ + 1);
          ++checkpoints_;
-         stamp_(root, count);
+         uroot_  = root;
+         ucount_ = count;
       }
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
       // free lists — the intrusive links live inside freed lines, so they ride the byte
@@ -259,168 +319,433 @@ namespace artpp
          }
       }
 
-     private:
+      static constexpr uint32_t INDEX_BITS = 28, TAG_BITS = 4;  // the handle: see detail::line_ptr
       static constexpr uint32_t NIL       = 0xFFFFFFFFu;
       static constexpr size_t   FREE_MAX  = 1024;  // node lists cover up to 128 KB
       static constexpr size_t   TFREE_MAX = 4096;  // terminal lists cover up to 64 KB
 
-      // ── persistence: a self-describing superblock in the nodes file's first page(s) ──
-      // A file-backed pool reserves SB_BYTES at the front of the NODES file for this header and
-      // shifts base_ past it, so every node/terminal offset stays base-relative — identical to an
-      // anonymous pool, so adopt() and every minted handle are unaffected. checkpoint() serializes
-      // the carving state (frontier + free-list heads; the chains themselves live inside freed
-      // blocks, already on disk) plus the tree's root handle + count here; a later line_pool(dir)
-      // over the same store restores them. Offset handles need no relocation — the bytes ARE the
-      // structure across a close/reopen. The terminal region is a SEPARATE dense file (no header).
-      static constexpr uint64_t MAGIC    = 0x6c6f6f7070747261ULL;  // "artppool" (little-endian)
-      static constexpr uint32_t VERSION  = 2;  // 2: `checkpoints`; a fresh store's root is null
-      static constexpr size_t   SB_BYTES = 32768;  // header reservation (>= sizeof(superblock))
+      // ── the image: a header at the front of each region file ─────────────────────────
+      // A file-backed pool reserves `hdr_` bytes at the front of BOTH files and maps the
+      // regions past them, so every node/terminal offset stays base-relative — identical to
+      // an anonymous pool, so adopt() and every minted handle are unaffected. The `nodes`
+      // header is the superblock: what the image depends on that the pool can know (format
+      // version, byte order, its own size and alignment, line size, handle layout, list
+      // sizes), the geometry, the carving state (frontier + free-list heads; the chains
+      // themselves live inside the freed blocks) and the tree's root handle + count. The
+      // `terms` header only says which store and which checkpoint the file belongs to, so
+      // that a `terms` file copied from elsewhere, or from another moment, is not taken for
+      // the right one. Everything is validated by open_store_ before it is believed.
+      // The layout is a detail of this version of the library: public only so that tools and
+      // tests can name the fields.
+      static constexpr uint64_t MAGIC      = 0x6c6f6f7070747261ULL;  // "artppool" (little-endian)
+      static constexpr uint64_t TERM_MAGIC = 0x6d72657470747261ULL;  // "artpterm"
+      // 2: null root in a fresh store, checkpoint count, identity fields, a header in `terms`.
+      static constexpr uint32_t VERSION         = 2;
+      static constexpr uint32_t BYTE_ORDER_MARK = 0x01020304u;
+      static constexpr size_t   SB_BYTES        = 32768;  // header reservation
       struct superblock
       {
          uint64_t magic;
-         uint32_t version, flags;
+         uint32_t version;
+         uint32_t byte_order;              // BYTE_ORDER_MARK as the writing machine stored it
+         uint32_t sb_size, sb_align;       // sizeof / alignof(superblock) of the writing build
+         uint32_t line_bytes, term_unit;   // region granularities
+         uint32_t index_bits, tag_bits;    // handle layout: 28-bit index + 4-bit tag
+         uint32_t free_max, tfree_max;     // sizes of the two free-list tables
+         uint64_t chunk_bytes;             // commit unit: `committed` is a multiple of it
+         uint64_t header_bytes;            // the reservation at the front of each file
+         uint64_t store_id;                // drawn when the store is created
+         uint64_t generation;              // +1 on every image write; `terms` carries the same
+         uint64_t checkpoints;             // user checkpoint() calls so far; 0 = never
          uint64_t ncap, tcap, frontier, tfrontier, committed, tcommitted;
          uint32_t huge, thuge;
          uint64_t uroot, ucount;             // user metadata: tree root handle + element count
-         uint64_t checkpoints;               // user checkpoint() calls so far; 0 = never
          uint32_t free_heads[FREE_MAX + 1];  // exact-size free-list heads
          uint32_t tfree_heads[TFREE_MAX + 1];
       };
+      struct terms_header
+      {
+         uint64_t magic;
+         uint32_t version;
+         uint32_t byte_order;
+         uint64_t header_bytes, store_id, generation;
+      };
       static_assert(sizeof(superblock) <= SB_BYTES, "superblock must fit its reservation");
 
-      // Write the superblock: the carving state, the root and count, and how many times the
-      // user has checkpointed (0 = the image is the empty one stamped at creation).
-      void stamp_(uint64_t root, uint64_t count) noexcept
+     private:
+      // ── refusals ──────────────────────────────────────────────────────────────────────
+      [[noreturn]] static void corrupt_(const std::string& dir, const std::string& why)
       {
-         uroot_  = root;
-         ucount_ = count;
-         if (sb_bytes_ == 0) return;  // anonymous pool: nothing to persist
-         auto* sb       = reinterpret_cast<superblock*>(nbase_);  // header = nodes file, page(s) 0
-         sb->magic      = MAGIC;
-         sb->version    = VERSION;
-         sb->flags      = 0;
-         sb->ncap       = ncap_;
-         sb->tcap       = tcap_;
-         sb->frontier   = frontier_;
-         sb->tfrontier  = tfrontier_;
-         sb->committed  = committed_;
-         sb->tcommitted = tcommitted_;
-         sb->huge       = huge_;
-         sb->thuge      = thuge_;
-         sb->uroot      = root;
-         sb->ucount     = count;
-         sb->checkpoints = checkpoints_;
-         std::memcpy(sb->free_heads, free_, sizeof(free_));
-         std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
-         ::msync(nbase_, sb_bytes_, MS_SYNC);  // header durable; data rides the page cache
+         throw store_corrupt("artpp::line_pool: " + dir + ": " + why);
       }
-      void destroy_() noexcept  // unwind a partially-constructed pool
+      [[noreturn]] static void incompatible_(const std::string& dir, const std::string& why)
+      {
+         throw store_incompatible("artpp::line_pool: " + dir + ": " + why);
+      }
+      // A failed system call: std::system_error carrying `err` (errno of the call).
+      [[noreturn]] static void os_error_(int err, const char* call, const std::string& path)
+      {
+         throw std::system_error(err, std::generic_category(),
+                                 std::string("artpp::line_pool: ") + call + "(" + path + ")");
+      }
+      static std::string num_(uint64_t v) { return std::to_string(v); }
+
+      // Can `raw` be the root of a non-empty tree whose regions end at these frontiers?
+      static bool root_ok_(uint64_t raw, uint64_t frontier, uint64_t tfrontier) noexcept
+      {
+         if (raw >> 32) return false;  // a handle is 4 bytes
+         const unsigned tag = unsigned(raw & 0xF);
+         if (tag == unsigned(detail::K::value_ptr)) return (raw >> 4) < tfrontier;  // a leaf
+         if (tag == unsigned(detail::K::value_inline)) return true;  // payload is in the handle
+         if (tag > detail::K_max) return false;                      // null, or no kind at all
+         return (raw >> 4) < frontier;                               // a node: a line index
+      }
+      // The list of n-unit blocks may only start at a block that lies before the frontier.
+      // Returns the first list that does not, or `max + 1`.
+      static size_t bad_head_(const uint32_t* heads, size_t max, uint64_t frontier) noexcept
+      {
+         if (heads[0] != NIL) return 0;  // there are no 0-unit blocks
+         for (size_t n = 1; n <= max; ++n)
+            if (heads[n] != NIL && uint64_t(heads[n]) + n > frontier) return n;
+         return max + 1;
+      }
+      static off_t file_size_(int fd, const std::string& path, const std::string& dir)
+      {
+         struct stat st;
+         if (::fstat(fd, &st) != 0) os_error_(errno, "fstat", path);
+         if (!S_ISREG(st.st_mode)) corrupt_(dir, "'" + path + "' is not a regular file");
+         return st.st_size;
+      }
+      // Read exactly n bytes at offset 0; false when the file is shorter.
+      static bool read_header_(int fd, void* buf, size_t n, const std::string& path)
+      {
+         size_t got = 0;
+         while (got < n)
+         {
+            const ssize_t r = ::pread(fd, static_cast<char*>(buf) + got, n - got, off_t(got));
+            if (r < 0)
+            {
+               if (errno == EINTR) continue;
+               os_error_(errno, "pread", path);
+            }
+            if (r == 0) return false;
+            got += size_t(r);
+         }
+         return true;
+      }
+      static constexpr uint64_t byteswap64_(uint64_t v) noexcept
+      {
+         uint64_t r = 0;
+         for (int i = 0; i < 8; ++i) r = (r << 8) | ((v >> (8 * i)) & 0xFF);
+         return r;
+      }
+
+      // Everything that can be checked about an existing store without reading its data.
+      // Throws store_corrupt / store_incompatible; reads only, never writes.
+      static void validate_(const std::string& dir, const superblock& sb, const terms_header& th,
+                            uint64_t nodes_size, uint64_t terms_size)
+      {
+         // 1. Is it a store, and one this build reads?
+         if (sb.magic == byteswap64_(MAGIC))
+            incompatible_(dir, "the store was written on a machine of the other byte order");
+         if (sb.magic != MAGIC) corrupt_(dir, "'nodes' is not an artpp line_pool store (no magic)");
+         if (sb.version != VERSION)
+            incompatible_(dir, "the store has format version " + num_(sb.version) +
+                                   ", this build of artpp reads only version " + num_(VERSION) +
+                                   " (the format is specific to the library version)");
+         const auto same = [&](const char* what, uint64_t stored, uint64_t mine) {
+            if (stored != mine)
+               incompatible_(dir, std::string("the store was written by a build with another layout: ") +
+                                      what + " is " + num_(stored) + ", this build has " + num_(mine));
+         };
+         same("byte order mark", sb.byte_order, BYTE_ORDER_MARK);
+         same("sizeof(superblock)", sb.sb_size, sizeof(superblock));
+         same("alignof(superblock)", sb.sb_align, alignof(superblock));
+         same("line size", sb.line_bytes, line_bytes);
+         same("terminal unit", sb.term_unit, term_unit);
+         same("handle index bits", sb.index_bits, INDEX_BITS);
+         same("handle tag bits", sb.tag_bits, TAG_BITS);
+         same("node free-list table size", sb.free_max, FREE_MAX);
+         same("terminal free-list table size", sb.tfree_max, TFREE_MAX);
+         same("commit unit", sb.chunk_bytes, chunk_bytes);
+         same("header reservation", sb.header_bytes, SB_BYTES);
+
+         // 2. Geometry and carving state: every field within what the others allow.
+         const auto in_range = [&](bool ok, const char* field, uint64_t v) {
+            if (!ok) corrupt_(dir, std::string("superblock field ") + field + " = " + num_(v) + " is out of range");
+         };
+         in_range(sb.ncap != 0 && sb.ncap <= max_bytes && sb.ncap % chunk_bytes == 0, "ncap", sb.ncap);
+         in_range(sb.tcap != 0 && sb.tcap <= max_term_bytes && sb.tcap % chunk_bytes == 0, "tcap", sb.tcap);
+         in_range(sb.committed <= sb.ncap && sb.committed % chunk_bytes == 0, "committed", sb.committed);
+         in_range(sb.tcommitted <= sb.tcap && sb.tcommitted % chunk_bytes == 0, "tcommitted", sb.tcommitted);
+         in_range(sb.frontier <= sb.committed / line_bytes, "frontier", sb.frontier);
+         in_range(sb.tfrontier <= sb.tcommitted / term_unit, "tfrontier", sb.tfrontier);
+         in_range(sb.huge == NIL || sb.huge < sb.frontier, "huge", sb.huge);
+         in_range(sb.thuge == NIL || sb.thuge < sb.tfrontier, "thuge", sb.thuge);
+         if (const size_t n = bad_head_(sb.free_heads, FREE_MAX, sb.frontier); n <= FREE_MAX)
+            corrupt_(dir, "superblock field free_heads[" + num_(n) + "] = " + num_(sb.free_heads[n]) +
+                              " is out of range");
+         if (const size_t n = bad_head_(sb.tfree_heads, TFREE_MAX, sb.tfrontier); n <= TFREE_MAX)
+            corrupt_(dir, "superblock field tfree_heads[" + num_(n) + "] = " + num_(sb.tfree_heads[n]) +
+                              " is out of range");
+         if (sb.checkpoints == 0)  // never checkpointed: the empty image written at creation
+            in_range(sb.uroot == null_root && sb.ucount == 0, "uroot", sb.uroot);
+         else if (sb.ucount == 0)
+            in_range(sb.uroot == null_root, "uroot", sb.uroot);
+         else
+            in_range(root_ok_(sb.uroot, sb.frontier, sb.tfrontier), "uroot", sb.uroot);
+
+         // 3. The files hold everything the checkpoint committed.
+         if (nodes_size < sb.header_bytes + sb.committed)
+            corrupt_(dir, "'nodes' is truncated: " + num_(nodes_size) + " bytes, the checkpoint committed " +
+                              num_(sb.header_bytes + sb.committed));
+         if (terms_size < sb.header_bytes + sb.tcommitted)
+            corrupt_(dir, "'terms' is truncated: " + num_(terms_size) + " bytes, the checkpoint committed " +
+                              num_(sb.header_bytes + sb.tcommitted));
+
+         // 4. `terms` is the other half of THIS store at THIS checkpoint.
+         if (th.magic != TERM_MAGIC || th.version != sb.version || th.byte_order != sb.byte_order ||
+             th.header_bytes != sb.header_bytes)
+            corrupt_(dir, "'terms' is not the terminal file of an artpp line_pool store");
+         if (th.store_id != sb.store_id)
+            corrupt_(dir, "'nodes' and 'terms' belong to different stores");
+         if (th.generation != sb.generation)
+            corrupt_(dir, "'nodes' and 'terms' are from different checkpoints (generation " +
+                              num_(sb.generation) + " and " + num_(th.generation) + ")");
+      }
+
+      // ── construction ──────────────────────────────────────────────────────────────────
+      void destroy_() noexcept  // also unwinds a partially-constructed pool
       {
          if (nbase_) ::munmap(nbase_, node_resv_);
-         if (tbase_) ::munmap(tbase_, term_resv_);
+         if (tmap_) ::munmap(tmap_, term_resv_);
          if (nfd_ >= 0) ::close(nfd_);
          if (tfd_ >= 0) ::close(tfd_);
-         nbase_ = base_ = tbase_ = nullptr;
+         nbase_ = base_ = tmap_ = tbase_ = nullptr;
          nfd_ = tfd_ = -1;
       }
-      void init_(const char* dir, size_t cap)
+      void set_caps_(size_t cap) noexcept
       {
-         ncap_     = std::min((cap + chunk_bytes - 1) / chunk_bytes * chunk_bytes, max_bytes);
-         tcap_     = std::min(std::max(ncap_ / 8, chunk_bytes), max_term_bytes);  // 1/8th (16/128)
-         sb_bytes_ = dir ? SB_BYTES : 0;  // the nodes file carries a self-describing header
-         bool restore = false;
-         if (dir)
-         {
-            ::mkdir(dir, 0755);  // create the store directory (EEXIST is fine; a bad path fails below)
-            const std::string np = std::string(dir) + "/nodes";  // big-object file (128 B lines + header)
-            const std::string tp = std::string(dir) + "/terms";  // terminal-unit file (16 B)
-            nfd_ = ::open(np.c_str(), O_RDWR | O_CREAT, 0644);
-            if (nfd_ < 0) throw std::bad_alloc();
-            tfd_ = ::open(tp.c_str(), O_RDWR | O_CREAT, 0644);
-            if (tfd_ < 0) { ::close(nfd_); nfd_ = -1; throw std::bad_alloc(); }
-            struct stat st;
-            if (::fstat(nfd_, &st) != 0) { destroy_(); throw std::bad_alloc(); }
-            if (st.st_size >= off_t(SB_BYTES))  // existing store: validate + adopt its geometry
-            {
-               struct { uint64_t magic; uint32_t version, flags; uint64_t ncap, tcap; } pk{};
-               if (::pread(nfd_, &pk, sizeof pk, 0) == off_t(sizeof pk) && pk.magic == MAGIC &&
-                   pk.version == VERSION)
-               {
-                  restore = true;
-                  ncap_   = pk.ncap;  // offsets resolve against the store's geometry, not `cap`
-                  tcap_   = pk.tcap;
-               }
-               else { destroy_(); throw std::bad_alloc(); }  // foreign / corrupt nodes file
-            }
-         }
-         node_resv_ = sb_bytes_ + ncap_;  // one PROT_NONE reservation per region (own file each)
-         term_resv_ = tcap_;
-         void* nr   = ::mmap(nullptr, node_resv_, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-         if (nr == MAP_FAILED) { destroy_(); throw std::bad_alloc(); }
-         nbase_ = static_cast<std::byte*>(nr);
-         base_  = nbase_ + sb_bytes_;
-         void* tr = ::mmap(nullptr, term_resv_, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-         if (tr == MAP_FAILED) { destroy_(); throw std::bad_alloc(); }
-         tbase_ = static_cast<std::byte*>(tr);
-         if (dir)  // map the superblock header (nodes file, page(s) 0) read-write
-         {
-            struct stat st;
-            if (::fstat(nfd_, &st) != 0) { destroy_(); throw std::bad_alloc(); }
-            if (st.st_size < off_t(sb_bytes_) && ::ftruncate(nfd_, off_t(sb_bytes_)) != 0)
-            { destroy_(); throw std::bad_alloc(); }
-            if (::mmap(nbase_, sb_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, nfd_, 0) ==
-                MAP_FAILED)
-            { destroy_(); throw std::bad_alloc(); }
-         }
-         std::memset(free_, 0xFF, sizeof(free_));   // every head = NIL (all-ones)
+         cap   = std::min(std::max(cap, size_t(1)), max_bytes);  // at least one chunk; no overflow below
+         ncap_ = (cap + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
+         tcap_ = std::min(std::max(ncap_ / 8, chunk_bytes), max_term_bytes);  // 1/8th (16/128)
+      }
+      void reset_lists_() noexcept
+      {
+         std::memset(free_, 0xFF, sizeof(free_));  // every head = NIL (all-ones)
          std::memset(tfree_, 0xFF, sizeof(tfree_));
-         if (restore)
+         huge_ = thuge_ = NIL;
+      }
+      // One PROT_NONE reservation per region; [0, hdr_) of each is the file's header.
+      void reserve_()
+      {
+         node_resv_ = hdr_ + ncap_;
+         term_resv_ = hdr_ + tcap_;
+         void* nr   = ::mmap(nullptr, node_resv_, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+         if (nr == MAP_FAILED) reserve_failed_(errno);
+         nbase_   = static_cast<std::byte*>(nr);
+         base_    = nbase_ + hdr_;
+         void* tr = ::mmap(nullptr, term_resv_, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+         if (tr == MAP_FAILED) reserve_failed_(errno);
+         tmap_  = static_cast<std::byte*>(tr);
+         tbase_ = tmap_ + hdr_;
+      }
+      [[noreturn]] void reserve_failed_(int err) const
+      {
+         if (file_backed()) os_error_(err, "mmap", dir_);
+         throw std::bad_alloc();
+      }
+      void map_headers_()
+      {
+         if (::mmap(nbase_, hdr_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, nfd_, 0) == MAP_FAILED)
+            os_error_(errno, "mmap", dir_ + "/nodes");
+         if (::mmap(tmap_, hdr_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, tfd_, 0) == MAP_FAILED)
+            os_error_(errno, "mmap", dir_ + "/terms");
+      }
+      superblock*   sb_() const noexcept { return reinterpret_cast<superblock*>(nbase_); }
+      terms_header* th_() const noexcept { return reinterpret_cast<terms_header*>(tmap_); }
+
+      void open_store_(const char* dir, size_t cap)
+      {
+         if (!dir || !*dir) throw std::invalid_argument("artpp::line_pool: empty store directory name");
+         dir_                 = dir;
+         const std::string np = dir_ + "/nodes";  // 128 B lines, behind the superblock
+         const std::string tp = dir_ + "/terms";  // 16 B terminal units, behind their header
+         // Open what is there first: nothing is created next to a file that is then refused.
+         nfd_ = ::open(np.c_str(), O_RDWR | O_CLOEXEC);
+         if (nfd_ < 0 && errno != ENOENT) os_error_(errno, "open", np);
+         tfd_ = ::open(tp.c_str(), O_RDWR | O_CLOEXEC);
+         if (tfd_ < 0 && errno != ENOENT) os_error_(errno, "open", tp);
+         if (nfd_ < 0 || tfd_ < 0)
          {
-            const superblock* sb = reinterpret_cast<const superblock*>(nbase_);
-            frontier_  = sb->frontier;
-            tfrontier_ = sb->tfrontier;
-            huge_      = sb->huge;
-            thuge_     = sb->thuge;
-            checkpoints_ = sb->checkpoints;
-            if (checkpoints_ != 0)  // else: only ever stamped at creation — an empty store
-            {
-               uroot_    = sb->uroot;
-               ucount_   = sb->ucount;
-               restored_ = true;
-            }
-            std::memcpy(free_, sb->free_heads, sizeof(free_));
-            std::memcpy(tfree_, sb->tfree_heads, sizeof(tfree_));
-            if (const size_t want = sb->committed) commit_(want);    // re-map written region files
-            if (const size_t twant = sb->tcommitted) tcommit_(twant);
+            // A store is both files. One of them alone, with content, is half a store.
+            if (nfd_ >= 0 && file_size_(nfd_, np, dir_) != 0)
+               corrupt_(dir_, "the store is incomplete: 'terms' is missing");
+            if (tfd_ >= 0 && file_size_(tfd_, tp, dir_) != 0)
+               corrupt_(dir_, "the store is incomplete: 'nodes' is missing");
+            if (::mkdir(dir, 0755) != 0 && errno != EEXIST) os_error_(errno, "mkdir", dir_);
+            if (nfd_ < 0 && (nfd_ = ::open(np.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0)
+               os_error_(errno, "open", np);
+            if (tfd_ < 0 && (tfd_ = ::open(tp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0)
+               os_error_(errno, "open", tp);
          }
-         else if (dir)
-            stamp_(null_root, 0);  // an initial empty image, so a reopen is self-describing
+         const uint64_t nsz = uint64_t(file_size_(nfd_, np, dir_));
+         const uint64_t tsz = uint64_t(file_size_(tfd_, tp, dir_));
+         hdr_ = SB_BYTES;
+         reset_lists_();
+         if (nsz == 0 && tsz == 0)
+         {
+            create_(cap);
+            return;
+         }
+         if (nsz == 0) corrupt_(dir_, "the store is incomplete: 'nodes' is empty and 'terms' is not");
+         if (tsz == 0) corrupt_(dir_, "the store is incomplete: 'terms' is empty and 'nodes' is not");
+         superblock   sb;
+         terms_header th;
+         if (!read_header_(nfd_, &sb, sizeof sb, np))
+            corrupt_(dir_, "'nodes' is not an artpp line_pool store (" + num_(nsz) +
+                               " bytes: too short to hold a superblock)");
+         if (!read_header_(tfd_, &th, sizeof th, tp))
+            corrupt_(dir_, "'terms' is not the terminal file of an artpp line_pool store (" + num_(tsz) +
+                               " bytes: too short)");
+         validate_(dir_, sb, th, nsz, tsz);
+         restore_(sb);
+      }
+      // A new store: both files are empty. Stamp the empty image so that a reopen is
+      // self-describing (and is told apart from a checkpointed one by `checkpoints` == 0).
+      void create_(size_t cap)
+      {
+         set_caps_(cap);
+         reserve_();
+         if (::ftruncate(nfd_, off_t(hdr_)) != 0) os_error_(errno, "ftruncate", dir_ + "/nodes");
+         if (::ftruncate(tfd_, off_t(hdr_)) != 0) os_error_(errno, "ftruncate", dir_ + "/terms");
+         map_headers_();
+         store_id_ = new_store_id_();
+         write_image_(null_root, 0, 0);
+      }
+      // An existing store that validate_ accepted: adopt its geometry (offsets resolve against
+      // the store's, not the constructor's `cap`) and map what it committed.
+      void restore_(const superblock& sb)
+      {
+         ncap_ = sb.ncap;
+         tcap_ = sb.tcap;
+         reserve_();
+         map_headers_();
+         if (const int e = commit_region_(base_, nfd_, hdr_, committed_, ncap_, sb.committed))
+            os_error_(e, "mmap", dir_ + "/nodes");
+         if (const int e = commit_region_(tbase_, tfd_, hdr_, tcommitted_, tcap_, sb.tcommitted))
+            os_error_(e, "mmap", dir_ + "/terms");
+         frontier_    = sb.frontier;
+         tfrontier_   = sb.tfrontier;
+         huge_        = sb.huge;
+         thuge_       = sb.thuge;
+         store_id_    = sb.store_id;
+         generation_  = sb.generation;
+         checkpoints_ = sb.checkpoints;
+         std::memcpy(free_, sb.free_heads, sizeof(free_));
+         std::memcpy(tfree_, sb.tfree_heads, sizeof(tfree_));
+         if (checkpoints_ != 0)  // else: only ever stamped at creation — an empty store
+         {
+            uroot_    = sb.uroot;
+            ucount_   = sb.ucount;
+            restored_ = true;
+         }
+      }
+      // Identifies a store among others: `nodes` and `terms` must agree on it. Not a secret
+      // and not a hash of the content — time, process and address mixed (splitmix64).
+      uint64_t new_store_id_() const noexcept
+      {
+         struct timespec ts{};
+         ::clock_gettime(CLOCK_REALTIME, &ts);
+         uint64_t z = uint64_t(ts.tv_sec) * 1000000000u + uint64_t(ts.tv_nsec);
+         z ^= uint64_t(::getpid()) << 32;
+         z ^= uint64_t(reinterpret_cast<uintptr_t>(this));
+         z += 0x9e3779b97f4a7c15ULL;
+         z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+         z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+         z ^= z >> 31;
+         return z ? z : 1;
+      }
+      // Write the image headers: the carving state, the root and count, and how many times
+      // the user has checkpointed (0 = the empty image stamped at creation). `terms` first:
+      // the superblock is what makes the pair valid.
+      void write_image_(uint64_t root, uint64_t count, uint64_t checkpoints)
+      {
+         const uint64_t gen = generation_ + 1;
+         terms_header*  th  = th_();
+         th->magic          = TERM_MAGIC;
+         th->version        = VERSION;
+         th->byte_order     = BYTE_ORDER_MARK;
+         th->header_bytes   = hdr_;
+         th->store_id       = store_id_;
+         th->generation     = gen;
+         if (::msync(tmap_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/terms");
+         superblock* sb   = sb_();
+         sb->magic        = MAGIC;
+         sb->version      = VERSION;
+         sb->byte_order   = BYTE_ORDER_MARK;
+         sb->sb_size      = uint32_t(sizeof(superblock));
+         sb->sb_align     = uint32_t(alignof(superblock));
+         sb->line_bytes   = uint32_t(line_bytes);
+         sb->term_unit    = uint32_t(term_unit);
+         sb->index_bits   = INDEX_BITS;
+         sb->tag_bits     = TAG_BITS;
+         sb->free_max     = uint32_t(FREE_MAX);
+         sb->tfree_max    = uint32_t(TFREE_MAX);
+         sb->chunk_bytes  = chunk_bytes;
+         sb->header_bytes = hdr_;
+         sb->store_id     = store_id_;
+         sb->generation   = gen;
+         sb->checkpoints  = checkpoints;
+         sb->ncap         = ncap_;
+         sb->tcap         = tcap_;
+         sb->frontier     = frontier_;
+         sb->tfrontier    = tfrontier_;
+         sb->committed    = committed_;
+         sb->tcommitted   = tcommitted_;
+         sb->huge         = huge_;
+         sb->thuge        = thuge_;
+         sb->uroot        = root;
+         sb->ucount       = count;
+         std::memcpy(sb->free_heads, free_, sizeof(free_));
+         std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
+         if (::msync(nbase_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/nodes");
+         generation_ = gen;
       }
       // Grow a region's mapping to cover `need` bytes: extend its OWN file densely from `file_off`
       // and map the new chunks (MAP_FIXED over the PROT_NONE reservation), or mprotect for an
-      // anonymous pool. One file per region ⇒ dense growth, no sparse holes.
-      static void commit_region_(std::byte* mem_base, int fd, size_t file_off, size_t& committed,
-                                 size_t regcap, size_t need)
+      // anonymous pool. One file per region ⇒ dense growth, no sparse holes. Returns 0, the
+      // errno of the call that failed, or -1 when `need` is beyond the region's capacity.
+      static int commit_region_(std::byte* mem_base, int fd, size_t file_off, size_t& committed,
+                                size_t regcap, size_t need) noexcept
       {
+         if (need > regcap) return -1;
          const size_t target = (need + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
-         if (target > regcap) throw std::bad_alloc();
+         if (target <= committed) return 0;
          if (fd >= 0)
          {
             const off_t fend = off_t(file_off + target);
             struct stat st;
-            if (::fstat(fd, &st) != 0) throw std::bad_alloc();
-            if (st.st_size < fend && ::ftruncate(fd, fend) != 0) throw std::bad_alloc();
+            if (::fstat(fd, &st) != 0) return errno;
+            if (st.st_size < fend && ::ftruncate(fd, fend) != 0) return errno;
             if (::mmap(mem_base + committed, target - committed, PROT_READ | PROT_WRITE,
                        MAP_SHARED | MAP_FIXED, fd, off_t(file_off + committed)) == MAP_FAILED)
-               throw std::bad_alloc();
+               return errno;
          }
          else if (::mprotect(mem_base + committed, target - committed, PROT_READ | PROT_WRITE) != 0)
-            throw std::bad_alloc();
+            return errno;
          committed = target;
+         return 0;
       }
-      // Node lines live past the header (file offset sb_bytes_); terminals fill their file from 0.
-      void commit_(size_t need) { commit_region_(base_, nfd_, sb_bytes_, committed_, ncap_, need); }
-      void tcommit_(size_t need) { commit_region_(tbase_, tfd_, 0, tcommitted_, tcap_, need); }
+      // Node lines and terminals both live past their file's header (file offset hdr_).
+      void commit_(size_t need)
+      {
+         if (commit_region_(base_, nfd_, hdr_, committed_, ncap_, need) != 0) throw std::bad_alloc();
+      }
+      void tcommit_(size_t need)
+      {
+         if (commit_region_(tbase_, tfd_, hdr_, tcommitted_, tcap_, need) != 0) throw std::bad_alloc();
+      }
 
       void* pop_huge_(size_t n) noexcept  // exact-size scan of the rare >FREE_MAX list
       {
@@ -465,12 +790,16 @@ namespace artpp
          return nullptr;
       }
 
-      std::byte* nbase_      = nullptr;  // nodes-region reservation start (superblock at [0,sb_bytes_))
-      std::byte* base_       = nullptr;  // node lines = nbase_ + sb_bytes_ (cached; don't recompute)
-      std::byte* tbase_      = nullptr;  // terminal-region reservation start (its own file, dense)
-      size_t     sb_bytes_   = 0;        // superblock reservation in the nodes file (0 anonymous)
-      size_t     node_resv_  = 0;        // nodes mapping size = sb_bytes_ + ncap_
-      size_t     term_resv_  = 0;        // terminal mapping size = tcap_
+      std::byte* nbase_      = nullptr;  // nodes-region reservation start (superblock at [0,hdr_))
+      std::byte* base_       = nullptr;  // node lines = nbase_ + hdr_ (cached; don't recompute)
+      std::byte* tmap_       = nullptr;  // terminal-region reservation start (header at [0,hdr_))
+      std::byte* tbase_      = nullptr;  // terminal units = tmap_ + hdr_
+      size_t     hdr_        = 0;        // header reservation in each file (0 anonymous)
+      size_t     node_resv_  = 0;        // nodes mapping size = hdr_ + ncap_
+      size_t     term_resv_  = 0;        // terminal mapping size = hdr_ + tcap_
+      uint64_t   store_id_   = 0;        // identity of the store on disk
+      uint64_t   generation_ = 0;        // image writes so far (both headers carry it)
+      std::string dir_;                  // the store directory, for messages
       uint64_t   uroot_      = null_root;  // root handle of the last checkpoint (null: none yet)
       uint64_t   ucount_     = 0;        // element count of the last checkpoint
       uint64_t   checkpoints_ = 0;       // user checkpoint() calls over the store's life

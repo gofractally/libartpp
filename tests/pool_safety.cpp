@@ -7,6 +7,7 @@
 #include "artpp/pool.hpp"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <dirent.h>
@@ -283,6 +285,314 @@ static void retention_is_only_for_the_destructor_of_a_file_backed_map()
    }
 }
 
+// ── #10: files that are not the store that was checkpointed ─────────────────────────────
+static std::vector<char> slurp(const std::string& path)
+{
+   std::vector<char> b;
+   if (FILE* f = std::fopen(path.c_str(), "rb"))
+   {
+      char   buf[65536];
+      size_t n;
+      while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) b.insert(b.end(), buf, buf + n);
+      std::fclose(f);
+   }
+   return b;
+}
+static void spit(const std::string& path, const std::vector<char>& b)
+{
+   FILE* f = std::fopen(path.c_str(), "wb");
+   CHECK(f != nullptr);
+   if (!f) return;
+   CHECK(std::fwrite(b.data(), 1, b.size(), f) == b.size());
+   std::fclose(f);
+}
+// A checkpointed store of n keys (value i + 1), closed.
+static void build_store(const temp_store& s, int n)
+{
+   artpp::line_pool pool(s.c_str());
+   Map              m{A{&pool}, artpp::attach};
+   for (int i = 0; i < n; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+   m.checkpoint();
+}
+static bool store_is_intact(const temp_store& s, int n)
+{
+   artpp::line_pool pool(s.c_str());
+   Map              m{A{&pool}, artpp::attach};
+   return pool.restored() && m.size() == size_t(n) && missing(m, 0, n) == 0;
+}
+// Opening `s` must throw exactly E, with a message that names the store, and must leave
+// both files byte for byte as they were.
+template <class E>
+static void expect_refused(const temp_store& s, const char* what, int line)
+{
+   const std::vector<char> nodes = slurp(s.file("nodes")), terms = slurp(s.file("terms"));
+   const off_t             nsz = s.size("nodes"), tsz = s.size("terms");
+   bool                    refused = false;
+   try
+   {
+      artpp::line_pool pool(s.c_str());
+   }
+   catch (const E& e)
+   {
+      refused = true;
+      if (std::string(e.what()).find(s.dir) == std::string::npos)
+      {
+         std::printf("FAIL line %d (%s): message does not name the store: %s\n", line, what, e.what());
+         ++g_fail;
+      }
+      const std::runtime_error& base = e;  // every refusal is a std::runtime_error
+      (void)base;
+   }
+   catch (const std::exception& e)
+   {
+      std::printf("FAIL line %d (%s): wrong exception: %s\n", line, what, e.what());
+      ++g_fail;
+      return;
+   }
+   if (!refused)
+   {
+      std::printf("FAIL line %d (%s): the store was opened\n", line, what);
+      ++g_fail;
+   }
+   if (s.size("nodes") != nsz || s.size("terms") != tsz || slurp(s.file("nodes")) != nodes ||
+       slurp(s.file("terms")) != terms)
+   {
+      std::printf("FAIL line %d (%s): the refused open modified the files\n", line, what);
+      ++g_fail;
+   }
+}
+#define EXPECT_REFUSED(E, s, what) expect_refused<E>(s, what, __LINE__)
+
+static void truncated_terms_file_is_refused()  // scenario 3: 68,928 of 200,000 keys were missing
+{
+   const int  N = 20000;
+   temp_store s;
+   build_store(s, N);
+   const off_t full = s.size("terms");
+   CHECK(full > 0);
+   CHECK(::truncate(s.file("terms").c_str(), full / 2) == 0);
+   EXPECT_REFUSED(artpp::store_corrupt, s, "terms cut to half");
+   CHECK(::truncate(s.file("terms").c_str(), full - 1) == 0);
+   EXPECT_REFUSED(artpp::store_corrupt, s, "terms one byte short");
+   CHECK(::truncate(s.file("terms").c_str(), 0) == 0);
+   EXPECT_REFUSED(artpp::store_corrupt, s, "terms empty");
+   CHECK(::unlink(s.file("terms").c_str()) == 0);
+   EXPECT_REFUSED(artpp::store_corrupt, s, "terms missing");
+   CHECK(s.size("terms") == -1);  // and it was not created
+}
+static void truncated_nodes_file_is_refused()  // scenario 4: 129,899 of 200,000 keys were missing
+{
+   const int  N = 20000;
+   temp_store s;
+   build_store(s, N);
+   const off_t full = s.size("nodes");
+   CHECK(full > (1 << 20));
+   CHECK(::truncate(s.file("nodes").c_str(), full - (1 << 20)) == 0);  // data cut short
+   EXPECT_REFUSED(artpp::store_corrupt, s, "nodes 1 MB short");
+   CHECK(::truncate(s.file("nodes").c_str(), 4096) == 0);  // not even a whole superblock
+   EXPECT_REFUSED(artpp::store_corrupt, s, "nodes cut inside the superblock");
+   CHECK(::truncate(s.file("nodes").c_str(), 0) == 0);  // empty, next to a populated terms file
+   EXPECT_REFUSED(artpp::store_corrupt, s, "nodes empty");
+   CHECK(::unlink(s.file("nodes").c_str()) == 0);
+   EXPECT_REFUSED(artpp::store_corrupt, s, "nodes missing");
+   CHECK(s.size("nodes") == -1);
+}
+// Scenario 5: a 38-byte file that happened to be called `nodes` was overwritten with a
+// fresh superblock. No file that is not a store may be written to, whatever its size.
+static void foreign_files_are_never_overwritten()
+{
+   const std::string txt = "these are my precious unrelated notes\n";
+   {
+      temp_store s;
+      spit(s.file("nodes"), std::vector<char>(txt.begin(), txt.end()));
+      EXPECT_REFUSED(artpp::store_corrupt, s, "small foreign nodes");
+      CHECK(s.size("terms") == -1);  // nothing was created next to it either
+   }
+   {
+      temp_store        s;
+      std::vector<char> big;
+      while (big.size() < (1u << 20)) big.insert(big.end(), txt.begin(), txt.end());
+      spit(s.file("nodes"), big);
+      spit(s.file("terms"), big);
+      EXPECT_REFUSED(artpp::store_corrupt, s, "large foreign nodes and terms");
+   }
+   {
+      temp_store s;
+      spit(s.file("terms"), std::vector<char>(txt.begin(), txt.end()));
+      EXPECT_REFUSED(artpp::store_corrupt, s, "foreign terms, no nodes");
+      CHECK(s.size("nodes") == -1);
+   }
+   {  // a real store's nodes next to a foreign terms of the right size
+      temp_store s;
+      build_store(s, 100);
+      std::vector<char> t = slurp(s.file("terms"));
+      for (size_t i = 0; i < t.size(); ++i) t[i] = txt[i % txt.size()];
+      spit(s.file("terms"), t);
+      EXPECT_REFUSED(artpp::store_corrupt, s, "foreign terms of the right size");
+   }
+}
+// `nodes` and `terms` are written together and only mean something together.
+static void files_of_different_checkpoints_are_refused()
+{
+   temp_store s;
+   build_store(s, 500);
+   const std::vector<char> old_terms = slurp(s.file("terms")), old_nodes = slurp(s.file("nodes"));
+   {
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}, artpp::attach};
+      for (int i = 500; i < 1000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      m.checkpoint();
+   }
+   const std::vector<char> new_terms = slurp(s.file("terms")), new_nodes = slurp(s.file("nodes"));
+   CHECK(old_terms.size() == new_terms.size() && old_nodes.size() == new_nodes.size());
+   spit(s.file("terms"), old_terms);  // a stale terms file under the current nodes file
+   EXPECT_REFUSED(artpp::store_corrupt, s, "stale terms");
+   spit(s.file("terms"), new_terms);
+   spit(s.file("nodes"), old_nodes);  // and the other way round
+   EXPECT_REFUSED(artpp::store_corrupt, s, "stale nodes");
+   spit(s.file("nodes"), new_nodes);
+   CHECK(store_is_intact(s, 1000));
+   {  // the terms file of ANOTHER store, at the same checkpoint number
+      temp_store other;
+      build_store(other, 500);
+      {
+         artpp::line_pool pool(other.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         for (int i = 500; i < 1000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+         m.checkpoint();
+      }
+      spit(s.file("terms"), slurp(other.file("terms")));
+      EXPECT_REFUSED(artpp::store_corrupt, s, "terms of another store");
+   }
+}
+// One superblock field at a time is given a value it cannot have. Each must be refused
+// (and the file left alone), and the store must open again once the value is put back.
+static void corrupted_superblock_fields_are_refused()
+{
+   using SB = artpp::line_pool::superblock;
+   const int  N = 3000;
+   temp_store s;
+   build_store(s, N);
+   {  // free some of each list so that the heads are populated, then checkpoint again
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}, artpp::attach};
+      for (int i = 0; i < N; i += 2) m.erase(key(i));
+      for (int i = 0; i < N; i += 2) m.insert(key(i), std::uint64_t(i) + 1);
+      for (int i = N; i < N + 64; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      for (int i = N; i < N + 64; ++i) m.erase(key(i));
+      m.checkpoint();
+   }
+   CHECK(store_is_intact(s, N));
+   const int fd = ::open(s.file("nodes").c_str(), O_RDWR);
+   CHECK(fd >= 0);
+   if (fd < 0) return;
+   SB sb;
+   CHECK(::pread(fd, &sb, sizeof sb, 0) == ssize_t(sizeof sb));
+   const std::uint64_t node_bytes = std::uint64_t(s.size("nodes"));
+   struct poke
+   {
+      const char*   field;
+      size_t        off, size;
+      std::uint64_t bad;
+      bool          incompatible;  // a version mismatch is a different refusal than damage
+   };
+#define POKE(member, value) {#member, offsetof(SB, member), sizeof(SB::member), std::uint64_t(value), false}
+   const poke pokes[] = {
+       POKE(magic, 0),
+       POKE(magic, 0x0123456789abcdefULL),
+       {"version", offsetof(SB, version), sizeof(SB::version), std::uint64_t(sb.version) + 1, true},
+       {"version", offsetof(SB, version), sizeof(SB::version), 1, true},
+       POKE(ncap, 0),
+       POKE(ncap, sb.ncap + 4096),                              // not a whole number of chunks
+       POKE(ncap, artpp::line_pool::max_bytes * 2),             // beyond what a handle addresses
+       POKE(ncap, sb.committed - artpp::line_pool::chunk_bytes),  // smaller than what is committed
+       POKE(tcap, 0),
+       POKE(tcap, artpp::line_pool::max_term_bytes * 2),
+       POKE(committed, sb.committed + artpp::line_pool::chunk_bytes),  // more than the file holds
+       POKE(committed, node_bytes * 4),
+       POKE(committed, sb.committed + 1),
+       POKE(committed, 0),                                     // less than the frontier needs
+       POKE(tcommitted, sb.tcommitted + artpp::line_pool::chunk_bytes),
+       POKE(tcommitted, 0),
+       POKE(frontier, sb.committed / artpp::line_pool::line_bytes + 1),  // past the committed range
+       POKE(frontier, ~std::uint64_t(0)),
+       POKE(tfrontier, sb.tcommitted / artpp::line_pool::term_unit + 1),
+       POKE(tfrontier, ~std::uint64_t(0) / 16),
+       POKE(huge, sb.frontier),                                // a free block at or past the frontier
+       POKE(thuge, sb.tfrontier + 5),
+       POKE(uroot, artpp::line_pool::null_root),               // count != 0 needs a root
+       POKE(uroot, (sb.frontier << 4) | 4),                    // a node_full at the frontier
+       POKE(uroot, (sb.tfrontier << 4) | 0),                   // a leaf at the terminal frontier
+       POKE(uroot, 0x1000000000ULL | sb.uroot),                // not a 32-bit handle
+       POKE(uroot, (sb.uroot & ~std::uint64_t(0xF)) | 0xD),    // a tag no node kind has
+       POKE(free_heads[0], 7),                                 // there is no list of 0-line blocks
+       POKE(free_heads[1], sb.frontier),
+       POKE(free_heads[2], sb.frontier - 1),                   // 2 lines do not fit before the frontier
+       POKE(free_heads[artpp::line_pool::FREE_MAX], sb.frontier + 100),
+       POKE(tfree_heads[0], 1),
+       POKE(tfree_heads[5], sb.tfrontier - 4),
+       POKE(tfree_heads[artpp::line_pool::TFREE_MAX], 0xFFFFFFF0u),
+   };
+#undef POKE
+   for (const poke& p : pokes)
+   {
+      char original[8];
+      CHECK(::pread(fd, original, p.size, off_t(p.off)) == ssize_t(p.size));
+      CHECK(::pwrite(fd, &p.bad, p.size, off_t(p.off)) == ssize_t(p.size));  // little-endian hosts
+      const std::string what = std::string(p.field) + " = " + std::to_string(p.bad);
+      if (p.incompatible)
+         EXPECT_REFUSED(artpp::store_incompatible, s, what.c_str());
+      else
+         EXPECT_REFUSED(artpp::store_corrupt, s, what.c_str());
+      CHECK(::pwrite(fd, original, p.size, off_t(p.off)) == ssize_t(p.size));
+   }
+   ::close(fd);
+   CHECK(store_is_intact(s, N));  // every refusal left the image alone
+}
+static int open_descriptors()
+{
+   int n = 0;
+   for (int fd = 0; fd < 1024; ++fd)
+      if (::fcntl(fd, F_GETFD) != -1) ++n;
+   return n;
+}
+// A constructor that throws has no destructor to clean up after it.
+static void refused_opens_release_their_descriptors()
+{
+   temp_store s;
+   build_store(s, 100);
+   CHECK(::truncate(s.file("terms").c_str(), s.size("terms") / 2) == 0);
+   const int before = open_descriptors();
+   for (int i = 0; i < 20; ++i)
+   {
+      try
+      {
+         artpp::line_pool pool(s.c_str());
+         CHECK(!"opened a truncated store");
+      }
+      catch (const artpp::store_error&)
+      {
+      }
+   }
+   CHECK(open_descriptors() == before);
+   temp_store none;  // a path that cannot be a store directory: an OS error, with its errno
+   spit(none.file("plain"), {'x'});
+   for (int i = 0; i < 20; ++i)
+   {
+      try
+      {
+         artpp::line_pool pool(none.file("plain").c_str());
+         CHECK(!"opened a store inside a regular file");
+      }
+      catch (const std::system_error& e)
+      {
+         CHECK(e.code().value() == ENOTDIR || e.code().value() == EEXIST);
+         CHECK(std::string(e.what()).find(none.dir) != std::string::npos);
+      }
+   }
+   CHECK(open_descriptors() == before);
+}
+
 int main()
 {
    struct test_case
@@ -299,6 +609,12 @@ int main()
        {"set_lifecycle", set_lifecycle},
        {"retention_is_only_for_the_destructor_of_a_file_backed_map",
         retention_is_only_for_the_destructor_of_a_file_backed_map},
+       {"truncated_terms_file_is_refused", truncated_terms_file_is_refused},
+       {"truncated_nodes_file_is_refused", truncated_nodes_file_is_refused},
+       {"foreign_files_are_never_overwritten", foreign_files_are_never_overwritten},
+       {"files_of_different_checkpoints_are_refused", files_of_different_checkpoints_are_refused},
+       {"corrupted_superblock_fields_are_refused", corrupted_superblock_fields_are_refused},
+       {"refused_opens_release_their_descriptors", refused_opens_release_their_descriptors},
    };
    for (const test_case& c : cases)
    {
