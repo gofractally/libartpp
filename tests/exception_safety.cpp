@@ -542,10 +542,21 @@ static bool still_usable(Map& m, oracle_t& o)
    return same_as(m, o);
 }
 enum class fault { alloc, value };
-template <class Map, class Build, class Op>
-static void eh_point(const char* cont, const char* scen, fault f, Build build, Op op, bool may_throw = true)
+struct tally
 {
-   int violations = 0, leaks = 0, vleaks = 0, swept = 0, threw_n = 0;
+   int points = 0, threw = 0, violations = 0, leaks = 0, vleaks = 0;
+   void report(const char* cont, const char* scen, fault f) const
+   {
+      const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
+      if (!ok) ++g_fail;
+      std::printf("  %-18s %-24s %-5s  %s  (%d points, %d threw, %d violations, %d mem-leak, %d dtor-leak)\n",
+                  cont, scen, f == fault::alloc ? "alloc" : "value", ok ? "OK  " : "FAIL", points, threw,
+                  violations, leaks, vleaks);
+   }
+};
+template <class Map, class Build, class Op>
+static void eh_point(tally& t, fault f, Build build, Op op, bool may_throw = true)
+{
    for (int n = 0;; ++n)
    {
       fail_counter fc;
@@ -556,7 +567,7 @@ static void eh_point(const char* cont, const char* scen, fault f, Build build, O
          Map                          m(al);
          oracle_t                     o;
          build(m, o);
-         if (!same_as(m, o)) ++violations;
+         if (!same_as(m, o)) ++t.violations;
          const oracle_t before = o;
          bool           threw  = false;
          (f == fault::alloc ? fc.countdown : g_vcountdown) = n;
@@ -565,22 +576,24 @@ static void eh_point(const char* cont, const char* scen, fault f, Build build, O
          catch (const value_error&) { threw = true; }
          fired        = (f == fault::alloc ? fc.countdown : g_vcountdown) < 0;
          fc.countdown = g_vcountdown = -1;
-         threw_n += threw;
-         if (threw && !may_throw) ++violations;
-         if (!same_as(m, threw ? before : o)) ++violations;
+         t.threw += threw;
+         if (threw && !may_throw) ++t.violations;
+         if (!same_as(m, threw ? before : o)) ++t.violations;
          if (threw) o = before;
-         if (!still_usable(m, o)) ++violations;
+         if (!still_usable(m, o)) ++t.violations;
       }
-      if (fc.allocs != fc.frees) ++leaks;
-      if (g_live != vbase) ++vleaks;
-      ++swept;
+      if (fc.allocs != fc.frees) ++t.leaks;
+      if (g_live != vbase) ++t.vleaks;
+      ++t.points;
       if (!fired) break;
    }
-   const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
-   if (!ok) ++g_fail;
-   std::printf("  %-14s %-22s %-5s  %s  (%d points, %d threw, %d violations, %d mem-leak, %d dtor-leak)\n", cont,
-               scen, f == fault::alloc ? "alloc" : "value", ok ? "OK  " : "FAIL", swept, threw_n, violations,
-               leaks, vleaks);
+}
+template <class Map, class Build, class Op>
+static void eh_point(const char* cont, const char* scen, fault f, Build build, Op op, bool may_throw = true)
+{
+   tally t;
+   eh_point<Map>(t, f, build, op, may_throw);
+   t.report(cont, scen, f);
 }
 
 // How many keys `under + <letter> + tail` share one bucket page before the next one bursts it
@@ -629,6 +642,32 @@ static void eh_bucket_burst(const char* cont)
    for (int c = 0; c < 30; ++c) child.push_back(std::string(1, char('A' + c)) + tail);
    for (int c = 0; c + 1 < fill; ++c) child.push_back(std::string("A") + char('a' + c) + tail);
    eh_point<Map>(cont, "burst child bucket", fault::alloc, put_keys<Map>(child, 0), put_keys<Map>({"Az" + tail}, 99));
+}
+
+// audit #4: a router that is full takes one more child by widening, in one step or (dense
+// tiers) several. bkt_put widened into a local: a setlist's inline prefix was cleared first
+// and re-attached last, so a failed widen dropped the prefix of every key below; and once
+// the first widen had freed the old node, any later failure (the next rung, or the prefix
+// node) left the parent pointing at freed memory. Every fan-out from 1 to 70 children under
+// the shared prefix "pre" is grown by one child here, which crosses each rung of the ladder.
+template <class Map>
+static void eh_bucket_widen(const char* cont)
+{
+   const std::string tail(40, 't');
+   for (int spread = 0; spread < 2; ++spread)
+   {
+      auto edge = [spread](int c) { return char(spread ? uint8_t(c * 67 + 5) : uint8_t('0' + c)); };
+      tally t;
+      for (int n = 1; n <= 70; ++n)
+      {
+         std::vector<std::string> pre;
+         for (int c = 0; c < n; ++c)
+            for (int j = 0; j < 2; ++j) pre.push_back(std::string("pre") + edge(c) + char('0' + j) + tail);
+         eh_point<Map>(t, fault::alloc, put_keys<Map>(pre, 0),
+                       put_keys<Map>({std::string("pre") + edge(n) + tail}, 999));
+      }
+      t.report(cont, spread ? "widen, spread edges" : "widen, adjacent edges", fault::alloc);
+   }
 }
 
 template <class Map>
@@ -761,9 +800,15 @@ int main()
    // Bucket and adaptive modes: the audited fault paths (#4 to #7), one operation at a time.
    using BU64 = map<std::string_view, uint64_t, mode::buckets, throwing_alloc<uint64_t>>;
    using BU32 = map<std::string_view, uint32_t, mode::buckets, throwing_alloc<uint32_t>>;
+   using BDenseU64  = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers, throwing_alloc<uint64_t>>;
+   using BDense8U64 = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers | mode::ladder_c8,
+                          throwing_alloc<uint64_t>>;
    std::printf("\nbucket and adaptive modes, one faulted operation against a std::map oracle:\n");
    eh_bucket_burst<BU64>("bucket/u64");
    eh_bucket_burst<BU32>("bucket/u32");
+   eh_bucket_widen<BU64>("bucket/u64");
+   eh_bucket_widen<BDenseU64>("bucket+dense/u64");
+   eh_bucket_widen<BDense8U64>("bucket+dense+c8/u64");
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");

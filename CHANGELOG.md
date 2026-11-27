@@ -66,6 +66,10 @@ before 1.0 a minor version may change the API.
   key of that bucket was lost and the next access was a use-after-free. The
   router that replaces the page is now linked before anything else can fail
   (#5).
+- `mode::buckets`: an allocation failure while a full router took one more
+  child (a widen) dropped the inline prefix of the router, so every key below
+  it changed and could no longer be found; with `mode::dense_tiers` a failure
+  after the first widening step left the parent pointing at a freed node (#4).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #7 (exception safety in

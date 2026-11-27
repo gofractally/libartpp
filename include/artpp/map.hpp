@@ -3244,15 +3244,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (sl_inl_active(s)) sl_externalize_all_(s);  // throws → strong
                packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
                if (setlist_set(s, byte, child)) return true;
+               // Full: grow through the widen ladder. grow_router_ keeps *slot valid at every
+               // step — the inline prefix is lifted into a prefix node BEFORE it is cleared, and
+               // *slot (or that prefix node) is re-pointed after each widen, since a widen frees
+               // the node it replaces — so a failure anywhere leaves every key in place.
                build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
-               uint8_t pfx[setlist::PREFIX_CAP];
-               std::memcpy(pfx, s->prefix, pl);
-               s->rh.hdr.prefix_len = 0;
-               packed_ptr w         = node;
-               do w = widen(w);
-               while (!router_try_set(w, byte, child));
+               grow_router_(slot, node, byte, child);
                gc.release();
-               *slot = pl ? make_prefix(std::string_view(reinterpret_cast<char*>(pfx), pl), w) : w;
                return true;
             }
             case K::pfxd:  // consume the fused prefix, then route as the dense default
@@ -3281,10 +3279,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   return bkt_put<Assign>(cs, key, depth + 1, std::forward<VF>(val));
                packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
                build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
-               packed_ptr w     = node;
-               while (!router_try_set(w, byte, child)) w = widen(w);
+               grow_router_(slot, node, byte, child);  // re-anchors *slot after every widen
                gc.release();
-               *slot = w;
                return true;
             }
          }
