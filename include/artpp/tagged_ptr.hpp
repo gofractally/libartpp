@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// artpp — the design4.md "headerless ART": the pointer is the micro-header.
+// artpp — the "headerless ART": the pointer is the micro-header.
 //
 // A branch is a single tagged handle (default: a 48-bit pointer in 6 bytes). Every node
 // and value blob is allocated 128-byte aligned, so the low 7 bits of an address are
@@ -48,6 +48,19 @@ namespace artpp
    // exactly when — as far as the container can know — they read and write the same bytes.
    // The image keeps the stamp of the container that wrote it and refuses another.
    using image_stamp = std::array<std::uint64_t, 8>;
+
+   // How hard checkpoint() pushes a persistent image to its file.
+   //   none  — (default) the image is recorded through the shared file mapping and the
+   //           operating system writes it back when it chooses. Costs nothing beyond
+   //           writing the headers. It survives the process exiting or being killed, and a
+   //           later open in any process sees it; it does NOT survive the machine crashing
+   //           or losing power before the write-back, and a write error (a full disk, an
+   //           I/O error) is not reported.
+   //   flush — the data, then the headers, are written out with msync(MS_SYNC), each step
+   //           checked: a write error is thrown from checkpoint(). Cost grows with what
+   //           changed since the previous flush. Still not crash consistency: the image
+   //           is updated in place.
+   enum class sync_level : std::uint8_t { none, flush };
 }  // namespace artpp
 
 namespace artpp::detail
@@ -69,7 +82,7 @@ namespace artpp::detail
                  "none_t is a 1-byte trivially-copyable tag");
 
    // The concrete node/value kind, stored in the low 4 bits of every branch handle.
-   // (design4 splits the tag into shape[2:0] + fmt[6:3]; with this v1 taxonomy a
+   // (the original design split the tag into shape[2:0] + fmt[6:3]; with this v1 taxonomy a
    // flat enum is enough — `shape_of` derives the descent class where needed.)
    enum class K : uint8_t
    {
@@ -220,7 +233,7 @@ namespace artpp::detail
    };
 
    // 9-bit nbranch (0..256) + 6-bit prefix_len + has_term, packed into one u16 —
-   // the base header every router shares (design4 `struct node`).
+   // the base header every router shares (`struct node`).
    struct node_hdr
    {
       uint16_t has_term : 1;

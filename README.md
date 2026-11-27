@@ -447,7 +447,8 @@ using Map = artpp::map<std::string_view, uint64_t, artpp::mode::none, A>;
    found.
 2. `Map t{alloc, artpp::attach}` binds a map to that tree in O(1) — or to an
    empty tree, on a store that was never checkpointed.
-3. `t.checkpoint()` records the tree as the store's content and flushes it.
+3. `t.checkpoint()` records the tree as the store's content. By default it
+   forces nothing to disk; see [Sync level](#sync-level).
    **What a later open sees is what the last `checkpoint()` recorded.**
 4. Close by destroying the map and the pool, in that order. **Destroying a map
    never tears down a tree in a file-backed pool**: the tree belongs to the
@@ -502,15 +503,34 @@ of space throws `artpp::pool_exhausted` and a failure of the system to grow it
 `artpp::pool_commit_failed` (with the `errno`); both are `std::bad_alloc`, so
 the tree's exception guarantees apply.
 
+#### Sync level
+
+`checkpoint()` takes an `artpp::sync_level`, on the map and on the low-level
+`pool.checkpoint(root, count, level)`:
+
+| Level | What it does | Cost | Survives |
+|---|---|---|---|
+| `sync_level::none` (default) | Records the image through the shared file mapping; the operating system writes it back when it chooses. | Writing two headers. | The process exiting or being killed. **Not** the machine crashing or losing power before the write-back. A write error (full disk, I/O error) is **not** reported. |
+| `sync_level::flush` | Writes the data, then the headers, with `msync(MS_SYNC)`, each step checked. | Grows with what changed since the previous flush. | As above, plus a machine crash after `checkpoint()` returns, as far as the system honours `msync`. A write error is thrown from `checkpoint()` as `std::system_error`. |
+
+```c++
+t.checkpoint();                          // default: nothing forced to disk
+t.checkpoint(artpp::sync_level::flush);  // written out; write errors reported
+```
+
+Neither level is crash consistency: the image is updated in place, so a crash
+*during* a checkpoint can leave a store that is refused.
+
 #### What is not guaranteed
 
 - **No crash durability.** This is clean-close persistence: there is no
   write-ahead log and the image is updated in place. A crash of the process
   after a change leaves a store that is refused (`store_dirty`), not one that
   is recovered; a crash of the machine, or power loss, can lose or damage
-  anything written since the last checkpoint, and — because `msync` does not
-  force a drive's write cache on every system — possibly that checkpoint as
-  well. Keep a copy if the data matters.
+  anything written since the last *flushed* checkpoint (`sync_level::flush`;
+  the default forces nothing to disk), and — because `msync` does not force a
+  drive's write cache on every system — possibly that checkpoint as well. Keep
+  a copy if the data matters.
 - **The on-disk format is specific to the library version.** A store is only
   guaranteed to open with the version of the library that wrote it. The format
   version and the layout parameters are stamped and checked, so an incompatible
@@ -528,8 +548,6 @@ the tree's exception guarantees apply.
   programs; copy a store only while no pool has it open.
 - A store can be moved between machines of the same byte order with 4, 16 or
   64 KB pages. It has not been run on a 64 KB-page kernel.
-- `checkpoint()` flushes the data it records, so its cost grows with the amount
-  changed since the previous one.
 
 ## Limits and guarantees
 
@@ -702,6 +720,9 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 | `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
 | `artpp_pool_safety` | the file-backed `line_pool` contract: never-checkpointed stores, map destruction after a checkpoint, repeated attach / mutate / checkpoint / reopen cycles; refusal of truncated, foreign, mismatched and field-corrupted stores without modifying them, of stores mutated after their last checkpoint (also by a writer that died), of a second opener, and of another map instantiation; page-size arithmetic and stores laid out for 64 KB and 1 MB pages; exhaustion at the capacity and at the 2^28-unit handle limits, size overflow, `errno` reporting, `close()` |
 | `artpp_fuzz_map` | differential fuzzer vs `std::map` — every op mirrored on both, full forward/reverse/bound/size agreement; standalone seeded RNG runner (also replays corpus files) |
+| `artpp_fuzz_set` | differential fuzzer vs `std::set`, covering key suffixes packed in the handle; same seeded runner |
+| `artpp_set_smoke` | `artpp::set` basics: the facade over the map with no mapped value |
+| `artpp_set_conformance` | STL contracts for `artpp::set`, and a set attached to a file-backed `line_pool` |
 
 ### Fuzzing
 

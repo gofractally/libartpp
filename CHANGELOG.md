@@ -24,6 +24,14 @@ before 1.0 a minor version may change the API.
 - `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
   an allocator returns a block the tree's handles cannot address.
 
+### Changed
+- `checkpoint()` takes an `artpp::sync_level` and forces nothing to disk by
+  default (`sync_level::none`); `sync_level::flush` writes the image out with
+  `msync` and reports write errors. Durability cost is opt-in.
+
+### Removed
+- `docs/sal2.md`, a design note about another project.
+
 ### Fixed
 - GCC warnings (`-Wreturn-type`, `-Wmaybe-uninitialized`) in `map.hpp`.
 - Undefined behaviour: `memcpy` from a null pointer for an empty key suffix or

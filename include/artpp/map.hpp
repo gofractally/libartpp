@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// map<T> — the headerless adaptive radix map of design4.md.
+// map<T> — the headerless adaptive radix map.
 //
 // Tiers implemented in this v1:
 //   leaf<T>      value_ptr  — suffix (rest of key) + value, one alloc (lazy expansion)
@@ -968,13 +968,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Record this tree as the content of the allocator's persistent image: what a later
       // attach — in this process or another — gets back. Everything the map holds at this
       // point is part of the image; changes made afterwards are not, until the next call.
-      void checkpoint()
+      // `sync` says how hard the image is pushed to its file (see artpp::sync_level): by
+      // default nothing is forced; sync_level::flush writes it out and reports write errors.
+      void checkpoint(sync_level sync = sync_level::none)
       {
          static_assert(has_artpp_image_<Allocator>::value && indexed,
                        "checkpoint needs an allocator with a persistent image (artpp::pool_alloc)");
          static_assert(std::is_trivially_copyable_v<T>,
                        "a persistent image stores T's bytes: T must be trivially copyable");
-         alloc_.artpp_checkpoint(root_.raw(), count_, image_stamp());
+         alloc_.artpp_checkpoint(root_.raw(), count_, image_stamp(), sync);
       }
 
       // Walk the tree, destroy every T and free every node — unless the tree lives in a
@@ -6241,7 +6243,7 @@ namespace detail
       // Attach to the allocator's persistent image / record this set as its content: see
       // map(const Allocator&, attach_t) and map::checkpoint().
       set(const Allocator& a, attach_t) : impl_(value_alloc(a), attach) {}
-      void checkpoint() { impl_.checkpoint(); }
+      void checkpoint(sync_level sync = sync_level::none) { impl_.checkpoint(sync); }
       // Low-level helpers (indexed pools): the root as a raw handle for line_pool::checkpoint,
       // and detach() to release the structure WITHOUT freeing it.
       uint64_t root_handle() const noexcept { return impl_.root_handle(); }

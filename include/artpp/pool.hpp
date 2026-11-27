@@ -25,6 +25,9 @@
 //     store_locked (open elsewhere), std::system_error (a system call failed).
 //   * CLEAN-CLOSE durability only. No write-ahead log, the image is updated in place: a crash
 //     is detected (store_dirty) where possible, never recovered from.
+//   * checkpoint() forces nothing to the file by default (sync_level::none): the operating
+//     system writes the image back when it chooses. sync_level::flush writes it out with
+//     msync and reports write errors; its cost grows with what changed.
 //   * The format is specific to this version of the library.
 //
 // MEASURED vs std::allocator (M5, 5M keys, artpp_pool_ab INTERLEAVED per rep): inserts
@@ -272,9 +275,11 @@ namespace artpp
       size_t file_extent() const noexcept { return 2 * hdr_ + committed_ + tcommitted_; }
 
       // ── persistence (file-backed, clean-close durability) ────────────────────────
-      // checkpoint() flushes the data and then stamps the current carving state + the tree's
-      // root handle and count into the superblock, so a later line_pool(dir) over the same
-      // store restores them and the tree round-trips with no relocation (offset handles).
+      // checkpoint() stamps the current carving state + the tree's root handle and count into
+      // the superblock, so a later line_pool(dir) over the same store restores them and the
+      // tree round-trips with no relocation (offset handles). By default it forces nothing to
+      // the file (sync_level::none); pass sync_level::flush to write the data and headers out
+      // and have write errors reported.
       // Clean-close durability only — see the file header.
       //
       // restored() is true when this open found an image that a checkpoint() call had written;
@@ -294,7 +299,8 @@ namespace artpp
       // that is bound to the store (see bind) — and NO stamp when none is, in which case
       // the image can later be attached by any instantiation. map::checkpoint() always
       // records its own.
-      void checkpoint(uint64_t root, uint64_t count, const image_stamp& stamp)
+      void checkpoint(uint64_t root, uint64_t count, const image_stamp& stamp,
+                      sync_level sync = sync_level::none)
       {
          const image_stamp old_stamp = stamp_;
          const bool        old_has = has_stamp_, old_bound = bound_;
@@ -302,7 +308,7 @@ namespace artpp
          has_stamp_ = bound_ = true;
          try
          {
-            checkpoint(root, count);
+            checkpoint(root, count, sync);
          }
          catch (...)
          {
@@ -322,7 +328,7 @@ namespace artpp
          stamp_     = stamp;
          has_stamp_ = bound_ = true;
       }
-      void checkpoint(uint64_t root, uint64_t count)
+      void checkpoint(uint64_t root, uint64_t count, sync_level sync = sync_level::none)
       {
          if (dead_) throw std::logic_error("artpp::line_pool::checkpoint: the pool is closed");
          if (count == 0)
@@ -330,7 +336,7 @@ namespace artpp
          else if (!root_ok_(root, frontier_, tfrontier_))
             throw std::invalid_argument(
                 "artpp::line_pool::checkpoint: the root handle does not address this pool");
-         if (file_backed()) write_image_(root, count, checkpoints_ + 1);
+         if (file_backed()) write_image_(root, count, checkpoints_ + 1, sync);
          ++checkpoints_;
          uroot_  = root;
          ucount_ = count;
@@ -894,21 +900,27 @@ namespace artpp
          return z ? z : 1;
       }
       // Write the image: the carving state, the root and count, and how many times the user
-      // has checkpointed (0 = the empty image stamped at creation). In this order, each step
-      // flushed (msync MS_SYNC) and checked before the next:
+      // has checkpointed (0 = the empty image stamped at creation). The headers are written
+      // through the shared mapping, which is all sync_level::none does: the operating system
+      // writes the pages back when it chooses, and a later open sees them either way.
+      //
+      // With sync_level::flush, in this order, each step flushed (msync MS_SYNC) and checked
+      // before the next:
       //   1. the data of both regions, up to their frontiers — the tree itself;
       //   2. the `terms` header;
       //   3. the superblock, which is what declares the image valid, clean and of this
       //      generation.
-      // So the superblock never describes data that was not handed to the file first, and a
+      // So the superblock never reaches the file ahead of the data it describes, and a
       // write error (a full disk under a file that grew, an I/O error) surfaces HERE, as an
       // exception from checkpoint(), instead of being lost in the page cache after a close
       // that looked clean. It is still not crash consistency: the image is updated in place.
-      void write_image_(uint64_t root, uint64_t count, uint64_t checkpoints)
+      void write_image_(uint64_t root, uint64_t count, uint64_t checkpoints,
+                        sync_level sync = sync_level::none)
       {
-         if (frontier_ && ::msync(base_, frontier_ * line_bytes, MS_SYNC) != 0)
+         const bool flush = sync == sync_level::flush;
+         if (flush && frontier_ && ::msync(base_, frontier_ * line_bytes, MS_SYNC) != 0)
             os_error_(errno, "msync", dir_ + "/nodes");
-         if (tfrontier_ && ::msync(tbase_, tfrontier_ * term_unit, MS_SYNC) != 0)
+         if (flush && tfrontier_ && ::msync(tbase_, tfrontier_ * term_unit, MS_SYNC) != 0)
             os_error_(errno, "msync", dir_ + "/terms");
          const uint64_t gen = generation_ + 1;
          terms_header*  th  = th_();
@@ -918,7 +930,7 @@ namespace artpp
          th->header_bytes   = hdr_;
          th->store_id       = store_id_;
          th->generation     = gen;
-         if (::msync(tmap_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/terms");
+         if (flush && ::msync(tmap_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/terms");
          superblock* sb   = sb_();
          sb->magic        = MAGIC;
          sb->version      = VERSION;
@@ -954,7 +966,7 @@ namespace artpp
          sb->ucount       = count;
          std::memcpy(sb->free_heads, free_, sizeof(free_));
          std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
-         if (::msync(nbase_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/nodes");
+         if (flush && ::msync(nbase_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/nodes");
          generation_ = gen;
          mark_clean_();
       }
@@ -1208,9 +1220,10 @@ namespace artpp
       bool artpp_retains() const noexcept { return pool && pool->file_backed(); }
       void artpp_released(uint64_t root, uint64_t count) const noexcept { pool->released(root, count); }
       void artpp_bind(const image_stamp& s) const { pool->bind(s); }
-      void artpp_checkpoint(uint64_t root, uint64_t count, const image_stamp& s)
+      void artpp_checkpoint(uint64_t root, uint64_t count, const image_stamp& s,
+                            sync_level sync = sync_level::none)
       {
-         pool->checkpoint(root, count, s);
+         pool->checkpoint(root, count, s, sync);
       }
       std::pair<uint64_t, uint64_t> artpp_attach(const image_stamp& s) const
       {

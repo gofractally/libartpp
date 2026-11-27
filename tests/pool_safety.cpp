@@ -780,6 +780,58 @@ static void a_writer_that_dies_leaves_the_store_marked()
    CHECK(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
    CHECK(open_throws<artpp::store_dirty>(s));
 }
+// checkpoint() takes a sync level. The default, none, forces nothing to the file: the image
+// is recorded through the shared mapping and is what any later open sees, including after
+// the writing process is gone without closing anything. flush writes it out and is the same
+// image. What flush adds — surviving a machine crash, reporting write errors — cannot be
+// observed from a test.
+static void each_sync_level_records_the_same_image()
+{
+   for (const artpp::sync_level level : {artpp::sync_level::none, artpp::sync_level::flush})
+   {
+      temp_store s;
+      {  // through the map, across a clean close
+         artpp::line_pool pool(s.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         for (int i = 0; i < 2000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+         m.checkpoint(level);
+         CHECK(pool.count() == 2000);
+      }
+      {
+         artpp::line_pool pool(s.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         CHECK(pool.restored() && m.size() == 2000 && missing(m, 0, 2000) == 0);
+         for (int i = 2000; i < 2500; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+         pool.checkpoint(m.root_handle(), m.size(), level);  // the low-level call takes it too
+      }
+      std::fflush(nullptr);
+      const pid_t pid = ::fork();  // a writer that checkpoints and is gone without closing
+      CHECK(pid >= 0);
+      if (pid == 0)
+      {
+         auto* pool = new artpp::line_pool(s.c_str());
+         auto* m    = new Map{A{pool}, artpp::attach};
+         for (int i = 2500; i < 3000; ++i) m->insert(key(i), std::uint64_t(i) + 1);
+         m->checkpoint(level);
+         ::_exit(m->size() == 3000 ? 0 : 1);  // no destructors, no close
+      }
+      int status = -1;
+      CHECK(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}, artpp::attach};
+      CHECK(pool.restored() && m.size() == 3000 && missing(m, 0, 3000) == 0);
+   }
+   {  // the default is none
+      temp_store       s;
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}, artpp::attach};
+      m.insert(key(1), 2);
+      m.checkpoint();
+      m.checkpoint(artpp::sync_level::none);
+      pool.checkpoint(m.root_handle(), m.size());
+      CHECK(pool.count() == 1);
+   }
+}
 // A store that was never checkpointed holds nothing that could be lost, so a mutated one is
 // not refused: it reopens as the empty store it still is (#9), and gives its space back.
 static void a_never_checkpointed_store_is_reset_not_refused()
@@ -1407,6 +1459,7 @@ int main()
        {"mutation_after_the_last_checkpoint_is_detected", mutation_after_the_last_checkpoint_is_detected},
        {"each_kind_of_mutation_marks_the_image", each_kind_of_mutation_marks_the_image},
        {"a_writer_that_dies_leaves_the_store_marked", a_writer_that_dies_leaves_the_store_marked},
+       {"each_sync_level_records_the_same_image", each_sync_level_records_the_same_image},
        {"a_never_checkpointed_store_is_reset_not_refused", a_never_checkpointed_store_is_reset_not_refused},
        {"a_change_that_allocates_nothing_is_detected_on_release",
         a_change_that_allocates_nothing_is_detected_on_release},
