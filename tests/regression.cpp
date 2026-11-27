@@ -550,6 +550,14 @@ static void deep_tree_ops(int N)
    n = 0;
    a.for_each_value([&](const V& v) { ++n; bad += !(v == chain_val<V>(int(n))); });
    CHECK(n == size_t(N) && bad == 0);
+   {
+      const auto st = a.debug_stats();  // the census walk: its work stack is on the heap
+      if (artpp::has_mode(M, mode::buckets) || artpp::has_mode(M, mode::adaptive))
+         CHECK(st.terminals <= uint64_t(N));  // keys held in buckets are not counted
+      else
+         CHECK(st.terminals == uint64_t(N));
+      CHECK(st.setlist + st.full + st.fullp + st.c2 + st.c4 + st.c8 + st.setlist16 + st.prefix > 100);
+   }
    auto lb = a.lower_bound(k);  // the deepest key: the directed descent goes all the way down
    CHECK(lb != a.end() && lb.key_bytes() == k);
    CHECK(a.upper_bound(k) == a.end());
@@ -601,6 +609,13 @@ static void regression_deep_tree_small_stack()
    run_on_stack(stack, [](int n) { deep_tree_ops<uint32_t, mode::none>(n); }, N);
    run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::dense_tiers>(n); }, N);
    run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::wide_stems>(n); }, N);
+   // Bucket mode: each burst of the page holding the chain's tail peels off one router, so
+   // the same keys make a tree about one level per two keys deep — and insert used to recurse
+   // once per level (an unoptimized build overflowed this stack after 230 levels). Half the
+   // keys keep the test quick: 3,000 levels is still far more than the stack could carry.
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::buckets>(n); }, N / 2);
+   run_on_stack(stack, [](int n) { deep_tree_ops<std::string, mode::buckets>(n); }, N / 2);
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::adaptive>(n); }, N / 2);
 }
 
 // ── audit #16: blocks the handle cannot address are refused, not truncated ───────

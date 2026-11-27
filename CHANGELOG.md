@@ -43,8 +43,9 @@ before 1.0 a minor version may change the API.
   the destructor and `clear`, `lower_bound` / `upper_bound`, and move
   assignment between unequal allocators no longer recurse; `for_each`,
   `for_each_value` and `operator==` recurse for at most 64 levels. Inserting in
-  `mode::buckets` and `debug_stats()` still recurse once per level; see
-  "Limits and guarantees" (#15).
+  `mode::buckets` and `debug_stats()`, which at first still recursed once per
+  level, are iterative as well: no operation's stack use grows with the depth
+  of the tree (#15).
 - A block whose address does not fit the handle (above 2^48 with the default
   6-byte handle) or that is not aligned as required (128 bytes for nodes) was
   only caught by `assert`; a release build silently truncated the address.

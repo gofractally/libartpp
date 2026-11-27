@@ -937,12 +937,6 @@ namespace detail  // implementation types & node helpers — not part of the pub
          std::string_view key = enc_(k, ks_);
          if (key.size() > max_key_bytes)  // u16 length fields would silently truncate
             throw std::length_error("artpp::map: encoded key exceeds max_key_bytes (65535)");
-         if constexpr (Buckets)  // bucket-mode: terminals are buckets, routers from splits
-         {
-            const bool ins = bkt_put<Assign>(&root_, key, 0, std::forward<VF>(v));
-            count_ += ins;
-            return ins;
-         }
          return insert_descend_<Assign>(key, std::forward<VF>(v));
       }
       // Can a prefix node of `pl` bytes above `nx` live in nx's header cacheline instead?
@@ -993,6 +987,18 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // Iterative descent (mirrors find): walk to the insertion point keeping a
          // pointer to the SLOT that holds `cur`, and write only there. No recursion,
          // no per-level function calls, and pass-through levels do zero writes.
+         //
+         // ONE loop for every mode. mode::buckets differs in exactly two places, both
+         // `if constexpr`: the terminal made for a new branch is a bucket (new_branch_), and
+         // the lazy prefix fusion also runs after a bucket burst. It used to have a recursive
+         // twin (bkt_put) — one call frame per level of a tree that may be max_key_bytes
+         // levels deep, and its own copies of the exception-safety hazards this loop solves
+         // by construction:
+         //
+         // EXCEPTION SAFETY: `*slot` is where the parent (or root_) holds the subtree being
+         // worked on. It is written the moment that subtree's top node is replaced, before
+         // anything else that can throw — a replacement that exists only in a local is one
+         // the parent never hears about, while the node it replaced is already freed.
          packed_ptr* slot   = &root_;
          // Slot of the last prefix node passed. A prefix node directly above a node_full
          // belongs in the full's header cacheline (the dedicated node is only the overflow
@@ -1009,7 +1015,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             packed_ptr cur = *slot;
             if (cur.is_null())
             {
-               *slot = make_value_at(key, depth, std::forward<VF>(v));
+               *slot = new_branch_(key, depth, std::forward<VF>(v));
                ++count_;
                return true;
             }
@@ -1031,7 +1037,29 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   bucket*   b = static_cast<bucket*>(deref_(cur));
                   const int r = bkt_insert_entry<Assign>(b, key.substr(depth), std::forward<VF>(v));
                   if (r >= 0) { count_ += (r == 1); return r == 1; }
-                  *slot = bkt_split(cur);  // overflow → radix; re-descend
+                  // Overflow (v untouched; the key is absent, or the entry would have been
+                  // found before the space check) → burst the page into a router, link it,
+                  // and re-descend from the same slot: the key lands in one of the router's
+                  // buckets, or — a suffix no page can hold — as a plain leaf (new_branch_).
+                  // bkt_split is all-or-nothing, and the router is in *slot before the
+                  // re-descent allocates anything.
+                  *slot = bkt_split(cur);
+                  // Bucket mode: a burst directly under a prefix node may have produced a
+                  // node_full, whose header is the prefix's home — fuse (alloc-free) and
+                  // re-descend from the prefix node's slot, since fusing frees the node that
+                  // `slot` points into.
+                  if constexpr (Buckets)
+                     if (pn_slot && pn_slot->tag() == K::prefix_node)
+                     {
+                        char* P = static_cast<char*>(deref_(*pn_slot));
+                        if (slot == reinterpret_cast<packed_ptr*>(P + 2) && pn_fusable_(pn_plen(P), *slot))
+                        {
+                           depth -= pn_plen(P);
+                           fuse_prefix_node_(pn_slot);
+                           slot    = pn_slot;
+                           pn_slot = nullptr;
+                        }
+                     }
                   continue;
                }
             // Hoist the dominant descend: node_full child slot via the offset table
@@ -1055,7 +1083,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   continue;
                }
                full_set(reinterpret_cast<node_full*>(f), byte,
-                        make_value_at(key, depth + 1, std::forward<VF>(v)));  // node_full never overflows
+                        new_branch_(key, depth + 1, std::forward<VF>(v)));  // node_full never overflows
                ++count_;
                return true;
             }
@@ -1071,7 +1099,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (c < pl)  // fused prefix diverges → split it
                   {
                      *slot = split_pfxd_prefix(cur, key, depth, c, std::forward<VF>(v), [&](auto&& x) {
-                        return make_value_at(key, depth + c + 1, std::forward<decltype(x)>(x));
+                        return new_branch_(key, depth + c + 1, std::forward<decltype(x)>(x));
                      });
                      ++count_;
                      return true;
@@ -1094,7 +1122,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      continue;
                   }
                   full_set(reinterpret_cast<node_full*>(f), byte,
-                           make_value_at(key, depth + 1, std::forward<VF>(v)));
+                           new_branch_(key, depth + 1, std::forward<VF>(v)));
                   ++count_;
                   return true;
                }
@@ -1118,7 +1146,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   *slot = split_leaf<Assign>(cur, key, depth, std::forward<VF>(v), inserted);
                   // Wide-stems: a split just created a router under the parent — if the parent
                   // is now a sparse 2-level chain, fuse it into one wide u16 node.
-                  if constexpr (WideStems)
+                  if constexpr (WideStems && !Buckets)  // bucket mode never formed wide nodes
                      if (inserted && pslot) try_fuse_parent(pslot);
                   count_ += inserted;
                   return inserted;
@@ -1138,7 +1166,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      continue;
                   }
                   *slot = split_prefix(cur, key, depth, c, std::forward<VF>(v), [&](auto&& x) {
-                     return make_value_at(key, depth + c + 1, std::forward<decltype(x)>(x));
+                     return new_branch_(key, depth + c + 1, std::forward<decltype(x)>(x));
                   });
                   ++count_;  // a diverging prefix always inserts
                   return true;
@@ -1154,7 +1182,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      if (c < pl)  // inline prefix diverges -> split it
                      {
                         *slot = split_setlist_prefix(cur, key, depth, c, std::forward<VF>(v), [&](auto&& x) {
-                           return make_value_at(key, depth + c + 1, std::forward<decltype(x)>(x));
+                           return new_branch_(key, depth + c + 1, std::forward<decltype(x)>(x));
                         });
                         ++count_;
                         return true;
@@ -1191,7 +1219,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   // split shape goes external and stays there (re-compacting per insert is
                   // O(n) alloc/free churn that wrecked clustered builds).
                   if (sl_inl_active(s)) sl_externalize_all_(s);  // one-time; throws → strong
-                  packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
+                  packed_ptr lf = new_branch_(key, depth + 1, std::forward<VF>(v));
                   if (setlist_set(s, byte, lf))  // room: in place (prefix untouched)
                   {
                      ++count_;
@@ -1233,7 +1261,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      *slot = restride_u16_to_u8(cur);
                      continue;
                   }
-                  sl16_set(s, q, make_value_at(key, depth + 2, std::forward<VF>(v)));  // room: in place
+                  sl16_set(s, q, new_branch_(key, depth + 2, std::forward<VF>(v)));  // room: in place
                   ++count_;
                   return true;
                }
@@ -1256,7 +1284,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      ++depth;
                      continue;
                   }
-                  packed_ptr lf = make_value_at(key, depth + 1, std::forward<VF>(v));
+                  packed_ptr lf = new_branch_(key, depth + 1, std::forward<VF>(v));
                   build_guard glf{this, &lf};  // grow can throw; don't orphan the new value
                   grow_router_(slot, cur, byte, lf);  // re-anchors *slot across the widen ladder
                   glf.release();
@@ -2924,7 +2952,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       // A fresh single-entry bucket holding (key[at:], val) — bucket mode's new-value branch.
       // A suffix no page could ever hold becomes a plain leaf instead: every descent
-      // (find/iterate/remove/bkt_put) already handles leaf terminals, so correctness is
+      // (find/iterate/remove/insert) already handles leaf terminals, so correctness is
       // mode-independent; only the packing policy is bypassed for these rare giants.
       template <class VF>
       packed_ptr make_bucket_branch(std::string_view key, size_t at, VF&& val)
@@ -2943,6 +2971,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
             throw;
          }
          return pack_(b, K::bucket);
+      }
+      // The terminal an insert creates for a NEW branch holding key[at:]: a one-entry bucket
+      // in bucket mode, a leaf (or an in-handle value) otherwise. The one policy difference
+      // between the modes on the insert path.
+      template <class VF>
+      [[gnu::always_inline]] packed_ptr new_branch_(std::string_view key, size_t at, VF&& val)
+      {
+         if constexpr (Buckets) return make_bucket_branch(key, at, std::forward<VF>(val));
+         else                   return make_value_at(key, at, std::forward<VF>(val));
       }
       // Adaptive collapse: turn the leaf at a deep-narrow split point into a bucket
       // holding the old entry + the new key. Frees the old leaf.
@@ -3284,152 +3321,6 @@ namespace detail  // implementation types & node helpers — not part of the pub
          for (int i = 0; i < n; ++i) v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
          node_free_(b, sizeof(bucket));
          return top;
-      }
-
-      // Recursive bucket-mode insert into the subtree held by `*slot`; returns true iff the
-      // key was added. Terminals are buckets; routers reused from the radix family. `val` is
-      // MOVED to its single resting place (each path consumes it exactly once — on overflow
-      // bkt_insert_entry leaves it intact, so the re-pass after the split still moves a live
-      // value).
-      // `*slot` is where the parent (or root_) holds this subtree, and it is written the
-      // moment the subtree's top node is replaced — before anything else that can throw. The
-      // tree is therefore whole whenever an exception leaves: a replacement that exists only
-      // in a local is one the parent never hears about, and the node it replaced is freed.
-      template <bool Assign, class VF>
-      bool bkt_put(packed_ptr* slot, std::string_view key, size_t depth, VF&& val)
-      {
-         const packed_ptr node = *slot;
-         if (node.is_null())
-         {
-            *slot = make_bucket_branch(key, depth, std::forward<VF>(val));
-            return true;
-         }
-         switch (node.tag())
-         {
-            case K::bucket:
-            {
-               bucket* b = static_cast<bucket*>(deref_(node));
-               if (bkt_fits(key.size() - depth))
-               {
-                  const int r = bkt_insert_entry<Assign>(b, key.substr(depth), std::forward<VF>(val));
-                  if (r >= 0) return r == 1;
-               }
-               // overflow → radix; an over-cap suffix re-enters and lands as a leaf via
-               // make_bucket_branch (splitting can never make it fit a page). The router
-               // replaces the page in *slot FIRST: the re-pass allocates, and a failure
-               // there must find the parent pointing at the router, not at the freed page.
-               *slot = bkt_split(node);
-               return bkt_put<Assign>(slot, key, depth, std::forward<VF>(val));  // val untouched on overflow
-            }
-            case K::value_ptr:
-            case K::value_inline:
-            {
-               // an over-cap-suffix terminal stored as a plain leaf (see make_bucket_branch):
-               // the radix leaf splitter handles collision/overwrite; in-range keys form
-               // buckets again beneath the split via this function's router arms.
-               bool ins = false;
-               *slot    = split_leaf<Assign>(node, key, depth, std::forward<VF>(val), ins);
-               return ins;
-            }
-            case K::prefix_node:
-            {
-               char*          P  = static_cast<char*>(deref_(node));
-               const uint16_t pl = pn_plen(P);
-               std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
-               const size_t     c = lcp(PP, key.substr(depth));
-               if (c == PP.size())
-               {
-                  const bool ins = bkt_put<Assign>(reinterpret_cast<packed_ptr*>(P + 2), key, depth + c,
-                                                   std::forward<VF>(val));
-                  // Lazy fusion, as in insert_: only after a key was ADDED below (an assignment
-                  // to a present key must not restructure), and alloc-free — nothing can throw
-                  // between freeing P and handing the fused node back to the parent slot.
-                  if (ins) fuse_prefix_node_(slot);
-                  return ins;
-               }
-               *slot = split_prefix(node, key, depth, c, std::forward<VF>(val), [&](auto&& x) {
-                  return make_bucket_branch(key, depth + c + 1, std::forward<decltype(x)>(x));
-               });
-               return true;
-            }
-            case K::setlist_u8:
-            {
-               setlist*       s  = static_cast<setlist*>(deref_(node));
-               const unsigned pl = s->rh.hdr.prefix_len;
-               if (pl)
-               {
-                  const size_t c = lcp(std::string_view(reinterpret_cast<char*>(s->prefix), pl),
-                                       key.substr(depth));
-                  if (c < pl)
-                  {
-                     *slot = split_setlist_prefix(node, key, depth, c, std::forward<VF>(val), [&](auto&& x) {
-                        return make_bucket_branch(key, depth + c + 1, std::forward<decltype(x)>(x));
-                     });
-                     return true;
-                  }
-                  depth += pl;
-               }
-               if (depth == key.size()) return set_or_update_term<Assign>(&s->rh, std::forward<VF>(val));
-               const uint8_t byte = uint8_t(key[depth]);
-               const int     i    = setlist_index(s, byte);
-               if (i >= 0)
-               {
-                  // An inline-leaf child must become a real leaf before descent: bkt_put (like
-                  // split_leaf below) treats the branch slot as an external value_ptr handle, so
-                  // an inline tail-offset would be mis-deref'd. Mirrors insert_'s setlist arm.
-                  if (sl_is_inline(s, i))
-                  {
-                     if (sl_inline_present_<Assign>(s, i, key.substr(depth + 1), std::forward<VF>(val)))
-                        return false;  // present key: assigned in place, the line is untouched
-                     sl_externalize_(s, i);  // throws → strong: unchanged
-                  }
-                  return bkt_put<Assign>(&s->branch[i], key, depth + 1, std::forward<VF>(val));
-               }
-               // setlist_set shifts branch[] and would desync the inl bits — flatten any inline
-               // children first (one-time; the setlist stays external thereafter). Mirrors insert_.
-               if (sl_inl_active(s)) sl_externalize_all_(s);  // throws → strong
-               packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
-               if (setlist_set(s, byte, child)) return true;
-               // Full: grow through the widen ladder. grow_router_ keeps *slot valid at every
-               // step — the inline prefix is lifted into a prefix node BEFORE it is cleared, and
-               // *slot (or that prefix node) is re-pointed after each widen, since a widen frees
-               // the node it replaces — so a failure anywhere leaves every key in place.
-               build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
-               grow_router_(slot, node, byte, child);
-               gc.release();
-               return true;
-            }
-            case K::pfxd:  // consume the fused prefix, then route as the dense default
-            {
-               void*          n  = deref_(node);
-               const unsigned pl = pfxd_plen(n);
-               const size_t   c  = lcp(
-                   std::string_view(reinterpret_cast<const char*>(pfxd_pfx(n)), pl),
-                   key.substr(depth));
-               if (c < pl)
-               {
-                  *slot = split_pfxd_prefix(node, key, depth, c, std::forward<VF>(val), [&](auto&& x) {
-                     return make_bucket_branch(key, depth + c + 1, std::forward<decltype(x)>(x));
-                  });
-                  return true;
-               }
-               depth += pl;
-               [[fallthrough]];
-            }
-            default:  // c2 / c4 / c8 / node_full — no inline prefix
-            {
-               router_hdr* rh = static_cast<router_hdr*>(deref_(node));
-               if (depth == key.size()) return set_or_update_term<Assign>(rh, std::forward<VF>(val));
-               const uint8_t byte = uint8_t(key[depth]);
-               if (packed_ptr* cs = router_find_slot(node, byte))
-                  return bkt_put<Assign>(cs, key, depth + 1, std::forward<VF>(val));
-               packed_ptr child = make_bucket_branch(key, depth + 1, std::forward<VF>(val));
-               build_guard gc{this, &child};  // widen() can throw; don't orphan the new bucket
-               grow_router_(slot, node, byte, child);  // re-anchors *slot after every widen
-               gc.release();
-               return true;
-            }
-         }
       }
 
      private:
@@ -4175,21 +4066,62 @@ namespace detail  // implementation types & node helpers — not part of the pub
          uint64_t full_lt48 = 0, full_48_96 = 0, full_96_160 = 0, full_160_192 = 0, full_ge192 = 0;
          uint64_t full_nbr_sum = 0, cn_nbr_sum = 0;
       };
-      // Returns the number of terminals in cur's subtree (used to weight collapse_saved).
-      // routers_above = routers already on the path; parent_noterm_router = the parent is a
-      // term-less router (so a u16 node could fuse this router into it).
-      uint64_t dbg_walk(packed_ptr cur, dbg_counts& d, int depth, int routers_above,
-                        bool parent_noterm_router) const
+      // The census walk. Each router contributes the number of terminals beneath it (to
+      // weight collapse_saved), so the walk is post-order: a router's frame stays on the
+      // work stack until its children are done. ITERATIVE — the stack is a heap vector, so
+      // the depth of the tree (up to max_key_bytes levels) costs heap, not call stack; it
+      // holds at most one frame per pending sibling per level.
+      //   routers_above        = routers on the path to the node (≈ cacheline misses);
+      //   parent_noterm_router = the parent is a term-less router, so a u16 node could
+      //                          fuse this router into it.
+      struct dbg_frame
       {
-         if (cur.is_null())
-            return 0;
-         switch (cur.tag())
+         packed_ptr node;
+         int        depth, routers_above;
+         bool       parent_noterm_router, entered;
+         size_t     parent;  // index of the frame that receives this subtree's terminal count
+         uint64_t   sub;     // terminals found beneath this node so far
+      };
+      dbg_counts debug_stats() const
+      {
+         dbg_counts             d;
+         std::vector<dbg_frame> st;
+         static constexpr size_t no_parent = ~size_t(0);
+         // A terminal is counted on the spot; a node with something below it is queued.
+         auto visit = [&](packed_ptr cur, int depth, int routers_above, bool pnr, size_t parent) {
+            switch (cur.tag())
+            {
+               case K::null:
+               case K::bucket:  // the census doesn't descend buckets
+                  return;
+               case K::value_ptr:
+               case K::value_inline:
+                  ++(cur.tag() == K::value_ptr ? d.leaf : d.inl);
+                  ++d.terminals;
+                  d.sum_depth += depth;
+                  d.router_hops += routers_above;
+                  if (parent != no_parent) ++st[parent].sub;
+                  return;
+               default:
+                  st.push_back(dbg_frame{cur, depth, routers_above, pnr, false, parent, 0});
+                  return;
+            }
+         };
+         visit(root_, 0, 0, false, no_parent);
+         while (!st.empty())
          {
-            case K::value_ptr:    ++d.leaf; ++d.terminals; d.sum_depth += depth;
-                                  d.router_hops += routers_above; return 1;
-            case K::value_inline: ++d.inl;  ++d.terminals; d.sum_depth += depth;
-                                  d.router_hops += routers_above; return 1;
-            case K::prefix_node:
+            const size_t    me = st.size() - 1;
+            const dbg_frame f  = st[me];  // by value: visit() may reallocate the vector
+            if (f.entered)  // every child is done: hand the count up
+            {
+               if (f.node.tag() != K::prefix_node && f.parent_noterm_router) d.collapse_saved += f.sub;
+               if (f.parent != no_parent) st[f.parent].sub += f.sub;
+               st.pop_back();
+               continue;
+            }
+            st[me].entered = true;
+            const packed_ptr cur = f.node;
+            if (cur.tag() == K::prefix_node)
             {
                ++d.prefix;
                const uint16_t pl = pn_plen(static_cast<char*>(deref_(cur)));
@@ -4199,47 +4131,50 @@ namespace detail  // implementation types & node helpers — not part of the pub
                d.pfx_le16 += (pl <= 16);
                // A prefix_node breaks a router→router chain (the child can't fuse into the
                // parent across a multi-byte prefix), so parent_noterm_router resets to false.
-               return dbg_walk(pn_next<Ptr>(static_cast<char*>(deref_(cur))), d, depth + 1,
-                               routers_above, false);
+               visit(pn_next<Ptr>(static_cast<char*>(deref_(cur))), f.depth + 1, f.routers_above, false, me);
+               continue;
             }
-            case K::setlist_u8:   ++d.setlist; break;
-            case K::setlist_u16:  ++d.setlist16; break;
-            case K::c2:           ++d.c2; break;
-            case K::c4:           ++d.c4; break;
-            case K::c8:           ++d.c8; break;
-            case K::node_full:    ++d.full; break;
-            case K::pfxd:         ++d.fullp; break;  // full router with a fused in-header prefix
-            case K::bucket:       return 0;  // census doesn't descend buckets
-            case K::null:         return 0;  // exhaustive (no default)
-         }
-         const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-         const bool        noterm = rh->term.is_null();
-         {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode branches
-            const unsigned nb = rh->hdr.nbranch;
-            const K        kk = cur.tag();
-            if (kk == K::node_full || kk == K::pfxd)
+            switch (cur.tag())
             {
-               d.full_nbr_sum += nb;
-               d.full_lt48 += (nb < 48);
-               d.full_48_96 += (nb >= 48 && nb < 96);
-               d.full_96_160 += (nb >= 96 && nb < 160);
-               d.full_160_192 += (nb >= 160 && nb < 192);
-               d.full_ge192 += (nb >= 192);
+               case K::setlist_u8:   ++d.setlist; break;
+               case K::setlist_u16:  ++d.setlist16; break;
+               case K::c2:           ++d.c2; break;
+               case K::c4:           ++d.c4; break;
+               case K::c8:           ++d.c8; break;
+               case K::node_full:    ++d.full; break;
+               case K::pfxd:         ++d.fullp; break;  // full router with a fused in-header prefix
+               // exhaustive (no default): visit() queues routers and prefix nodes only
+               case K::null: case K::value_ptr: case K::value_inline: case K::bucket: case K::prefix_node:
+                  assert(false && "not queued");
+                  break;
             }
-            else if (kk == K::c2 || kk == K::c4 || kk == K::c8)
-               d.cn_nbr_sum += nb;
+            const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
+            const bool        noterm = rh->term.is_null();
+            {  // occupancy census (debug-only): bucket fulls by fanout, tally cnode branches
+               const unsigned nb = rh->hdr.nbranch;
+               const K        kk = cur.tag();
+               if (kk == K::node_full || kk == K::pfxd)
+               {
+                  d.full_nbr_sum += nb;
+                  d.full_lt48 += (nb < 48);
+                  d.full_48_96 += (nb >= 48 && nb < 96);
+                  d.full_96_160 += (nb >= 96 && nb < 160);
+                  d.full_160_192 += (nb >= 160 && nb < 192);
+                  d.full_ge192 += (nb >= 192);
+               }
+               else if (kk == K::c2 || kk == K::c4 || kk == K::c8)
+                  d.cn_nbr_sum += nb;
+            }
+            if (f.parent_noterm_router) ++d.collapsible;
+            visit(rh->term, f.depth + 1, f.routers_above + 1, false, me);
+            router_for_each(cur, [&](uint8_t, packed_ptr br) {
+               visit(br, f.depth + 1, f.routers_above + 1, noterm, me);
+            });
+            // If this router fuses up into its (term-less) parent, every terminal beneath it
+            // loses one router hop — added when the frame is popped, once `sub` is complete.
          }
-         if (parent_noterm_router) ++d.collapsible;
-         uint64_t sub = dbg_walk(rh->term, d, depth + 1, routers_above + 1, false);
-         router_for_each(cur, [&](uint8_t, packed_ptr br) {
-            sub += dbg_walk(br, d, depth + 1, routers_above + 1, noterm);
-         });
-         // If this router fuses up into its (term-less) parent, every terminal beneath it
-         // loses one router hop.
-         if (parent_noterm_router) d.collapse_saved += sub;
-         return sub;
+         return d;
       }
-      dbg_counts debug_stats() const { dbg_counts d; dbg_walk(root_, d, 0, 0, false); return d; }
 
      private:
       // ── leaf<T> layout: [u16 suffix_len][u16 pfx_field][pad to alignof(T)][T value][key bytes] ─
