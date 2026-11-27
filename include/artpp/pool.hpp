@@ -41,6 +41,7 @@
 
 #include <fcntl.h>
 #include <time.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -129,6 +130,12 @@ namespace artpp
    // (the writer closed without one, or died). The superblock describes a tree that the pages
    // no longer hold; there is nothing to repair it from.
    class store_dirty : public store_error
+   {
+     public:
+      using store_error::store_error;
+   };
+   // The store is open in another line_pool, in this process or another one.
+   class store_locked : public store_error
    {
      public:
       using store_error::store_error;
@@ -605,6 +612,17 @@ namespace artpp
                os_error_(errno, "open", np);
             if (tfd_ < 0 && (tfd_ = ::open(tp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0)
                os_error_(errno, "open", tp);
+         }
+         // One pool per store: an advisory exclusive lock on `nodes`, held until the descriptor
+         // is closed (also by the death of the process). Taken before anything is read, so the
+         // validation below sees a store no one else is writing.
+         while (::flock(nfd_, LOCK_EX | LOCK_NB) != 0)
+         {
+            if (errno == EINTR) continue;
+            if (errno == EWOULDBLOCK)
+               throw store_locked("artpp::line_pool: " + dir_ +
+                                  ": the store is open in another line_pool (this process or another)");
+            os_error_(errno, "flock", np);
          }
          const uint64_t nsz = uint64_t(file_size_(nfd_, np, dir_));
          const uint64_t tsz = uint64_t(file_size_(tfd_, tp, dir_));

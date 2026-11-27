@@ -135,6 +135,10 @@ before 1.0 a minor version may change the API.
   A store that was never checkpointed is reset to empty instead.
   `line_pool::dirty()` reports the state. The flag costs the allocation path
   no branch and no store (#10).
+- File-backed `line_pool`: nothing stopped two pools, in one process or in
+  two, from opening the same store and overwriting each other's nodes. The
+  pool now holds an advisory exclusive lock (`flock`) on the store while it is
+  open; a second opener gets `artpp::store_locked` (#10).
 
 ### Known issues
 - Open bugs from the pre-release audit: #10 and #17 (file-backed

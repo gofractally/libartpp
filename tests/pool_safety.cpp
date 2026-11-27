@@ -795,6 +795,60 @@ static void a_change_that_allocates_nothing_is_detected_on_release()
    }
 }
 
+// ── #10: one store, one pool at a time ──────────────────────────────────────────────────
+// Two pools over one store each keep their own frontier and free lists and overwrite each
+// other's nodes. The second opener is refused, in this process or another, until the first
+// has closed; being refused disturbs neither the store nor the pool that holds it.
+static void a_second_opener_is_refused_while_the_first_is_open()
+{
+   temp_store s;
+   build_store(s, 200);
+   {
+      artpp::line_pool first(s.c_str());
+      Map              m{A{&first}, artpp::attach};
+      CHECK(open_throws<artpp::store_locked>(s));  // same process
+      std::fflush(nullptr);
+      const pid_t pid = ::fork();  // another process
+      CHECK(pid >= 0);
+      if (pid == 0)
+      {
+         int rc = 1;
+         try
+         {
+            new artpp::line_pool(s.c_str());
+            rc = 2;  // opened: wrong
+         }
+         catch (const artpp::store_locked&)
+         {
+            rc = 0;
+         }
+         catch (...)
+         {
+            rc = 3;
+         }
+         ::_exit(rc);
+      }
+      int status = -1;
+      CHECK(::waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+      CHECK(WEXITSTATUS(status) == 0);
+      for (int i = 200; i < 400; ++i) m.insert(key(i), std::uint64_t(i) + 1);  // the holder carries on
+      m.checkpoint();
+   }
+   CHECK(store_is_intact(s, 400));  // closed: the lock is gone with it
+   {  // a store being created is locked from the start as well
+      temp_store       fresh;
+      artpp::line_pool first(fresh.c_str());
+      CHECK(open_throws<artpp::store_locked>(fresh));
+   }
+   {  // and a refused open (for any reason) does not keep the lock
+      temp_store bad;
+      build_store(bad, 10);
+      CHECK(::truncate(bad.file("terms").c_str(), 100) == 0);
+      CHECK(open_throws<artpp::store_corrupt>(bad));
+      CHECK(open_throws<artpp::store_corrupt>(bad));  // not store_locked
+   }
+}
+
 int main()
 {
    struct test_case
@@ -823,6 +877,8 @@ int main()
        {"a_never_checkpointed_store_is_reset_not_refused", a_never_checkpointed_store_is_reset_not_refused},
        {"a_change_that_allocates_nothing_is_detected_on_release",
         a_change_that_allocates_nothing_is_detected_on_release},
+       {"a_second_opener_is_refused_while_the_first_is_open",
+        a_second_opener_is_refused_while_the_first_is_open},
    };
    for (const test_case& c : cases)
    {
