@@ -450,6 +450,19 @@ cache across a clean reopen.
   (`std::allocator` and `std::pmr::polymorphic_allocator` do). `alignof(T) > 128`,
   or `alignof(T) > 16` with a `line_pool` allocator (its terminal region is
   16-byte granular), is rejected at compile time.
+- **Stack use** — a tree can be as deep as its longest key: keys `a`, `aa`,
+  `aaa`, … build one level per byte, up to 65,535. Depth costs heap, not stack,
+  for everything on this list: `find` / `contains` / `insert` / `emplace` /
+  `update` / `erase` (loops), iterators and `lower_bound` / `upper_bound`
+  (heap-backed descent stack), `clear` and the destructor (constant stack, no
+  allocation), and move assignment between unequal allocators (heap work
+  list). `for_each`, `for_each_value` and `operator==` recurse for the first
+  64 levels and hand anything deeper to the iterator: at most about 13 KB of
+  stack in an optimized build, about 100 KB unoptimized. Two operations still
+  recurse once per tree level — roughly 180 bytes per level optimized, several
+  times that unoptimized: **`insert` / `emplace` in `mode::buckets`**, and the
+  diagnostic `debug_stats()`. Give those a stack sized for your longest
+  nested-key chain, or avoid `mode::buckets` for such key sets.
 - **Exception safety** — mutating operations provide the basic guarantee with
   **zero leaks** (fault-injection-tested: every allocation point swept, leak
   and double-destroy counters asserted). Single-leaf inserts and the

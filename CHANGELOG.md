@@ -37,6 +37,12 @@ before 1.0 a minor version may change the API.
   Leaves for such types are now allocated in `alignof(T)`-aligned units;
   alignments the storage cannot provide (above 128, or above 16 with
   `line_pool`) fail a `static_assert` (#14).
+- Stack overflow on deep trees (long keys that are prefixes of one another):
+  the destructor and `clear`, `lower_bound` / `upper_bound`, and move
+  assignment between unequal allocators no longer recurse; `for_each`,
+  `for_each_value` and `operator==` recurse for at most 64 levels. Inserting in
+  `mode::buckets` and `debug_stats()` still recurse once per level; see
+  "Limits and guarantees" (#15).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in

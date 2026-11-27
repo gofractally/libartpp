@@ -2011,135 +2011,144 @@ namespace detail  // implementation types & node helpers — not part of the pub
          // next sibling after an all-less subtree). `upper`: strict (first key > key).
          bool descend_lb_(packed_ptr cur, std::string_view key, size_t depth, bool upper)
          {
-            const K k = cur.tag();
-            if (k == K::value_ptr)
+            for (;;)  // a loop, not recursion: the path may be max_key_bytes levels deep
             {
-               const char*      L = static_cast<const char*>(deref_term_(cur));
-               std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
-               const int        cmp = S.compare(key.substr(depth));
-               if (upper ? cmp > 0 : cmp >= 0) return descend_(cur, 0);  // qualifies → position
-               return false;                                            // < target → seek_ from parent
-            }
-            if (k == K::value_inline)
-            {
-               if constexpr (!HasValue)  // SET: the handle packs a suffix; compare like a leaf
+               const K k = cur.tag();
+               if (k == K::value_ptr)
                {
-                  const int cmp = suffix_of_inline(cur).compare(key.substr(depth));
+                  const char*      L = static_cast<const char*>(deref_term_(cur));
+                  std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
+                  const int        cmp = S.compare(key.substr(depth));
                   if (upper ? cmp > 0 : cmp >= 0) return descend_(cur, 0);  // qualifies → position
                   return false;                                            // < target → seek_ from parent
                }
-               // map: stored key == path (empty suffix). Qualifies only for lower_bound when
-               // the target ends here exactly (path == target).
-               if (!upper && depth == key.size()) return descend_(cur, 0);
-               return false;
-            }
-            if constexpr (Buckets || Adaptive)  // buckets exist only under these modes
-               if (k == K::bucket)
+               if (k == K::value_inline)
                {
-                  bucket* b = static_cast<bucket*>(deref_(cur));
-                  const std::string_view R = key.substr(depth);
-                  int                    i = 0;
-                  for (; i < b->nent; ++i)  // index order is suffix order: first >= / > R
+                  if constexpr (!HasValue)  // SET: the handle packs a suffix; compare like a leaf
                   {
-                     const char*      e = bkt_entry(b, i);
-                     std::string_view S(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
-                     const int        cmp = S.compare(R);
-                     if (upper ? cmp > 0 : cmp >= 0) break;
+                     const int cmp = suffix_of_inline(cur).compare(key.substr(depth));
+                     if (upper ? cmp > 0 : cmp >= 0) return descend_(cur, 0);  // qualifies → position
+                     return false;                                            // < target → seek_ from parent
                   }
-                  stk_.push_back(Frame{cur, i, 0, 0});  // seek_ yields entry i (or pops if i==nent)
+                  // map: stored key == path (empty suffix). Qualifies only for lower_bound when
+                  // the target ends here exactly (path == target).
+                  if (!upper && depth == key.size()) return descend_(cur, 0);
                   return false;
                }
-            if (k == K::prefix_node)
-            {
-               const char*      P = static_cast<const char*>(deref_(cur));
-               std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pn_plen(P));
-               std::string_view R = key.substr(depth);
-               const size_t     c = lcp(PP, R);
-               if (c == PP.size())  // prefix matched → descend the single child
+               if constexpr (Buckets || Adaptive)  // buckets exist only under these modes
+                  if (k == K::bucket)
+                  {
+                     bucket* b = static_cast<bucket*>(deref_(cur));
+                     const std::string_view R = key.substr(depth);
+                     int                    i = 0;
+                     for (; i < b->nent; ++i)  // index order is suffix order: first >= / > R
+                     {
+                        const char*      e = bkt_entry(b, i);
+                        std::string_view S(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
+                        const int        cmp = S.compare(R);
+                        if (upper ? cmp > 0 : cmp >= 0) break;
+                     }
+                     stk_.push_back(Frame{cur, i, 0, 0});  // seek_ yields entry i (or pops if i==nent)
+                     return false;
+                  }
+               if (k == K::prefix_node)
                {
-                  stk_.push_back(Frame{cur, 1, 0, 0});
-                  return descend_lb_(pn_next<Ptr>(const_cast<char*>(P)), key, depth + c, upper);
-               }
-               if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c]))
-               {
-                  descend_(cur, 0);  // subtree > target → leftmost
+                  const char*      P = static_cast<const char*>(deref_(cur));
+                  std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pn_plen(P));
+                  std::string_view R = key.substr(depth);
+                  const size_t     c = lcp(PP, R);
+                  if (c == PP.size())  // prefix matched → descend the single child
+                  {
+                     stk_.push_back(Frame{cur, 1, 0, 0});
+                     cur = pn_next<Ptr>(const_cast<char*>(P));
+                     depth += c;
+                     continue;
+                  }
+                  if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c]))
+                  {
+                     descend_(cur, 0);  // subtree > target → leftmost
+                     return false;
+                  }
+                  stk_.push_back(Frame{cur, 1, 0, 0});  // subtree < target → pop to parent's next
                   return false;
                }
-               stk_.push_back(Frame{cur, 1, 0, 0});  // subtree < target → pop to parent's next
-               return false;
-            }
-            if (k == K::setlist_u16)  // wide router: position on the 2-byte stem lower-bound
-            {
-               const setlist16* s = static_cast<const setlist16*>(deref_(cur));
-               if (depth == key.size())  // key ends here: lower yields term then stems; upper stems only
+               if (k == K::setlist_u16)  // wide router: position on the 2-byte stem lower-bound
                {
+                  const setlist16* s = static_cast<const setlist16*>(deref_(cur));
+                  if (depth == key.size())  // key ends here: lower yields term then stems; upper stems only
+                  {
+                     stk_.push_back(Frame{cur, upper ? 0 : -1, 0, 0});
+                     return false;
+                  }
+                  // <2 bytes left: pad the missing low byte with 0 → first stem with hi >= key[depth]
+                  const uint16_t q = (key.size() - depth < 2)
+                                         ? uint16_t(uint16_t(uint8_t(key[depth])) << 8)
+                                         : uint16_t(uint16_t(uint8_t(key[depth])) << 8 | uint8_t(key[depth + 1]));
+                  const int lb = sl16_lb(s, q);
+                  if (key.size() - depth >= 2 && lb < s->rh.hdr.nbranch && s->stems[lb] == q)
+                  {
+                     stk_.push_back(Frame{cur, lb + 1, 0, 0});  // exact stem → recurse; resume after it
+                     cur = s->branch[lb];
+                     depth += 2;
+                     continue;
+                  }
+                  stk_.push_back(Frame{cur, lb, 0, 0});  // seek_ yields stems from the lower-bound index
+                  return false;
+               }
+               // routers (setlist / c2 / c4 / c8 / node_full / pfxd)
+               const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
+               if ((k == K::setlist_u8 || k == K::pfxd) && rh->hdr.prefix_len)
+               {
+                  const uint8_t* pb = k == K::pfxd ? pfxd_pfx(rh)
+                                                   : static_cast<const setlist*>(deref_(cur))->prefix;
+                  std::string_view PP(reinterpret_cast<const char*>(pb), rh->hdr.prefix_len);
+                  std::string_view R = key.substr(depth);
+                  const size_t     c = lcp(PP, R);
+                  if (c < PP.size())
+                  {
+                     if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c])) { descend_(cur, 0); return false; }
+                     stk_.push_back(Frame{cur, 256, 0, 0});  // subtree < target → pop router
+                     return false;
+                  }
+                  depth += PP.size();
+               }
+               if (depth == key.size())  // key ends at this router
+               {
+                  // lower: term (== key) then children (>). upper: skip term, children only.
                   stk_.push_back(Frame{cur, upper ? 0 : -1, 0, 0});
                   return false;
                }
-               // <2 bytes left: pad the missing low byte with 0 → first stem with hi >= key[depth]
-               const uint16_t q = (key.size() - depth < 2)
-                                      ? uint16_t(uint16_t(uint8_t(key[depth])) << 8)
-                                      : uint16_t(uint16_t(uint8_t(key[depth])) << 8 | uint8_t(key[depth + 1]));
-               const int lb = sl16_lb(s, q);
-               if (key.size() - depth >= 2 && lb < s->rh.hdr.nbranch && s->stems[lb] == q)
+               const uint8_t byte = uint8_t(key[depth]);
+               // inline-leaf child of a setlist: a terminal reached here (needs parent context).
+               // Mirror the value_ptr arm — push the resume frame, position iff it qualifies.
+               if (cur.tag() == K::setlist_u8)
                {
-                  stk_.push_back(Frame{cur, lb + 1, 0, 0});  // exact stem → recurse; resume after it
-                  return descend_lb_(s->branch[lb], key, depth + 2, upper);
-               }
-               stk_.push_back(Frame{cur, lb, 0, 0});  // seek_ yields stems from the lower-bound index
-               return false;
-            }
-            // routers (setlist / c2 / c4 / c8 / node_full / pfxd)
-            const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
-            if ((k == K::setlist_u8 || k == K::pfxd) && rh->hdr.prefix_len)
-            {
-               const uint8_t* pb = k == K::pfxd ? pfxd_pfx(rh)
-                                                : static_cast<const setlist*>(deref_(cur))->prefix;
-               std::string_view PP(reinterpret_cast<const char*>(pb), rh->hdr.prefix_len);
-               std::string_view R = key.substr(depth);
-               const size_t     c = lcp(PP, R);
-               if (c < PP.size())
-               {
-                  if (c == R.size() || uint8_t(PP[c]) > uint8_t(R[c])) { descend_(cur, 0); return false; }
-                  stk_.push_back(Frame{cur, 256, 0, 0});  // subtree < target → pop router
-                  return false;
-               }
-               depth += PP.size();
-            }
-            if (depth == key.size())  // key ends at this router
-            {
-               // lower: term (== key) then children (>). upper: skip term, children only.
-               stk_.push_back(Frame{cur, upper ? 0 : -1, 0, 0});
-               return false;
-            }
-            const uint8_t byte = uint8_t(key[depth]);
-            // inline-leaf child of a setlist: a terminal reached here (needs parent context).
-            // Mirror the value_ptr arm — push the resume frame, position iff it qualifies.
-            if (cur.tag() == K::setlist_u8)
-            {
-               const setlist* s = static_cast<const setlist*>(deref_(cur));
-               if (s->inl & 0x80)
-               {
-                  const int i = setlist_index(s, byte);
-                  if (i >= 0 && map::sl_is_inline(s, i))
+                  const setlist* s = static_cast<const setlist*>(deref_(cur));
+                  if (s->inl & 0x80)
                   {
-                     stk_.push_back(Frame{cur, byte + 1, 0, 0});  // seek_/retreat_ resume here
-                     const char*      L = t_->sl_inline_leaf(s, i);
-                     std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
-                     const int        cmp = S.compare(key.substr(depth + 1));
-                     if (upper ? cmp > 0 : cmp >= 0) { emit_inline_leaf_(s, i, 0); return true; }
-                     return false;  // < target → seek_ from the frame yields the bound
+                     const int i = setlist_index(s, byte);
+                     if (i >= 0 && map::sl_is_inline(s, i))
+                     {
+                        stk_.push_back(Frame{cur, byte + 1, 0, 0});  // seek_/retreat_ resume here
+                        const char*      L = t_->sl_inline_leaf(s, i);
+                        std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
+                        const int        cmp = S.compare(key.substr(depth + 1));
+                        if (upper ? cmp > 0 : cmp >= 0) { emit_inline_leaf_(s, i, 0); return true; }
+                        return false;  // < target → seek_ from the frame yields the bound
+                     }
                   }
                }
+               const packed_ptr child = router_child_(cur, byte);
+               if (!child.is_null())  // exact child → follow the key deeper
+               {
+                  stk_.push_back(Frame{cur, byte + 1, 0, 0});
+                  cur = child;
+                  ++depth;
+                  continue;
+               }
+               stk_.push_back(Frame{cur, byte, 0, 0});  // no exact child → seek_ takes next-greater leftmost
+               return false;
             }
-            const packed_ptr child = router_child_(cur, byte);
-            if (!child.is_null())  // exact child → follow the key deeper
-            {
-               stk_.push_back(Frame{cur, byte + 1, 0, 0});
-               return descend_lb_(child, key, depth + 1, upper);
-            }
-            stk_.push_back(Frame{cur, byte, 0, 0});  // no exact child → seek_ takes next-greater leftmost
-            return false;
          }
 
          // ── reverse stepping ───────────────────────────────────────────────────
@@ -2506,6 +2515,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
          struct end_tag
          {
          };
+        private:
+         friend map;  // for_each's deep-subtree fallback drives an iterator over a subtree
+         const T& val_ref_() const noexcept  // value() without the HasValue constraint
+         {
+            if constexpr (inlineable) return val_;
+            else return *val_;
+         }
+
+        public:
          const_iterator() = default;
          // end() WITH tree identity: compares equal to any end iterator, and --it
          // re-seats at the rightmost key (std::map's --end() / rbegin()).
@@ -3811,9 +3829,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // The structural walk: 1 equal, 0 not equal, -1 representations diverged (content
       // undecided — caller falls back). Both nodes were reached along IDENTICAL paths, so
       // any byte-level divergence in prefixes/edges/suffixes means the key sets differ.
-      int eq_walk_(packed_ptr a, const map& tb, packed_ptr b) const
+      int eq_walk_(packed_ptr a, const map& tb, packed_ptr b, unsigned lvl = 0) const
       {
          if (a.is_null() || b.is_null()) return (a.is_null() == b.is_null()) ? 1 : 0;
+         // Bounded recursion: past walk_recursion_max levels report "undecided", which sends
+         // the caller to the iterator-based sequence compare (heap stack, any depth).
+         if (lvl > walk_recursion_max) return -1;
          const K ka = a.tag(), kb = b.tag();
          if (ka != kb)
          {
@@ -3850,7 +3871,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (pa != pb)
                   return -1;  // same bytes so far, carved differently → undecided
                return eq_walk_(pn_next<Ptr>(const_cast<char*>(A)), tb,
-                               pn_next<Ptr>(const_cast<char*>(B)));
+                               pn_next<Ptr>(const_cast<char*>(B)), lvl + 1);
             }
             case K::setlist_u8:
             {
@@ -3868,7 +3889,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (std::memcmp(A->bytes, B->bytes, size_t(nb)) != 0) return 0;  // sorted edges
                if (eq_value_(A->rh.term, tb, B->rh.term) == 0) return 0;
                for (int i = 0; i < nb; ++i)  // sorted + identical edges → parallel arrays
-                  if (const int r = eq_walk_(A->branch[i], tb, B->branch[i]); r != 1) return r;
+                  if (const int r = eq_walk_(A->branch[i], tb, B->branch[i], lvl + 1); r != 1) return r;
                return 1;
             }
             case K::setlist_u16:
@@ -3880,7 +3901,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if (std::memcmp(A->stems, B->stems, size_t(nb) * 2) != 0) return 0;
                if (eq_value_(A->rh.term, tb, B->rh.term) == 0) return 0;
                for (int i = 0; i < nb; ++i)
-                  if (const int r = eq_walk_(A->branch[i], tb, B->branch[i]); r != 1) return r;
+                  if (const int r = eq_walk_(A->branch[i], tb, B->branch[i], lvl + 1); r != 1) return r;
                return 1;
             }
             case K::pfxd:  // fused prefixes must agree, then compare as the dense router
@@ -3907,7 +3928,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (res != 1) return;
                   packed_ptr* sb = tb.router_find_slot(b, e);
                   if (!sb) { res = 0; return; }  // edge absent in b → key sets differ
-                  res = eq_walk_(ca, tb, *sb);
+                  res = eq_walk_(ca, tb, *sb, lvl + 1);
                });
                return res;
             }
@@ -4087,9 +4108,40 @@ namespace detail  // implementation types & node helpers — not part of the pub
             if (p.tag() == K::value_inline) { unpack_inline(p, tmp); return &tmp; }
          return leaf_val(static_cast<char*>(deref_term_(p)));
       }
+      // The recursive scans (for_each / for_each_value / operator=='s structural walk) recurse
+      // once per tree LEVEL, and a tree may be max_key_bytes levels deep. They are fast because
+      // they recurse, so they keep doing so for the first walk_recursion_max levels — far more
+      // than any ordinary tree has — and hand a deeper subtree to the iterator, whose descent
+      // stack lives on the heap. Stack use is therefore bounded by a constant.
+      static constexpr unsigned walk_recursion_max = 64;
+      template <class F>
+      void walk_v_child_(packed_ptr ch, F& f, unsigned lvl) const
+      {
+         if (lvl < walk_recursion_max) { walk_v_(ch, f, lvl + 1); return; }
+         for (const_iterator it(this, ch); !it.end_; ++it) f(it.val_ref_());
+      }
+      template <class F>
+      void walk_child_(packed_ptr ch, key_buf& key, F& f, unsigned lvl) const
+      {
+         if (lvl < walk_recursion_max) { walk_(ch, key, f, lvl + 1); return; }
+         const size_t base = key.len;  // the path down to `ch`; the iterator's keys are relative to ch
+         for (const_iterator it(this, ch); !it.end_; ++it)
+         {
+            if (it.full_str_)  // a leaf that stores its whole key: already absolute
+            {
+               f(std::string_view(it.full_str_, it.full_len_), it.val_ref_());
+               continue;
+            }
+            const std::string_view kb = it.key_bytes();
+            key.len = base;
+            key.append(kb.data(), kb.size());
+            f(key.view(), it.val_ref_());
+         }
+         key.len = base;
+      }
       // Value-only DFS (no key assembly) backing for_each_value.
       template <class F>
-      void walk_v_(packed_ptr cur, F& f) const
+      void walk_v_(packed_ptr cur, F& f, unsigned lvl = 0) const
       {
          const K k = cur.tag();
          switch (k)
@@ -4101,7 +4153,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                if constexpr (inlineable) { T tmp; unpack_inline(cur, tmp); f(static_cast<const T&>(tmp)); }
                return;
             case K::prefix_node:
-               walk_v_(pn_next<Ptr>(static_cast<char*>(deref_(cur))), f);
+               walk_v_child_(pn_next<Ptr>(static_cast<char*>(deref_(cur))), f, lvl);
                return;
             case K::bucket:
                if constexpr (bucketable)
@@ -4115,7 +4167,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
                if (!rh->term.is_null()) { T tmp; f(*val_of_(rh->term, tmp)); }
-               auto recurse = [&](uint8_t, packed_ptr ch) { walk_v_(ch, f); };
+               auto recurse = [&](uint8_t, packed_ptr ch) { walk_v_child_(ch, f, lvl); };
                switch (k)
                {
                   case K::setlist_u8:
@@ -4124,14 +4176,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      const int      n = s->rh.hdr.nbranch;
                      for (int i = 0; i < n; ++i)
                         if (sl_is_inline(s, i)) f(static_cast<const T&>(*leaf_val(sl_inline_leaf(s, i))));
-                        else                    walk_v_(s->branch[i], f);
+                        else                    walk_v_child_(s->branch[i], f, lvl);
                      break;
                   }
                   case K::setlist_u16:  // wide router (2 bytes/hop) — must be walked like any other
                   {
                      const setlist16* s = static_cast<const setlist16*>(deref_(cur));
                      const int        n = s->rh.hdr.nbranch;
-                     for (int i = 0; i < n; ++i) walk_v_(s->branch[i], f);
+                     for (int i = 0; i < n; ++i) walk_v_child_(s->branch[i], f, lvl);
                      break;
                   }
                   case K::c2: cnode_for_each(static_cast<const cnode<2>*>(deref_(cur)), recurse); break;
@@ -4143,7 +4195,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      for (int byte = 0; byte < 256; ++byte)
                      {
                         packed_ptr ch = full_find(fn, uint8_t(byte));
-                        if (!ch.is_null()) walk_v_(ch, f);
+                        if (!ch.is_null()) walk_v_child_(ch, f, lvl);
                      }
                      break;
                   }
@@ -4156,9 +4208,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Recursive in-order DFS backing for_each. Enumerates children directly: setlist
       // by its sorted bytes[], cnode via cnode_for_each (ctz bitmap walk), node_full by
       // a single 0..255 pass, buckets by their sorted index (bkt_index_sorted_). `key`
-      // grows on descent and the length is reset on return.
+      // grows on descent and the length is reset on return. Depth-limited: see walk_child_.
       template <class F>
-      void walk_(packed_ptr cur, key_buf& key, F& f) const
+      void walk_(packed_ptr cur, key_buf& key, F& f, unsigned lvl = 0) const
       {
          const K k = cur.tag();
          switch (k)
@@ -4194,7 +4246,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                char*        P = static_cast<char*>(deref_(cur));
                const size_t b = key.len;
                key.append(pn_pfx<Ptr>(P), pn_plen(P));
-               walk_(pn_next<Ptr>(P), key, f);
+               walk_child_(pn_next<Ptr>(P), key, f, lvl);
                key.len = b;
                return;
             }
@@ -4225,7 +4277,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   call_val_(key.view(), rh->term, f);  // key ends here (path + prefix)
                auto recurse = [&](uint8_t byte, packed_ptr ch) {
                   key.push(byte);
-                  walk_(ch, key, f);
+                  walk_child_(ch, key, f, lvl);
                   key.len = cb;
                };
                switch (k)
@@ -4255,7 +4307,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                         const uint16_t st = s->stems[i];
                         key.push(uint8_t(st >> 8));
                         key.push(uint8_t(st & 0xFF));
-                        walk_(s->branch[i], key, f);
+                        walk_child_(s->branch[i], key, f, lvl);
                         key.len = cb;
                      }
                      break;
@@ -5510,115 +5562,136 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // (Key-by-key reinsert — the naive fallback — pays a full descent plus split/widen
       // work per element and rebuilds the whole shape from scratch.)
       //
-      // Exception safety: every copied node has its child slots nulled before any
-      // throwing recursion and is owned by a build_guard, so a bad_alloc mid-clone
-      // reclaims exactly the part built so far (free_all_ tolerates null children).
+      // ITERATIVE: a node is cloned SHALLOWLY (clone_node_: allocate, memcpy, null the child
+      // slots, clone the term) and linked into its already-cloned parent at once; if it has
+      // children it joins a heap work list of (source, clone) pairs whose children are still
+      // to do. No recursion, so the depth of the tree (up to max_key_bytes levels) costs heap,
+      // not stack.
+      //
+      // Exception safety: every clone is reachable from `root` the moment it exists and its
+      // unfilled slots are null, so one guard on the root reclaims exactly the part built so
+      // far (free_all_ tolerates null children) — on bad_alloc from a node, a leaf or the
+      // work list itself, or on a throwing T move.
+      struct clone_job
+      {
+         packed_ptr src, dst;  // same kind; dst's child slots are null until its job runs
+      };
       void move_elements_from_(map& o)
       {
-         root_  = clone_walk_(o, o.root_);
+         packed_ptr             root = packed_ptr::null();
+         build_guard            g{this, &root};
+         std::vector<clone_job> work;
+         root = clone_node_(o, o.root_, work);
+         while (!work.empty())
+         {
+            const clone_job j = work.back();
+            work.pop_back();
+            switch (j.src.tag())
+            {
+               case K::prefix_node:
+               {
+                  const packed_ptr c = clone_node_(o, pn_next<Ptr>(static_cast<char*>(o.deref_(j.src))), work);
+                  pn_set_next(static_cast<char*>(deref_(j.dst)), c);
+                  break;
+               }
+               case K::setlist_u16:  // parallel sorted arrays: clone children index-by-index
+               {
+                  const setlist16* S  = static_cast<const setlist16*>(o.deref_(j.src));
+                  setlist16*       D  = static_cast<setlist16*>(deref_(j.dst));
+                  const int        nb = S->rh.hdr.nbranch;
+                  for (int i = 0; i < nb; ++i) D->branch[i] = clone_node_(o, S->branch[i], work);
+                  break;
+               }
+               case K::setlist_u8:  // inline branches rode the line memcpy; only externals re-point
+               {
+                  const setlist* S  = static_cast<const setlist*>(o.deref_(j.src));
+                  setlist*       D  = static_cast<setlist*>(deref_(j.dst));
+                  const int      nb = S->rh.hdr.nbranch;
+                  for (int i = 0; i < nb; ++i)
+                     if (!sl_is_inline(S, i)) D->branch[i] = clone_node_(o, S->branch[i], work);
+                  break;
+               }
+               case K::pfxd:
+               case K::c2:
+               case K::c4:
+               case K::c8:
+               case K::node_full:  // re-point each edge of the copied directory at the child's clone
+                  o.router_for_each(j.src, [&](uint8_t e, packed_ptr child) {
+                     const packed_ptr c = clone_node_(o, child, work);
+                     router_try_set(j.dst, e, c);
+                  });
+                  break;
+               case K::null: case K::value_ptr: case K::value_inline: case K::bucket:
+                  assert(false && "terminals and buckets are never queued");
+                  break;
+            }
+         }
+         g.release();
+         root_  = root;
          count_ = o.count_;
       }
-      // Clone one router node (setlist / cN / node_full): the memcpy preserves the
-      // edge directory (sorted bytes / presence bitmaps / direct slots); each branch
-      // slot is then re-pointed at the cloned child via router_try_set on its own edge.
+      // Shallow clone of a router (setlist / cN / node_full): the memcpy preserves the edge
+      // directory (sorted bytes / presence bitmaps / direct slots, and a setlist's inline-leaf
+      // payloads when `bytes` covers the whole line); every external child slot is nulled and
+      // the term cloned. The caller links the result and queues it.
       template <class Node>
-      packed_ptr clone_router_(const map& src, const Node* S, K k)
+      packed_ptr clone_router_(const map& src, const Node* S, K k, size_t bytes = sizeof(Node))
       {
          Node* D = ::new (node_alloc_(sizeof(Node))) Node;
-         std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), sizeof(Node));
+         std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), bytes);
          const router_hdr* sh = reinterpret_cast<const router_hdr*>(S);
          router_hdr*       dh = reinterpret_cast<router_hdr*>(D);
          dh->term             = packed_ptr::null();
-         router_for_each(const_cast<Node*>(S),  // null every slot before recursion can throw
-                         [&](uint8_t e, packed_ptr) { router_try_set(D, e, packed_ptr::null()); });
+         if constexpr (std::is_same_v<Node, setlist>)
+         {
+            const int nb = S->rh.hdr.nbranch;
+            for (int i = 0; i < nb; ++i)
+               if (!sl_is_inline(S, i)) D->branch[i] = packed_ptr::null();
+         }
+         else if constexpr (std::is_same_v<Node, setlist16>)
+         {
+            const int nb = S->rh.hdr.nbranch;
+            for (int i = 0; i < nb; ++i) D->branch[i] = packed_ptr::null();
+         }
+         else
+            router_for_each(const_cast<Node*>(S),
+                            [&](uint8_t e, packed_ptr) { router_try_set(D, e, packed_ptr::null()); });
          packed_ptr  dp = pack_(D, k);
-         build_guard g{this, &dp};
-         dh->term = clone_walk_(src, sh->term);
-         router_for_each(const_cast<Node*>(S),
-                         [&](uint8_t e, packed_ptr child) { router_try_set(D, e, clone_walk_(src, child)); });
+         build_guard g{this, &dp};  // not linked yet: the term's leaf allocation / T move may throw
+         dh->term = clone_leaf_(src, sh->term);
          g.release();
          return dp;
       }
-      packed_ptr clone_walk_(const map& src, packed_ptr s)
+      // Clone a terminal handle (a leaf or an in-handle value; null stays null).
+      packed_ptr clone_leaf_(const map& src, packed_ptr s)
+      {
+         if (s.tag() != K::value_ptr)
+         {
+            assert((s.is_null() || s.tag() == K::value_inline) && "a term is a terminal");
+            return s;  // null, or the handle IS the value (handle widths match: same tree type)
+         }
+         char*        L  = static_cast<char*>(src.deref_term_(s));
+         const size_t sz = leaf_alloc_size(L);
+         char*        D  = static_cast<char*>(term_alloc_(sz));
+         std::memcpy(D, L, sz);  // header + suffix/full-key bytes (+ value if trivial)
+         if constexpr (!std::is_trivially_copyable_v<T>)
+         {
+            try { v_construct(alloc_, leaf_val(D), std::move(*leaf_val(L))); }
+            catch (...) { term_free_(D, sz); throw; }
+         }
+         return pack_term_(D, K::value_ptr);
+      }
+      // Clone ONE node of the source tree (not its children). Nodes that have children are
+      // appended to `work`; the slot for the job is reserved BEFORE the node is allocated so
+      // nothing can throw between creating the clone and handing it to the caller to link.
+      packed_ptr clone_node_(const map& src, packed_ptr s, std::vector<clone_job>& work)
       {
          switch (s.tag())
          {
             case K::null:
-               return packed_ptr::null();
             case K::value_inline:
-               return s;  // the handle IS the value (handle widths match: same tree type)
             case K::value_ptr:
-            {
-               char*        L  = static_cast<char*>(src.deref_term_(s));
-               const size_t sz = leaf_alloc_size(L);
-               char*        D  = static_cast<char*>(term_alloc_(sz));
-               std::memcpy(D, L, sz);  // header + suffix/full-key bytes (+ value if trivial)
-               if constexpr (!std::is_trivially_copyable_v<T>)
-               {
-                  try { v_construct(alloc_, leaf_val(D), std::move(*leaf_val(L))); }
-                  catch (...) { term_free_(D, sz); throw; }
-               }
-               return pack_term_(D, K::value_ptr);
-            }
-            case K::prefix_node:
-            {
-               char*        P  = static_cast<char*>(src.deref_(s));
-               const size_t sz = pn_size<Ptr>(pn_plen(P));
-               char*        D  = static_cast<char*>(node_alloc_(sz));
-               std::memcpy(D, P, sz);
-               pn_set_next(D, packed_ptr::null());
-               packed_ptr  dp = pack_(D, K::prefix_node);
-               build_guard g{this, &dp};
-               pn_set_next(D, clone_walk_(src, pn_next<Ptr>(P)));
-               g.release();
-               return dp;
-            }
-            case K::setlist_u16:  // parallel sorted arrays: clone children index-by-index
-            {
-               const setlist16* S = static_cast<const setlist16*>(src.deref_(s));
-               setlist16*       D = ::new (node_alloc_(sizeof(setlist16))) setlist16;
-               std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), sizeof(setlist16));
-               const int nb = D->rh.hdr.nbranch;
-               D->rh.term   = packed_ptr::null();
-               for (int i = 0; i < nb; ++i) D->branch[i] = packed_ptr::null();
-               packed_ptr  dp = pack_(D, K::setlist_u16);
-               build_guard g{this, &dp};
-               D->rh.term = clone_walk_(src, S->rh.term);
-               for (int i = 0; i < nb; ++i) D->branch[i] = clone_walk_(src, S->branch[i]);
-               g.release();
-               return dp;
-            }
-            case K::setlist_u8:
-            {
-               // Copy the WHOLE line: inline-leaf payloads live in the tail (possibly past
-               // sizeof(setlist)) and their branch handles are line-relative, so the memcpy
-               // carries them verbatim. Only EXTERNAL children are re-pointed to clones;
-               // inline branches stay as the memcpy left them.
-               const setlist* S = static_cast<const setlist*>(src.deref_(s));
-               setlist*       D = ::new (node_alloc_(sizeof(setlist))) setlist;
-               std::memcpy(static_cast<void*>(D), static_cast<const void*>(S), SL_LINE);
-               const int nb = S->rh.hdr.nbranch;
-               D->rh.term   = packed_ptr::null();
-               for (int i = 0; i < nb; ++i)
-                  if (!sl_is_inline(S, i)) D->branch[i] = packed_ptr::null();  // null before throws
-               packed_ptr  dp = pack_(D, K::setlist_u8);
-               build_guard g{this, &dp};
-               D->rh.term = clone_walk_(src, S->rh.term);
-               for (int i = 0; i < nb; ++i)
-                  if (!sl_is_inline(S, i)) D->branch[i] = clone_walk_(src, S->branch[i]);
-               g.release();
-               return dp;
-            }
-            case K::pfxd:  // full body + in-header prefix; the memcpy carries both
-               return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
-            case K::c2:
-               return clone_router_(src, static_cast<const cnode<2>*>(src.deref_(s)), K::c2);
-            case K::c4:
-               return clone_router_(src, static_cast<const cnode<4>*>(src.deref_(s)), K::c4);
-            case K::c8:
-               return clone_router_(src, static_cast<const cnode<8>*>(src.deref_(s)), K::c8);
-            case K::node_full:
-               return clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::node_full);
+               return clone_leaf_(src, s);
             case K::bucket:
             {
                const bucket* B = static_cast<const bucket*>(src.deref_(s));
@@ -5642,68 +5715,138 @@ namespace detail  // implementation types & node helpers — not part of the pub
                }
                return pack_(D, K::bucket);
             }
+            default:
+               break;
          }
-         return packed_ptr::null();  // unreachable (exhaustive switch)
+         work.push_back(clone_job{s, packed_ptr::null()});  // reserve (may throw: nothing built yet)
+         packed_ptr dp = packed_ptr::null();
+         try
+         {
+            switch (s.tag())
+            {
+               case K::prefix_node:
+               {
+                  char*        P  = static_cast<char*>(src.deref_(s));
+                  const size_t sz = pn_size<Ptr>(pn_plen(P));
+                  char*        D  = static_cast<char*>(node_alloc_(sz));
+                  std::memcpy(D, P, sz);
+                  pn_set_next(D, packed_ptr::null());
+                  dp = pack_(D, K::prefix_node);
+                  break;
+               }
+               case K::setlist_u16:
+                  dp = clone_router_(src, static_cast<const setlist16*>(src.deref_(s)), K::setlist_u16);
+                  break;
+               case K::setlist_u8:
+                  // Copy the WHOLE line: inline-leaf payloads live in the tail (possibly past
+                  // sizeof(setlist)) and their branch handles are line-relative.
+                  dp = clone_router_(src, static_cast<const setlist*>(src.deref_(s)), K::setlist_u8, SL_LINE);
+                  break;
+               case K::pfxd:  // full body + in-header prefix; the memcpy carries both
+                  dp = clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::pfxd);
+                  break;
+               case K::c2:
+                  dp = clone_router_(src, static_cast<const cnode<2>*>(src.deref_(s)), K::c2);
+                  break;
+               case K::c4:
+                  dp = clone_router_(src, static_cast<const cnode<4>*>(src.deref_(s)), K::c4);
+                  break;
+               case K::c8:
+                  dp = clone_router_(src, static_cast<const cnode<8>*>(src.deref_(s)), K::c8);
+                  break;
+               case K::node_full:
+                  dp = clone_router_(src, static_cast<const node_full*>(src.deref_(s)), K::node_full);
+                  break;
+               case K::null: case K::value_ptr: case K::value_inline: case K::bucket:
+                  break;  // handled above
+            }
+         }
+         catch (...)
+         {
+            work.pop_back();  // no clone was made for this job
+            throw;
+         }
+         work.back().dst = dp;
+         return dp;
       }
 
       // Tear down a (possibly partial) subtree: destroy each T AND free each node. Drives
       // teardown (~map / clear), and the exception-safety guard's cleanup of a half-built
       // subtree when a mutate op throws before committing it.
+      //
+      // ITERATIVE, constant stack, no allocation (it is noexcept and runs in destructors): a
+      // tree may be max_key_bytes levels deep, and one call frame per level overflowed small
+      // thread stacks. The nodes being freed ARE the work list. A terminal or bucket has
+      // nothing below it and is freed on sight; a prefix chain is walked in a loop; a router
+      // is deferred by pushing it on a LIFO threaded through its own term slot (the term, always
+      // a terminal, is disposed of first — the slot is dead storage from then on).
       void free_all_(packed_ptr cur) noexcept
       {
-         if (cur.is_null())
-            return;
-         switch (cur.tag())
-         {
-            case K::value_ptr:
+         packed_ptr pending = packed_ptr::null();  // deferred routers, linked through rh.term
+         auto       free_terminal = [this](packed_ptr t) noexcept {
+            if (t.tag() != K::value_ptr) return;  // null / in-handle value: nothing allocated
+            char* L = static_cast<char*>(deref_term_(t));
+            if constexpr (!std::is_trivially_destructible_v<T>) v_destroy(alloc_, leaf_val(L));
+            term_free_(L, leaf_alloc_size(L));
+         };
+         auto dispose = [&](packed_ptr h) noexcept {
+            while (h.tag() == K::prefix_node)  // single-child chain: free on the way down
             {
-               char* L = static_cast<char*>(deref_term_(cur));
-               if constexpr (!std::is_trivially_destructible_v<T>) v_destroy(alloc_, leaf_val(L));
-               term_free_(L, leaf_alloc_size(L));
-               return;
-            }
-            case K::value_inline:
-               return;
-            case K::prefix_node:
-            {
-               char* P = static_cast<char*>(deref_(cur));
-               free_all_(pn_next<Ptr>(P));
+               char*            P  = static_cast<char*>(deref_(h));
+               const packed_ptr nx = pn_next<Ptr>(P);
                node_free_(P, pn_size<Ptr>(pn_plen(P)));
-               return;
+               h = nx;
             }
-            case K::setlist_u8:
+            switch (h.tag())
             {
-               setlist* s = static_cast<setlist*>(deref_(cur));
-               free_all_(s->rh.term);
+               case K::null:
+               case K::value_inline:
+                  return;
+               case K::value_ptr:
+                  free_terminal(h);
+                  return;
+               case K::bucket:
+               {
+                  bucket* b = static_cast<bucket*>(deref_(h));
+                  if constexpr (!std::is_trivially_destructible_v<T>)
+                     for (int i = 0; i < b->nent; ++i) v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
+                  node_free_(b, sizeof(bucket));
+                  return;
+               }
+               case K::setlist_u8:
+               case K::setlist_u16:
+               case K::c2:
+               case K::c4:
+               case K::c8:
+               case K::node_full:
+               case K::pfxd:
+               {
+                  router_hdr* rh = static_cast<router_hdr*>(deref_(h));
+                  assert((rh->term.is_null() || is_terminal(rh->term.tag())) && "a term is a terminal");
+                  free_terminal(rh->term);
+                  rh->term = pending;  // push: the term slot now links the work list
+                  pending  = h;
+                  return;
+               }
+               case K::prefix_node:  // consumed by the loop above
+                  return;
+            }
+         };
+         dispose(cur);
+         while (!pending.is_null())
+         {
+            const packed_ptr nd = pending;
+            pending             = static_cast<router_hdr*>(deref_(nd))->term;  // pop
+            if (nd.tag() == K::setlist_u8)
+            {
+               setlist*  s = static_cast<setlist*>(deref_(nd));
                const int n = s->rh.hdr.nbranch;
                for (int i = 0; i < n; ++i)
-                  if (!sl_is_inline(s, i)) free_all_(s->branch[i]);  // inline leaves ride the line
-               node_free_(s, node_size(K::setlist_u8));
-               return;
+                  if (!sl_is_inline(s, i)) dispose(s->branch[i]);  // inline leaves ride the line
             }
-            case K::setlist_u16:
-            case K::c2:
-            case K::c4:
-            case K::c8:
-            case K::node_full:
-            case K::pfxd:
-            {
-               router_hdr* rh = static_cast<router_hdr*>(deref_(cur));
-               free_all_(rh->term);
-               router_for_each(cur, [&](uint8_t, packed_ptr br) { free_all_(br); });
-               node_free_(deref_(cur), node_size(cur.tag()));
-               return;
-            }
-            case K::bucket:
-            {
-               bucket* b = static_cast<bucket*>(deref_(cur));
-               if constexpr (!std::is_trivially_destructible_v<T>)
-                  for (int i = 0; i < b->nent; ++i) v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
-               node_free_(b, sizeof(bucket));
-               return;
-            }
-            case K::null:
-               return;
+            else
+               router_for_each(nd, [&](uint8_t, packed_ptr br) { dispose(br); });
+            node_free_(deref_(nd), node_size(nd.tag()));
          }
       }
       // Nodes are allocated per-node (no bulk-reclaiming pool), so a node orphaned on a throwing

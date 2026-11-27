@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <pthread.h>
+
 using artpp::map;
 using artpp::mode;
 
@@ -504,6 +506,103 @@ static void regression_overaligned_values()
    overaligned<V64, mode::buckets>("alignas(64) buckets");
 }
 
+// ── audit #15: a deep tree must not need a deep call stack ───────────────────────
+// Keys a^1 … a^N build an N-level tree (every level has a term). Teardown, for_each,
+// for_each_value, lower_bound, operator== and the cross-allocator move (structural clone)
+// used to recurse once per level; at N = 8,000 that overflowed a 512 KB thread stack.
+// Run them all on a thread whose stack is far too small for N nested frames of anything:
+// with the recursion gone (or bounded and handed to the heap-stacked iterator) it passes.
+template <class T>
+struct tagged_alloc  // stateful and non-propagating: unequal ids force move-assign to clone
+{
+   using value_type = T;
+   int id;
+   explicit tagged_alloc(int i = 0) noexcept : id(i) {}
+   template <class U>
+   tagged_alloc(const tagged_alloc<U>& o) noexcept : id(o.id) {}
+   T*   allocate(std::size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(alignof(T)))); }
+   void deallocate(T* p, std::size_t) noexcept { ::operator delete(p, std::align_val_t(alignof(T))); }
+   template <class U>
+   bool operator==(const tagged_alloc<U>& o) const noexcept { return id == o.id; }
+   template <class U>
+   bool operator!=(const tagged_alloc<U>& o) const noexcept { return id != o.id; }
+};
+template <class V, mode M>
+static void deep_tree_ops(int N)
+{
+   using A    = tagged_alloc<V>;
+   using Tree = map<std::string_view, V, M, A>;
+   Tree        a{A(1)}, b{A(1)}, c{A(2)};
+   std::string k;
+   for (int i = 1; i <= N; ++i)
+   {
+      k.push_back('a');
+      a.insert(k, chain_val<V>(i));
+      b.insert(k, chain_val<V>(i));
+   }
+   CHECK(a.size() == size_t(N));
+   size_t n = 0, bad = 0;
+   a.for_each([&](std::string_view key, const V& v) {  // ascending: a, aa, aaa, …
+      ++n;
+      bad += key.size() != n || key.find_first_not_of('a') != std::string_view::npos || !(v == chain_val<V>(int(n)));
+   });
+   CHECK(n == size_t(N) && bad == 0);
+   n = 0;
+   a.for_each_value([&](const V& v) { ++n; bad += !(v == chain_val<V>(int(n))); });
+   CHECK(n == size_t(N) && bad == 0);
+   auto lb = a.lower_bound(k);  // the deepest key: the directed descent goes all the way down
+   CHECK(lb != a.end() && lb.key_bytes() == k);
+   CHECK(a.upper_bound(k) == a.end());
+   CHECK(a.find(k) != a.end());
+   CHECK(a == b);  // structural walk, then the sequence compare past the depth bound
+   b.insert_or_assign(k, chain_val<V>(-5));
+   CHECK(a != b);  // differs only in the deepest value
+   b.insert_or_assign(k, chain_val<V>(N));
+   c = std::move(a);  // unequal allocators: node-by-node clone of the whole depth
+   CHECK(c.size() == size_t(N) && a.empty());
+   CHECK(c == b);
+   n = 0;
+   for (auto it = c.begin(); it != c.end(); ++it) ++n;
+   CHECK(n == size_t(N));
+   b.clear();         // teardown of the full depth …
+   CHECK(b.empty() && b.begin() == b.end());
+}                     // … and again in c's destructor
+struct stack_job
+{
+   void (*fn)(int);
+   int  arg;
+};
+static void* stack_tramp(void* p)
+{
+   auto* j = static_cast<stack_job*>(p);
+   j->fn(j->arg);
+   return nullptr;
+}
+static void run_on_stack(std::size_t bytes, void (*fn)(int), int arg)
+{
+   pthread_attr_t attr;
+   pthread_attr_init(&attr);
+   CHECK(pthread_attr_setstacksize(&attr, bytes) == 0);
+   stack_job j{fn, arg};
+   pthread_t t;
+   CHECK(pthread_create(&t, &attr, stack_tramp, &j) == 0);
+   pthread_join(t, nullptr);
+   pthread_attr_destroy(&attr);
+}
+static void regression_deep_tree_small_stack()
+{
+   // 12,000 levels on a 256 KB stack: about 21 bytes per level, less than one call frame of
+   // anything, while the bounded scans (64 recursion levels, then the iterator) fit with room
+   // to spare even in a sanitizer build.
+   const std::size_t stack = 256 * 1024;
+   const int         N     = 12000;
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::none>(n); }, N);
+   run_on_stack(stack, [](int n) { deep_tree_ops<std::string, mode::none>(n); }, N);
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint32_t, mode::none>(n); }, N);
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::dense_tiers>(n); }, N);
+   run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::wide_stems>(n); }, N);
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
@@ -513,6 +612,7 @@ int main()
    regression_erase_cascade_past_window();
    regression_assign_present_key();
    regression_overaligned_values();
+   regression_deep_tree_small_stack();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;

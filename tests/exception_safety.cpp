@@ -361,6 +361,54 @@ static void run_inline_scenarios(const char* cont)
                          "Z");
 }
 
+// ── cross-allocator move assignment (the structural clone) under fault ────────────
+// Unequal, non-propagating allocators force operator=(map&&) to clone the source node by
+// node into the destination's allocator. Fail each allocation of the clone in turn (or, for
+// tvalue, each value move): the destination must come out valid, the source must stay
+// destructible, and neither allocator may be left holding a block or a live value.
+template <class Map>
+static void eh_clone(const char* cont, const char* scen, const std::vector<std::string>& keys, bool by_value)
+{
+   int violations = 0, leaks = 0, vleaks = 0, swept = 0;
+   for (int n = 0;; ++n)
+   {
+      fail_counter fa, fb;
+      bool         completed = false;
+      const long   vbase     = g_live;
+      {
+         Map src{typename Map::allocator_type(&fa)}, dst{typename Map::allocator_type(&fb)};
+         for (size_t i = 0; i < keys.size(); ++i) src.insert_or_assign(keys[i], std::string(8, char('a' + (i & 15))));
+         dst.insert_or_assign("previous-content", std::string("p"));
+         if (by_value) g_vcountdown = n;
+         else          fb.countdown = n;
+         try
+         {
+            dst       = std::move(src);
+            completed = true;
+         }
+         catch (const std::bad_alloc&) {}
+         catch (const value_error&) {}
+         g_vcountdown = -1;
+         fb.countdown = -1;
+         auto d = dump(dst);  // both trees must still walk cleanly
+         auto s = dump(src);
+         if (d.size() != dst.size() || s.size() != src.size()) ++violations;
+         if (completed && (d.size() != keys.size() || !src.empty())) ++violations;
+         if (!completed && !dst.empty()) ++violations;  // the half-built clone was reclaimed
+         for (auto& kv : d)
+            if (!dst.contains(kv.first)) ++violations;
+      }
+      if (fa.allocs != fa.frees || fb.allocs != fb.frees) ++leaks;
+      if (g_live != vbase) ++vleaks;
+      ++swept;
+      if (completed) break;
+   }
+   const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
+   if (!ok) ++g_fail;
+   std::printf("  %-10s %-14s %-5s  %s  (%d points, %d corruption, %d mem-leak, %d dtor-leak)\n", cont, scen,
+               by_value ? "value" : "alloc", ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -448,6 +496,27 @@ int main()
    eh_value_repeat<TDense>("artpp-dense", false);
    eh_value_repeat<TBkt>("artpp-bucket", true);
    eh_value_repeat<TAdp>("artpp-adapt", false);
+
+   // Cross-allocator move assignment: the node-by-node clone, every allocation / value move failed.
+   std::printf("\nmove assignment across unequal allocators (structural clone) under fault:\n");
+   {
+      std::vector<std::string> deep;  // a 300-level chain with a term at every level
+      for (int i = 1; i <= 300; ++i) deep.push_back(std::string(size_t(i), 'd'));
+      std::vector<std::string> mixed = cluster;
+      mixed.insert(mixed.end(), wide.begin(), wide.begin() + 120);
+      mixed.push_back("");
+      mixed.push_back(std::string(700, 'L'));
+      for (int i = 0; i < 20; ++i) mixed.push_back("0123456789ABCDEF" + std::string(1, char('a' + i)) + "t");
+      eh_clone<TRadix>("artpp-radix", "mixed", mixed, false);
+      eh_clone<TRadix>("artpp-radix", "mixed", mixed, true);
+      eh_clone<TRadix>("artpp-radix", "deep-chain", deep, false);
+      eh_clone<TDense>("artpp-dense", "mixed", mixed, false);
+      eh_clone<TDense>("artpp-dense", "mixed", mixed, true);
+      eh_clone<TWide>("artpp-wide", "mixed", mixed, false);
+      eh_clone<TBkt>("artpp-bucket", "mixed", mixed, false);
+      eh_clone<TBkt>("artpp-bucket", "mixed", mixed, true);
+      eh_clone<TAdp>("artpp-adapt", "mixed", mixed, false);
+   }
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");
