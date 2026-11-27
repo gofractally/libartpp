@@ -30,6 +30,9 @@ before 1.0 a minor version may change the API.
   or move in `insert`) no longer leaks the leaf allocated for it; in
   `mode::buckets` it no longer leaks the new bucket page or consumes space in
   an existing one (#12).
+- Inserting below a small inline value (a trivially copyable `T` of at most 5
+  bytes) no longer leaks a 128-byte node when the second allocation of the
+  split fails (#13).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in

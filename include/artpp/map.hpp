@@ -5338,11 +5338,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
                T oldv;
                unpack_inline(cur, oldv);  // inlineable T is trivially copyable
                inserted = true;
-               setlist* r = new_setlist();
-               set_term(&r->rh, std::move(oldv));                                    // old key terminates
+               setlist*    r       = new_setlist();
+               packed_ptr  partial = pack_(r, K::setlist_u8);
+               build_guard g{this, &partial};  // the new key's leaf allocation can throw: reclaim r
                setlist_set(r, uint8_t(R[0]), make_value_at(key, depth + 1, std::forward<VF>(val)));  // new continues
-               sl_inline_compact_(r);          // pull the small leaf child into this line
-               return pack_(r, K::setlist_u8);  // c == 0, no prefix node needed
+               set_term(&r->rh, std::move(oldv));  // old key terminates here (inline: cannot throw)
+               g.release();
+               sl_inline_compact_(r);  // pull the small leaf child into this line
+               return partial;         // c == 0, no prefix node needed
             }
          char*            L = static_cast<char*>(deref_term_(cur));
          std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));

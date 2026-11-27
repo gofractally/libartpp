@@ -587,8 +587,7 @@ A pre-release audit found bugs that are open in the
 fixed:
 
 - **Exception safety:** the guarantees under [Limits and guarantees](#limits-and-guarantees)
-  do not hold in `mode::buckets` and `mode::adaptive`, nor when the allocation
-  for splitting a small inline value fails (#4 to #7, #13).
+  do not hold in `mode::buckets` and `mode::adaptive` (#4 to #7).
 - **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
   stale or never-checkpointed store is not detected (#8 to #10).
 

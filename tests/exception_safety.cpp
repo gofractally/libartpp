@@ -298,6 +298,69 @@ static void eh_value_repeat(const char* cont, bool expect_no_alloc_after)
                fc.allocs, fc.frees);
 }
 
+// ── small INLINE values (audit #13) ──────────────────────────────────────────────
+// A trivially copyable value of <= 5 bytes lives in the handle itself, so the harness above
+// (std::string values) never reaches the code that splits such a terminal: it allocates a
+// router and then a leaf for the new key, and a failure of the second allocation used to
+// leak the router. Same sweep, uint32_t values: strong guarantee and zero leaks at every
+// allocation point.
+template <class Map>
+static void eh_insert_inline(const char* cont, const char* scen, const std::vector<std::string>& pre,
+                             const std::string& nk)
+{
+   auto dump32 = [](const Map& m) {
+      std::vector<std::pair<std::string, uint32_t>> v;
+      for (auto it = m.begin(); it != m.end(); ++it) v.emplace_back(std::string(it.key_bytes()), it.value());
+      return v;
+   };
+   int violations = 0, leaks = 0, swept = 0;
+   for (int n = 0;; ++n)
+   {
+      fail_counter fc;
+      bool         completed = false, threw = false;
+      {
+         typename Map::allocator_type al(&fc);
+         Map                          m(al);
+         for (size_t i = 0; i < pre.size(); ++i) m.insert_or_assign(pre[i], uint32_t(100 + i));
+         auto before  = dump32(m);
+         fc.countdown = n;
+         try
+         {
+            m.insert_or_assign(nk, uint32_t(7));
+            completed = true;
+         }
+         catch (const std::bad_alloc&) { threw = true; }
+         fc.countdown = -1;
+         auto after = dump32(m);
+         if (threw && after != before) ++violations;
+         uint32_t got = 0;
+         if (completed && !(m.find(nk, got) && got == 7)) ++violations;
+         if (m.size() != after.size()) ++violations;
+      }
+      if (fc.allocs != fc.frees) ++leaks;
+      ++swept;
+      if (completed) break;
+   }
+   const bool ok = (violations == 0 && leaks == 0);
+   if (!ok) ++g_fail;
+   std::printf("  %-10s %-14s  %s  (%d pts, %d strong-viol, %d mem-leak)\n", cont, scen,
+               ok ? "OK  " : "FAIL", swept, violations, leaks);
+}
+template <class Map>
+static void run_inline_scenarios(const char* cont)
+{
+   eh_insert_inline<Map>(cont, "empty->x", {}, "x");
+   eh_insert_inline<Map>(cont, "inline-split", {"ab", "ac"}, "ab" + std::string(40, 'z'));  // the #13 shape
+   eh_insert_inline<Map>(cont, "inline-split1", {"ab", "ac"}, "abq");
+   eh_insert_inline<Map>(cont, "root-inline", {""}, "q");          // the root itself is an inline value
+   eh_insert_inline<Map>(cont, "leaf-split", {"apple"}, "apricot");
+   eh_insert_inline<Map>(cont, "key-is-prefix", {"apple"}, "app");
+   eh_insert_inline<Map>(cont, "prefix-split", {"abcdefgh1", "abcdefgh2"}, "abcZ");
+   eh_insert_inline<Map>(cont, "setlist-widen",
+                         [] { std::vector<std::string> v; for (int b = 0; b < 16; ++b) v.push_back(std::string(1, char('a' + b))); return v; }(),
+                         "Z");
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -385,6 +448,12 @@ int main()
    eh_value_repeat<TDense>("artpp-dense", false);
    eh_value_repeat<TBkt>("artpp-bucket", true);
    eh_value_repeat<TAdp>("artpp-adapt", false);
+
+   // Inline (in-handle) values under allocation failure (audit #13).
+   std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");
+   run_inline_scenarios<map<std::string_view, uint32_t, mode::none, throwing_alloc<uint32_t>>>("artpp-radix");
+   run_inline_scenarios<map<std::string_view, uint32_t, mode::dense_tiers, throwing_alloc<uint32_t>>>("artpp-dense");
+   run_inline_scenarios<map<std::string_view, uint32_t, mode::wide_stems, throwing_alloc<uint32_t>>>("artpp-wide");
 
    std::printf(g_fail ? "\nartpp_eh: %d containers/scenarios FAILED\n" : "\nartpp_eh: ALL OK\n", g_fail);
    return g_fail ? 1 : 0;
