@@ -12,7 +12,27 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <type_traits>
+
+namespace artpp
+{
+   // Thrown from the ALLOCATION path when the allocator returns a block the tree cannot
+   // address: one that is not aligned as the node layout requires (the low address bits
+   // carry the handle's tag), or one whose address does not fit the handle's width (the
+   // default 6-byte handle holds 48 bits — top-byte tagging such as HWASan/MTE, 5-level
+   // paging or 52-bit ARM addresses exceed it; select `packed_ptr_t<8>` in the allocator).
+   // The block is returned to the allocator first, so nothing leaks. Derived from
+   // std::bad_alloc: to a caller it is an allocation that could not be used.
+   class bad_allocation_address : public std::bad_alloc
+   {
+      const char* msg_;
+
+     public:
+      explicit bad_allocation_address(const char* m) noexcept : msg_(m) {}
+      const char* what() const noexcept override { return msg_; }
+   };
+}  // namespace artpp
 
 namespace artpp::detail
 {
@@ -99,6 +119,17 @@ namespace artpp::detail
       static constexpr bool indexed = false;  // direct addressing: the handle IS the address
       uint8_t b[N];
 
+      // Can a block at `addr` be named by this handle? Its low bits (`align_mask`: 0x7f for
+      // a node, the terminal unit - 1 for a leaf) must be clear for the tag, and the address
+      // must fit N bytes. Checked once per ALLOCATION by the tree (which throws
+      // bad_allocation_address) — never on descent; from()/from_term() only assert.
+      static bool addressable(const void* addr, uint64_t align_mask) noexcept
+      {
+         // one AND against a constant: the alignment bits plus every bit above the N-byte field
+         constexpr uint64_t high = N < 8 ? ~uint64_t(0) << (8u * (N < 8 ? N : 0)) : 0;
+         return (reinterpret_cast<uint64_t>(addr) & (align_mask | high)) == 0;
+      }
+
       static packed_ptr_t null() noexcept
       {
          packed_ptr_t p;
@@ -108,10 +139,12 @@ namespace artpp::detail
       static packed_ptr_t from(const void* addr, K k) noexcept
       {
          const uint64_t a = reinterpret_cast<uint64_t>(addr);
-         // Two invariants every tagged NODE allocation guarantees — asserted in debug:
+         // Two invariants every tagged NODE allocation guarantees:
          //   * the allocation is 128-byte aligned (low 7 bits free for the tag), and
          //   * the address fits in the N-byte field (no >8N-bit VA: e.g. for N=6, >48-bit VA from
-         //     5-level paging / ARM LVA is opt-in via mmap hints, never returned by default malloc).
+         //     5-level paging / ARM LVA / top-byte tagging).
+         // ENFORCED where the block is allocated (map::node_alloc_ / term_alloc_ check
+         // addressable() and throw); the asserts here only document it for debug builds.
          assert((a & 0x7f) == 0 && "artpp: tagged allocation must be 128-byte aligned");
          if constexpr (N < 8)
             assert((a >> (8u * N)) == 0 && "artpp: address exceeds the packed_ptr width");

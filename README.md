@@ -124,7 +124,10 @@ target_link_libraries(your_target PRIVATE artpp::artpp)
 - C++20 (`<bit>`, `requires`-clauses, `if constexpr`; `std::byteswap` when available, else a `__builtin_bswap` shim).
 - A little-endian target (statically asserted) with 48-bit virtual addresses for
   the default 6-byte handle; an allocator can select 8-byte handles to lift the
-  VA assumption ([Allocators](#allocators)).
+  VA assumption ([Allocators](#allocators)). The assumption is checked at run
+  time, once per allocation: a block above 2^48 (top-byte pointer tagging such
+  as HWASan or MTE, 5-level paging, 52-bit ARM addresses) makes the allocating
+  operation throw `artpp::bad_allocation_address` instead of being truncated.
 - NEON (ARM64) or SSE2 (x86-64) for the SIMD router probes; both paths are
   provided and selected automatically.
 - No dependencies beyond the standard library. Header-only:
@@ -376,6 +379,15 @@ elements.**
 block runs taken from a rebound copy of your allocator, values are constructed
 and destroyed via `allocator_traits`, and the container honors the propagation
 traits on move, swap, and assignment. PMR works as expected.
+
+The rebound allocator must honour the alignment of the type it is asked for:
+128 bytes for nodes and `max(16, alignof(T))` for leaves (`std::allocator` and
+PMR do; a `malloc`-backed allocator that ignores `alignof` does not). The tree
+checks every block it receives — alignment, and that the address fits the
+handle — and throws `artpp::bad_allocation_address` (derived from
+`std::bad_alloc`) after returning the block, so a non-conforming allocator is
+reported on the first allocation rather than corrupting the tree. The check is
+on the allocation path only; lookups are unaffected.
 
 Beyond the standard protocol, an allocator can customize the tree through three
 **opt-in members** (detected, never required):

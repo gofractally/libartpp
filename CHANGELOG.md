@@ -13,6 +13,9 @@ before 1.0 a minor version may change the API.
   macOS, each also under AddressSanitizer and UndefinedBehaviorSanitizer, plus an
   install-and-consume check.
 
+- `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
+  an allocator returns a block the tree's handles cannot address.
+
 ### Fixed
 - GCC warnings (`-Wreturn-type`, `-Wmaybe-uninitialized`) in `map.hpp`.
 - Undefined behaviour: `memcpy` from a null pointer for an empty key suffix or
@@ -43,6 +46,11 @@ before 1.0 a minor version may change the API.
   `for_each_value` and `operator==` recurse for at most 64 levels. Inserting in
   `mode::buckets` and `debug_stats()` still recurse once per level; see
   "Limits and guarantees" (#15).
+- A block whose address does not fit the handle (above 2^48 with the default
+  6-byte handle) or that is not aligned as required (128 bytes for nodes) was
+  only caught by `assert`; a release build silently truncated the address.
+  Both are now checked on every allocation and reported by throwing
+  `artpp::bad_allocation_address` (#16).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in

@@ -626,7 +626,44 @@ namespace detail  // implementation types & node helpers — not part of the pub
       void* node_alloc_(size_t n)  // throws bad_alloc — the strong-guarantee fault point
       {
          node_alloc_t na(alloc_);
-         return node_at::allocate(na, nblocks_(n));
+         const size_t nb = nblocks_(n);
+         auto         p  = node_at::allocate(na, nb);
+         // A direct handle packs this ADDRESS into sizeof(Ptr) bytes and keeps the tag in its
+         // low 7 bits. A block that is not 128-byte aligned, or lies above the handle's range,
+         // would be silently truncated into a different address — so refuse it here, once per
+         // allocation, rather than trusting an assert (compiled out in release builds).
+         if constexpr (!indexed)
+            if (!Ptr::addressable(std::to_address(p), node_block_bytes - 1)) [[unlikely]]
+               refuse_node_block_(p, nb);
+         return p;
+      }
+      // The refusal is out of line and cold: the allocation path keeps one mask-and-branch.
+      template <class P>
+      [[noreturn, gnu::cold, gnu::noinline]] void refuse_node_block_(P p, size_t nb)
+      {
+         node_alloc_t na(alloc_);
+         node_at::deallocate(na, p, nb);
+         throw bad_allocation_address(
+             "artpp::map: the allocator returned a node block that is not 128-byte aligned "
+             "or whose address does not fit the handle (use artpp_handle = packed_ptr_t<8>)");
+      }
+      template <class P>
+      [[noreturn, gnu::cold, gnu::noinline]] void refuse_term_block_(P p, size_t nu)
+      {
+         term_alloc_t ta(alloc_);
+         term_at::deallocate(ta, p, nu);
+         throw bad_allocation_address(
+             "artpp::map: the allocator returned a leaf block that is not aligned to "
+             "max(16, alignof(T)) or whose address does not fit the handle "
+             "(use artpp_handle = packed_ptr_t<8>)");
+      }
+      [[noreturn, gnu::cold, gnu::noinline]] void refuse_term_region_block_(void* p, size_t n)
+      {
+         if constexpr (has_term_region_<Allocator>::value) alloc_.artpp_free_term(p, n);
+         else { (void)p; (void)n; }
+         throw bad_allocation_address(
+             "artpp::map: the allocator's terminal region returned a block that is not "
+             "16-byte aligned or whose address does not fit the handle");
       }
       void node_free_(void* p, size_t n) noexcept
       {
@@ -643,7 +680,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // OVER-ALIGNED VALUES: a leaf is [header | pad to alignof(T) | T | key bytes], so the
       // value is aligned only if the leaf's base is. For alignof(T) > 16 the terminal unit
       // therefore grows to alignof(T) (size and alignment), which the rebound allocator must
-      // honour like any other over-aligned type. Everything else that
+      // honour like any other over-aligned type (term_alloc_ checks). Everything else that
       // holds a T — a setlist's inline leaves, bucket entries — sits at an alignof(T)-aligned
       // offset inside a 128-byte-aligned node, hence the 128 ceiling. A terminal-region
       // allocator (line_pool) hands out 16-byte-granular storage only.
@@ -663,11 +700,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
       void* term_alloc_(size_t n)  // throws bad_alloc — same fault point as node_alloc_
       {
          if constexpr (has_term_region_<Allocator>::value)
-            return alloc_.artpp_alloc_term(n);
+         {
+            void* p = alloc_.artpp_alloc_term(n);
+            if constexpr (!indexed)  // a terminal region addressed by direct handles
+               if (!Ptr::addressable(p, 15)) [[unlikely]] refuse_term_region_block_(p, n);
+            return p;
+         }
          else
          {
             term_alloc_t ta(alloc_);
-            return term_at::allocate(ta, tunits_(n));
+            const size_t nu = tunits_(n);
+            auto         p  = term_at::allocate(ta, nu);
+            if constexpr (!indexed)  // same contract as node_alloc_, at the terminal alignment
+               if (!Ptr::addressable(std::to_address(p), term_unit - 1)) [[unlikely]]
+                  refuse_term_block_(p, nu);
+            return p;
          }
       }
       void term_free_(void* p, size_t n) noexcept
@@ -4674,7 +4721,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // anywhere yet, so it must go back to the allocator here or it is lost. (try/catch,
       // not a guard object: zero-cost on the non-throwing path, nothing for trivial T.)
       template <class VF>
-      void leaf_construct_(char* p, size_t alloc_bytes, VF&& val)
+      [[gnu::always_inline]] void leaf_construct_(char* p, size_t alloc_bytes, VF&& val)
       {
          if constexpr (HasValue)
          {
@@ -4688,7 +4735,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else { (void)p; (void)alloc_bytes; (void)val; }  // set: a leaf is the key bytes only
       }
       template <class VF>
-      packed_ptr make_leaf(std::string_view suf, VF&& val)  // suffix-only (compressed) leaf
+      [[gnu::always_inline]] packed_ptr make_leaf(std::string_view suf, VF&& val)  // suffix-only (compressed) leaf
       {
          const size_t sz = leaf_size(suf.size());
          char*        p  = static_cast<char*>(term_alloc_(sz));
@@ -4698,7 +4745,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          return pack_term_(p, K::value_ptr);
       }
       template <class VF>
-      packed_ptr make_leaf_full(std::string_view pfx, std::string_view suf, VF&& val)  // whole key
+      [[gnu::always_inline]] packed_ptr make_leaf_full(std::string_view pfx, std::string_view suf, VF&& val)  // whole key
       {
          const size_t sz = leaf_size(pfx.size() + suf.size());
          char*        p  = static_cast<char*>(term_alloc_(sz));
@@ -4726,8 +4773,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // = key[depth:]). Stores the WHOLE key contiguously iff the prefix fits in the node
       // blocks we'd allocate anyway (free) → enables zero-copy key() during iteration;
       // else falls back to suffix-only. depth must fit the leaf's 15-bit prefix_len field.
+      // always_inline (here and on make_leaf / make_leaf_full): this is the one allocation
+      // every insert of a new key makes. Left to the inliner's budget the chain tips out of
+      // line when the allocation path grows by so much as a checked branch (measured: +3% on
+      // uniform inserts), so the decision is pinned.
       template <class VF>
-      packed_ptr make_value_at(std::string_view key, size_t depth, VF&& val)
+      [[gnu::always_inline]] packed_ptr make_value_at(std::string_view key, size_t depth, VF&& val)
       {
          const std::string_view suf = key.substr(depth);
          if constexpr (!HasValue)  // SET: pack a short suffix into the handle (no leaf alloc)

@@ -603,6 +603,90 @@ static void regression_deep_tree_small_stack()
    run_on_stack(stack, [](int n) { deep_tree_ops<uint64_t, mode::wide_stems>(n); }, N);
 }
 
+// ── audit #16: blocks the handle cannot address are refused, not truncated ───────
+// A direct handle packs the block's address into 6 bytes and keeps its tag in the low
+// bits. Both requirements on the allocator — alignment (128 for nodes, 16 for leaves) and
+// an address below 2^48 — were checked only by assert, so a release build silently built
+// a handle to a different address. They are now checked where the block is allocated:
+// the block goes back to the allocator and bad_allocation_address (a std::bad_alloc) is
+// thrown, before anything is written through it.
+static int                  g_odd_mode = 0;  // 1: nodes 64 mod 128   2: leaves 8 mod 16   3: top-byte tag on nodes
+static long                 g_odd_alloc = 0, g_odd_free = 0, g_odd_foreign = 0;
+static std::set<void*>      g_odd_live;      // exactly the pointers allocate() handed out
+template <class T>
+struct odd_alloc
+{
+   using value_type = T;
+   odd_alloc() = default;
+   template <class U>
+   odd_alloc(const odd_alloc<U>&) noexcept {}
+   T* allocate(std::size_t n)
+   {
+      const std::size_t A   = alignof(T);
+      char*             raw = static_cast<char*>(::operator new(n * sizeof(T) + 2 * A + sizeof(void*)));
+      std::uintptr_t    u   = (reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*) + A - 1) / A * A;  // aligned
+      if ((g_odd_mode == 1 && A == 128) || (g_odd_mode == 2 && A == 16)) u += A / 2;  // under-aligned
+      std::memcpy(reinterpret_cast<char*>(u) - sizeof(void*), &raw, sizeof(void*));
+      if (g_odd_mode == 3 && A == 128) u |= std::uintptr_t(0xB4) << 56;  // HWASan/MTE-style tagged pointer
+      ++g_odd_alloc;
+      g_odd_live.insert(reinterpret_cast<void*>(u));
+      return reinterpret_cast<T*>(u);
+   }
+   void deallocate(T* p, std::size_t) noexcept
+   {
+      ++g_odd_free;
+      if (g_odd_live.erase(p) == 0) { ++g_odd_foreign; return; }  // not a pointer we handed out
+      const std::uintptr_t u = reinterpret_cast<std::uintptr_t>(p) & ~(std::uintptr_t(0xFF) << 56);
+      char*                raw;
+      std::memcpy(&raw, reinterpret_cast<char*>(u) - sizeof(void*), sizeof(void*));
+      ::operator delete(raw);
+   }
+   template <class U>
+   bool operator==(const odd_alloc<U>&) const noexcept { return true; }
+};
+static void regression_unaddressable_blocks()
+{
+   using Tree = map<std::string_view, uint64_t, mode::none, odd_alloc<uint64_t>>;
+   for (int bad : {1, 2, 3})
+   {
+      g_odd_alloc = g_odd_free = g_odd_foreign = 0;
+      {
+         Tree t;
+         g_odd_mode = 0;  // a healthy start: one leaf, then a split that needs a node
+         CHECK(t.insert("alpha", 1));
+         CHECK(t.insert("beta", 2));
+         g_odd_mode = bad;
+         int threw = 0, specific = 0;
+         for (const char* k : {"alpine", "gamma", "be", "alphabet"})
+         {
+            try { t.insert(k, 9); }
+            catch (const artpp::bad_allocation_address& e) { ++threw; ++specific; CHECK(e.what()[0] == 'a'); }
+            catch (const std::bad_alloc&) { ++threw; }
+         }
+         CHECK(threw > 0 && threw == specific);  // refused, with the specific exception type
+         g_odd_mode = 0;
+         uint64_t v = 0;                      // the tree is intact and still usable
+         CHECK(t.find("alpha", v) && v == 1);
+         CHECK(t.find("beta", v) && v == 2);
+         size_t n = 0;
+         for (auto it = t.begin(); it != t.end(); ++it) ++n;
+         CHECK(n == t.size());
+         CHECK(t.insert("gamma", 3) || t.contains("gamma"));
+         CHECK(t.find("gamma", v));
+      }
+      CHECK(g_odd_alloc == g_odd_free);  // every refused block went back to the allocator …
+      CHECK(g_odd_foreign == 0);         // … as the very pointer it was handed (no truncation)
+      CHECK(g_odd_live.empty());
+   }
+   g_odd_mode = 0;
+   {  // an allocator that opts into full-width handles may use the whole address space
+      CHECK(artpp::packed_ptr_t<8>::addressable(reinterpret_cast<void*>(std::uintptr_t(0xB4) << 56), 0x7f));
+      CHECK(!artpp::packed_ptr_t<6>::addressable(reinterpret_cast<void*>(std::uintptr_t(1) << 48), 0x7f));
+      CHECK(!artpp::packed_ptr_t<6>::addressable(reinterpret_cast<void*>(std::uintptr_t(64)), 0x7f));
+      CHECK(artpp::packed_ptr_t<6>::addressable(reinterpret_cast<void*>((std::uintptr_t(1) << 48) - 128), 0x7f));
+   }
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
@@ -613,6 +697,7 @@ int main()
    regression_assign_present_key();
    regression_overaligned_values();
    regression_deep_tree_small_stack();
+   regression_unaddressable_blocks();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;
