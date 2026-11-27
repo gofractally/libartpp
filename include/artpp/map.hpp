@@ -850,8 +850,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
 
      private:
-      // The one insert descent. Assign decides the exact-match action: overwrite (insert)
+      // The one insert entry. Assign decides the exact-match action: overwrite (insert)
       // or leave untouched (emplace); everything else — splits, widens, growth — is shared.
+      //
+      // INVARIANT (README, Iterators / Invalidation): when the key is already PRESENT the
+      // tree is not restructured — no node is allocated, freed or moved, so iterators and
+      // value references stay valid. Every step that reshapes the path (externalizing an
+      // inline leaf, collapsing to a bucket, fusing a prefix node) therefore happens only
+      // once the key is known to be absent, or after a new key has actually been added.
       template <bool Assign, class VF>
       bool insert_(key_param k, VF&& v)
       {
@@ -866,10 +872,64 @@ namespace detail  // implementation types & node helpers — not part of the pub
             count_ += ins;
             return ins;
          }
+         return insert_descend_<Assign>(key, std::forward<VF>(v));
+      }
+      // Can a prefix node of `pl` bytes above `nx` live in nx's header cacheline instead?
+      bool pn_fusable_(size_t pl, packed_ptr nx) const noexcept
+      {
+         return (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
+                (nx.tag() == K::pfxd && pfxd_kind(deref_(nx)) == K::node_full &&
+                 pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP);
+      }
+      void fuse_prefix_node_(packed_ptr* ps) noexcept
+      {
+         const packed_ptr pp = *ps;
+         if (pp.tag() != K::prefix_node) return;
+         char*            P  = static_cast<char*>(deref_(pp));
+         const uint16_t   pl = pn_plen(P);
+         const packed_ptr nx = pn_next<Ptr>(P);
+         if (!pn_fusable_(pl, nx)) return;
+         // make_prefix takes its alloc-free fusion branch (same predicate): memcpy + retag
+         *ps = make_prefix(std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
+         node_free_(P, pn_size<Ptr>(pl));
+      }
+      // A setlist's INLINE leaf child i matched the key's stem byte. If its suffix is the
+      // rest of the key, the key is present: assign in place (or leave it, for emplace) and
+      // report true — the caller must not externalize or otherwise reshape the line.
+      template <bool Assign, class VF>
+      bool sl_inline_present_(setlist* s, int i, std::string_view rem, VF&& v)
+      {
+         char* lf = sl_inline_leaf(s, i);
+         if (std::string_view(reinterpret_cast<const char*>(leaf_suf(lf)), leaf_slen(lf)) != rem)
+            return false;
+         if constexpr (Assign && HasValue) vf_assign(std::forward<VF>(v), leaf_val(lf));
+         return true;
+      }
+      // Does the terminal `cur` hold exactly the key whose remaining bytes are `rem`?
+      bool term_is_key_(packed_ptr cur, std::string_view rem) const noexcept
+      {
+         if (cur.tag() == K::value_inline)
+         {
+            if constexpr (!HasValue) return suffix_of_inline(cur) == rem;  // set: packed suffix
+            else                     return rem.empty();                   // map: empty suffix
+         }
+         const char* L = static_cast<const char*>(deref_term_(cur));
+         return std::string_view(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L)) == rem;
+      }
+      template <bool Assign, class VF>
+      [[gnu::always_inline]] bool insert_descend_(std::string_view key, VF&& v)
+      {
          // Iterative descent (mirrors find): walk to the insertion point keeping a
          // pointer to the SLOT that holds `cur`, and write only there. No recursion,
          // no per-level function calls, and pass-through levels do zero writes.
          packed_ptr* slot   = &root_;
+         // Slot of the last prefix node passed. A prefix node directly above a node_full
+         // belongs in the full's header cacheline (the dedicated node is only the overflow
+         // form); that shape appears when the router under it WIDENS, so the two grow sites
+         // below fuse it right there (fuse_prefix_node_) — after the new key is in, never on
+         // the way to a key that may turn out to be present. Written only in the prefix arm,
+         // read only on the (rare) widen path: the common paths pay nothing for it.
+         packed_ptr* pn_slot = nullptr;
          [[maybe_unused]] packed_ptr* pslot = nullptr;  // slot holding the parent of *slot (for fusion)
          size_t      depth  = 0;
          [[maybe_unused]] unsigned lowfan = 0;  // routers with <3 branches (deep-narrow signature)
@@ -973,6 +1033,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   bool inserted;
                   if constexpr (Adaptive)
                      if (lowfan >= 2 &&  // deep-narrow leaf collision → bucket, iff BOTH the old
+                         !term_is_key_(cur, key.substr(depth)) &&  // present key: assign, never collapse
                          bkt_fits2(cur.tag() == K::value_inline  // and new suffixes share one page
                                        // map inline → empty suffix; set inline → packed suffix len
                                        ? (HasValue ? size_t(0) : suffix_of_inline(cur).size())
@@ -995,24 +1056,11 @@ namespace detail  // implementation types & node helpers — not part of the pub
                {
                   char*          P  = static_cast<char*>(deref_(cur));
                   const uint16_t pl = pn_plen(P);
-                  // Lazy fusion: a prefix node sitting directly above a node_full migrates
-                  // into the full's header cacheline on the first write that touches it —
-                  // the dedicated node was only ever the overflow form. Alloc-free (the
-                  // make_prefix fusion branch memcpys + retags), then re-dispatch.
-                  if (const packed_ptr nx = pn_next<Ptr>(P);
-                      (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
-                      (nx.tag() == K::pfxd &&
-                       pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
-                  {
-                     *slot = make_prefix(
-                         std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
-                     node_free_(P, pn_size<Ptr>(pl));
-                     continue;  // *slot is now the fused node; the pfxd arm consumes
-                  }
                   std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
                   const size_t     c = lcp(PP, key.substr(depth));
                   if (c == PP.size())  // whole prefix matched -> descend into next
                   {
+                     pn_slot = slot;  // fusion candidate if the router below widens
                      if constexpr (WideStems) pslot = slot;
                      slot  = reinterpret_cast<packed_ptr*>(P + 2);  // the next-pointer slot
                      depth += PP.size();
@@ -1052,8 +1100,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   if (int i = setlist_index(s, byte); i >= 0)  // existing child -> descend
                   {
                      // An inline-leaf child must become a real leaf before descent: the
-                     // generic loop (split_leaf) treats *slot as an external value_ptr.
-                     if (sl_is_inline(s, i)) sl_externalize_(s, i);  // throws → strong: unchanged
+                     // generic loop (split_leaf) treats *slot as an external value_ptr. But
+                     // externalizing repacks the line (moving its other inline values), so
+                     // first settle the exact-match case in place.
+                     if (sl_is_inline(s, i))
+                     {
+                        if (sl_inline_present_<Assign>(s, i, key.substr(depth + 1), std::forward<VF>(v)))
+                           return false;
+                        sl_externalize_(s, i);  // throws → strong: unchanged
+                     }
                      if constexpr (WideStems) pslot = slot;
                      slot  = &s->branch[i];
                      ++depth;
@@ -1076,6 +1131,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   build_guard glf{this, &lf};  // widen() can throw; don't orphan the new value
                   grow_router_(slot, cur, byte, lf);
                   glf.release();  // lf is now linked into the widened node
+                  if (pn_slot) fuse_prefix_node_(pn_slot);
                   ++count_;
                   return true;
                }
@@ -1133,6 +1189,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   build_guard glf{this, &lf};  // grow can throw; don't orphan the new value
                   grow_router_(slot, cur, byte, lf);  // re-anchors *slot across the widen ladder
                   glf.release();
+                  if (pn_slot) fuse_prefix_node_(pn_slot);
                   ++count_;
                   return true;
                }
@@ -3022,21 +3079,21 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                char*          P  = static_cast<char*>(deref_(node));
                const uint16_t pl = pn_plen(P);
-               if (const packed_ptr nx = pn_next<Ptr>(P);  // lazy fusion, as in insert_
-                   (nx.tag() == K::node_full && pl <= node_full::PFX_CAP) ||
-                   (nx.tag() == K::pfxd && pl + pfxd_plen(deref_(nx)) <= node_full::PFX_CAP))
-               {
-                  packed_ptr fused = make_prefix(
-                      std::string_view(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl), nx);
-                  node_free_(P, pn_size<Ptr>(pl));
-                  return bkt_put<Assign>(fused, key, depth, std::forward<VF>(val), ins);
-               }
                std::string_view PP(reinterpret_cast<const char*>(pn_pfx<Ptr>(P)), pl);
                const size_t     c = lcp(PP, key.substr(depth));
                if (c == PP.size())
                {
                   packed_ptr nn = bkt_put<Assign>(pn_next<Ptr>(P), key, depth + c, std::forward<VF>(val), ins);
                   pn_set_next(P, nn);
+                  // Lazy fusion, as in insert_: only after a key was ADDED below (an assignment
+                  // to a present key must not restructure), and alloc-free — nothing can throw
+                  // between freeing P and handing the fused node back to the parent slot.
+                  if (ins && pn_fusable_(pl, nn))
+                  {
+                     packed_ptr fused = make_prefix(PP, nn);
+                     node_free_(P, pn_size<Ptr>(pl));
+                     return fused;
+                  }
                   return node;
                }
                ins = true;
@@ -3069,7 +3126,15 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   // An inline-leaf child must become a real leaf before descent: bkt_put (like
                   // split_leaf below) treats the branch slot as an external value_ptr handle, so
                   // an inline tail-offset would be mis-deref'd. Mirrors insert_'s setlist arm.
-                  if (sl_is_inline(s, i)) sl_externalize_(s, i);  // throws → strong: unchanged
+                  if (sl_is_inline(s, i))
+                  {
+                     if (sl_inline_present_<Assign>(s, i, key.substr(depth + 1), std::forward<VF>(val)))
+                     {
+                        ins = false;  // present key: assigned in place, the line is untouched
+                        return node;
+                     }
+                     sl_externalize_(s, i);  // throws → strong: unchanged
+                  }
                   s->branch[i] = bkt_put<Assign>(s->branch[i], key, depth + 1, std::forward<VF>(val), ins);
                   return node;
                }

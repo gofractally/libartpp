@@ -21,6 +21,11 @@ before 1.0 a minor version may change the API.
   null child in a surviving node, so `begin()`, `for_each` and `lower_bound`
   crashed afterwards. The cascade now continues by re-descent past the
   64-level path window and is correct at any depth (#3).
+- `insert`, `insert_or_assign`, `upsert` and `emplace` on a key that is already
+  present no longer restructure the tree, so iterators and references stay
+  valid as the README promises. Previously such a call could move the values
+  of neighbouring keys, free the key's leaf (`mode::adaptive`) or free a prefix
+  node that live iterators still pointed at (#11).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in

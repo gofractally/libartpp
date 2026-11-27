@@ -263,6 +263,138 @@ static void regression_erase_cascade_past_window()
    }
 }
 
+// ── audit #11: assigning to a PRESENT key must not restructure the tree ───────────
+// README, Iterators / Invalidation: insert / insert_or_assign / emplace on a key that is
+// already present keep every iterator and value reference valid. Three paths broke that:
+//   * a setlist's inline leaf child was externalized (and the line repacked, moving the
+//     OTHER inline values) before the key was known to be present;
+//   * adaptive mode collapsed the matching leaf into a bucket, freeing it;
+//   * a prefix node above a node_full was fused into the full's header (and freed) by any
+//     write passing through it, leaving iterators with a frame on the freed node.
+// The check is exact and needs no sanitizer: across the assignment the allocator must see
+// no allocation and no deallocation, the value's address must not change, and iterators
+// taken before it (on the key and on its successor) must still read the right elements.
+static long g_nalloc = 0, g_nfree = 0;
+template <class T>
+struct count_alloc
+{
+   using value_type = T;
+   count_alloc()    = default;
+   template <class U>
+   count_alloc(const count_alloc<U>&) noexcept {}
+   T* allocate(std::size_t n)
+   {
+      ++g_nalloc;
+      return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(alignof(T))));
+   }
+   void deallocate(T* p, std::size_t) noexcept
+   {
+      ++g_nfree;
+      ::operator delete(p, std::align_val_t(alignof(T)));
+   }
+   template <class U>
+   bool operator==(const count_alloc<U>&) const noexcept { return true; }
+};
+template <class V, mode M>
+static void assign_present(const std::vector<std::string>& keys, const char* where)
+{
+   using Tree = map<std::string_view, V, M, count_alloc<V>>;
+   const long a_start = g_nalloc, f_start = g_nfree;
+   {
+      Tree                     t;
+      std::map<std::string, V> oracle;
+      int                      x = 0;
+      for (auto& k : keys) { const V v = chain_val<V>(x++); t.insert_or_assign(k, v); oracle[k] = v; }
+      for (auto& k : keys)
+      {
+         auto it = t.find(k);
+         CHECK(it != t.end());
+         auto nx = it;
+         ++nx;  // an iterator on the successor, taken before the assignment
+         const V* p = nullptr;
+         if constexpr (!Tree::inlineable) p = t.find_ptr(k);
+         auto quiet = [&, a0 = g_nalloc, f0 = g_nfree] { return g_nalloc == a0 && g_nfree == f0; };
+         auto same  = [&](const V& v) {
+            CHECK(quiet());  // nothing allocated, nothing freed: the structure is untouched
+            if constexpr (!Tree::inlineable)
+            {
+               CHECK(t.find_ptr(k) == p);  // the value did not move …
+               CHECK(*p == v);             // … and a reference held across the call reads it
+               CHECK(it.value() == v);     // non-inline values are read live through iterators
+            }
+            CHECK(std::string(it.key_bytes()) == k);
+            auto oi = oracle.find(k);
+            ++oi;
+            CHECK((nx == t.end()) == (oi == oracle.end()));
+            if (oi != oracle.end())
+            {
+               CHECK(std::string(nx.key_bytes()) == oi->first);
+               CHECK(nx.value() == oi->second);
+            }
+            auto step = it;  // walking on from the held iterator reaches the successor
+            ++step;
+            CHECK(step == nx);
+         };
+         V v = chain_val<V>(x++);
+         CHECK(!t.insert_or_assign(k, v));
+         oracle[k] = v;
+         same(v);
+         v = chain_val<V>(x++);
+         CHECK(!t.insert(k, v));
+         oracle[k] = v;
+         same(v);
+         CHECK(!t.emplace(k, chain_val<V>(x++)));  // present: left untouched
+         same(v);
+      }
+      agree<Tree, V>(t, oracle, where);
+   }
+   CHECK(g_nalloc - a_start == g_nfree - f_start);
+}
+template <class V>
+static void assign_present_all_modes(const std::vector<std::string>& keys, const char* where)
+{
+   assign_present<V, mode::none>(keys, where);
+   assign_present<V, mode::dense_tiers>(keys, where);
+   assign_present<V, mode::dense_tiers | mode::ladder_c8>(keys, where);
+   assign_present<V, mode::wide_stems>(keys, where);
+   assign_present<V, mode::adaptive>(keys, where);
+   assign_present<V, mode::adaptive | mode::dense_tiers>(keys, where);
+   assign_present<V, mode::buckets>(keys, where);
+}
+static void regression_assign_present_key()
+{
+   std::vector<std::vector<std::string>> shapes;
+   shapes.push_back({"apple", "apricot"});                        // two inline leaves in one line
+   shapes.push_back({"a", "ab", "abc", "abcd", "abcde", "abx"});  // adaptive deep-narrow collapse
+   for (int fan : {17, 40, 200})  // a long shared prefix over a router that widens to node_full
+   {
+      std::vector<std::string> v;
+      const std::string        pfx = "0123456789AB";
+      for (int i = 0; i < fan; ++i) v.push_back(pfx + char(1 + i) + "tail");
+      v.push_back(pfx);                        // a key ending at the router (its term)
+      v.push_back(pfx + char(1) + "tail2");    // and a leaf split below it
+      shapes.push_back(v);
+   }
+   {
+      std::vector<std::string> v;  // clustered: inline leaves, terms, buckets
+      for (int a = 0; a < 6; ++a)
+      {
+         v.push_back(std::string("k") + char('a' + a));
+         for (int b = 0; b < 6; ++b) v.push_back(std::string("k") + char('a' + a) + char('a' + b) + "x");
+      }
+      v.push_back("");
+      v.push_back(std::string(600, 'L'));  // over a bucket page: a plain leaf even in bucket mode
+      v.push_back(std::string(600, 'L') + "s");
+      shapes.push_back(v);
+   }
+   for (auto& keys : shapes)
+   {
+      assign_present_all_modes<uint64_t>(keys, "assign present u64");
+      assign_present_all_modes<std::string>(keys, "assign present string");
+      assign_present_all_modes<uint32_t>(keys, "assign present u32 (inline values)");
+   }
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
@@ -270,6 +402,7 @@ int main()
    regression_bkt_put_inline_leaf();
    regression_walk_dense_routers();
    regression_erase_cascade_past_window();
+   regression_assign_present_key();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;

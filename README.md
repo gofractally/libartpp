@@ -326,8 +326,10 @@ iterators) is a **bidirectional proxy iterator**:
 **Invalidation.** Any structurally mutating operation (`insert`, `emplace`,
 `upsert`, `remove`, `erase`, `clear`, `operator[]` on a missing key) invalidates
 all iterators, and may invalidate references obtained from
-`at`/`find_ptr`/`operator[]` whose leaf or bucket was restructured. `update`
-(and assignment to a present key) never restructures, so iterators stay valid —
+`at`/`find_ptr`/`operator[]` whose leaf or bucket was restructured. `update`,
+and `insert` / `insert_or_assign` / `upsert` / `emplace` on a key that is
+**already present**, never restructure — no node is allocated, freed or moved —
+so iterators and references stay valid, in every mode;
 but note an iterator positioned on a small *inline* value holds a copy made when
 it was positioned and will not observe later updates; non-inline values are
 always read live. The safe rule: re-acquire after mutation.
@@ -589,8 +591,6 @@ fixed:
   constructors throw (#4 to #7, #12, #13).
 - **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
   stale or never-checkpointed store is not detected (#8 to #10).
-- **Assigning to a present key** with `insert` or `insert_or_assign` can
-  invalidate iterators and references, contrary to [Iterators](#iterators) (#11).
 
 Reproducers are in [tests/known_bugs](tests/known_bugs).
 

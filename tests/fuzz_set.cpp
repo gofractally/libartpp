@@ -127,8 +127,26 @@ static void run_impl(Set& s, Reader& r)
       const uint8_t     choice = raw >= 252 ? 8 : raw >= 248 ? 9 : raw % 8;
       switch (choice)
       {
-         case 0: FZCHECK(s.insert(k).second == o.insert(k).second, op); break;
-         case 1: FZCHECK(s.emplace(k).second == o.emplace(k).second, op); break;
+         case 0:
+         case 1:  // insert / emplace; on a PRESENT key nothing may move (audit #11): iterators
+         {        // taken before the call — on the key and on its successor — must stay exact
+            const bool present = o.count(k) != 0;
+            auto       it = s.end(), nx = s.end();
+            if (present) { it = s.find(k); nx = it; ++nx; }
+            if (choice == 0) FZCHECK(s.insert(k).second == o.insert(k).second, op);
+            else             FZCHECK(s.emplace(k).second == o.emplace(k).second, op);
+            if (present)
+            {
+               auto oi = o.find(k);
+               FZCHECK(it != s.end() && std::string(it.key_bytes()) == k, op);
+               ++oi;
+               FZCHECK((nx == s.end()) == (oi == o.end()), op);
+               if (oi != o.end()) FZCHECK(std::string(nx.key_bytes()) == *oi, op);
+               ++it;
+               FZCHECK(it == nx, op);
+            }
+            break;
+         }
          case 2: FZCHECK(s.erase(k) == o.erase(k), op); break;
          case 3:  // erase through an iterator at lower_bound(k)
          {

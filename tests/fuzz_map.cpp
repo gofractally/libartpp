@@ -20,6 +20,8 @@
 //   * two rare ops build and tear down a deep single-child CHAIN (base + s^i + "t" for i < n, plus
 //     base + s^n; n up to ~200): erasing the t-keys deepest first and then the last key makes one
 //     erase free a chain far longer than remove()'s 64-level path window (audit #3).
+//   * insert / emplace on a PRESENT key hold an iterator on the key, one on its successor and a
+//     pointer to the value across the call, and require all three to stay exact (audit #11).
 #include "artpp/map.hpp"
 #include "artpp/pool.hpp"
 
@@ -161,6 +163,37 @@ static void run_impl(Tree& t, Reader& r)
       if (leaf) k.push_back('t');
       return k;
    };
+   // Assigning to a PRESENT key must not restructure (audit #11): hold an iterator on the key,
+   // one on its successor and a pointer to the value across the call, then require all three to
+   // still be exact. Under ASan a freed or repacked node shows up here as a use-after-free.
+   struct held
+   {
+      bool                          on = false;
+      typename Tree::const_iterator it, nx;
+      const V*                      p = nullptr;
+   };
+   auto hold = [&](const std::string& k) {
+      held h;
+      if (m.count(k) == 0) return h;
+      h.on = true;
+      h.it = t.find(k);
+      h.nx = h.it;
+      ++h.nx;
+      h.p = t.find_ptr(k);
+      return h;
+   };
+   auto still = [&](held& h, const std::string& k, int op) {
+      if (!h.on) return;
+      auto mi = m.find(k);
+      FZCHECK(h.it != t.end() && std::string(h.it.key_bytes()) == k && h.it.value() == mi->second, op);
+      FZCHECK(t.find_ptr(k) == h.p && *h.p == mi->second, op);
+      ++mi;
+      FZCHECK((h.nx == t.end()) == (mi == m.end()), op);
+      if (mi != m.end())
+         FZCHECK(std::string(h.nx.key_bytes()) == mi->first && h.nx.value() == mi->second, op);
+      ++h.it;
+      FZCHECK(h.it == h.nx, op);
+   };
    const bool               wide = r.u8() & 1;  // per-run: narrow (clustered) vs wide (fan-out) keys
    int                      op   = 0;
    for (; !r.done(); ++op)
@@ -174,8 +207,22 @@ static void run_impl(Tree& t, Reader& r)
                       m.size(), k.empty() ? -1 : (int)(unsigned char)k[0]);
       switch (choice)
       {
-         case 0: { V v = mkval<V>(r); FZCHECK(t.insert(k, v) == m.insert_or_assign(k, v).second, op); break; }
-         case 1: { V v = mkval<V>(r); FZCHECK(t.emplace(k, v) == m.try_emplace(k, v).second, op); break; }
+         case 0:
+         {
+            V    v = mkval<V>(r);
+            held h = hold(k);
+            FZCHECK(t.insert(k, v) == m.insert_or_assign(k, v).second, op);
+            still(h, k, op);
+            break;
+         }
+         case 1:
+         {
+            V    v = mkval<V>(r);
+            held h = hold(k);
+            FZCHECK(t.emplace(k, v) == m.try_emplace(k, v).second, op);
+            still(h, k, op);
+            break;
+         }
          case 2:
          {
             V v = mkval<V>(r);
