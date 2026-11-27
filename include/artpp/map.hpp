@@ -2946,12 +2946,27 @@ namespace detail  // implementation types & node helpers — not part of the pub
       }
       // Adaptive collapse: turn the leaf at a deep-narrow split point into a bucket
       // holding the old entry + the new key. Frees the old leaf.
+      //
+      // Exception safety (strong): the page is built COMPLETELY before the old leaf is
+      // touched. The new entry goes in first — it is the only step that runs user code that
+      // commonly throws (emplace arguments, a copy) — then the old value is carried over by
+      // relocate_src_ (moved if that cannot throw, else copied), and only then is the old
+      // leaf's value destroyed and the leaf freed, which cannot fail. A throw at any point
+      // unwinds through the guard: the page and whatever it holds go back, and *slot still
+      // holds the untouched leaf. (The index is kept sorted by insertion, so the order the
+      // two entries are added in does not matter.)
       template <bool Assign, class VF>
       packed_ptr collapse_to_bucket(packed_ptr cur, std::string_view key, size_t depth, VF&& val,
                                     bool& inserted)
       {
-         // The caller pre-checks bkt_fits for BOTH suffixes — neither insert can overflow.
-         bucket* b = new_bucket();
+         // The caller pre-checks bkt_fits2 for BOTH suffixes — neither insert can overflow —
+         // and that the key is absent, so the new entry is always an insertion.
+         bucket*     b  = new_bucket();
+         packed_ptr  bp = pack_(b, K::bucket);
+         build_guard g{this, &bp};
+         const int   r1 = bkt_insert_entry<Assign>(b, key.substr(depth), std::forward<VF>(val));
+         assert(r1 == 1 && "artpp: collapse_to_bucket pre-checked sizes and absence");
+         inserted = (r1 == 1);
          if (cur.tag() == K::value_inline)
          {
             if constexpr (!HasValue)  // SET: the inline handle carries a key suffix (not empty)
@@ -2975,16 +2990,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
          {
             char*            L = static_cast<char*>(deref_term_(cur));
             std::string_view S(reinterpret_cast<const char*>(leaf_suf(L)), leaf_slen(L));
-            T                ov(std::move(*leaf_val(L)));  // move out, then destruct the leaf's T
-            v_destroy(alloc_, leaf_val(L));
-            [[maybe_unused]] const int r0 = bkt_insert_entry(b, S, std::move(ov));
+            [[maybe_unused]] const int r0 = bkt_insert_entry(b, S, relocate_src_(*leaf_val(L)));
             assert(r0 == 1);
+            v_destroy(alloc_, leaf_val(L));  // committed: nothing below can throw
             term_free_(L, leaf_alloc_size(L));
          }
-         const int r1 = bkt_insert_entry<Assign>(b, key.substr(depth), std::forward<VF>(val));
-         assert(r1 >= 0 && "artpp: collapse_to_bucket pre-checked sizes; overflow is impossible");
-         inserted = (r1 == 1);
-         return pack_(b, K::bucket);
+         g.release();
+         return bp;
       }
       bool bkt_find(const bucket* b, std::string_view rem, T& out) const
       {

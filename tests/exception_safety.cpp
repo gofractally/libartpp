@@ -484,9 +484,18 @@ static void eh_erase(const char* cont, const char* scen, const std::vector<std::
 //   * iteration, size(), contains() and find() agree with the oracle;
 //   * the map is then worked on some more (inserts, assignments, erases) and must still
 //     agree, and after destruction every block and every value is accounted for.
+// The harness's own values are made with the value fault disarmed: every armed construction
+// is then one the MAP performs (the move into a leaf or bucket entry, a copy, a relocation).
+struct value_fault_pause
+{
+   long saved = g_vcountdown;
+   value_fault_pause() { g_vcountdown = -1; }
+   ~value_fault_pause() { g_vcountdown = saved; }
+};
 template <class V>
 static V mkv(uint64_t x)
 {
+   value_fault_pause p;
    if constexpr (std::is_arithmetic_v<V>) return V(x);
    else return V(std::string("value-long-enough-to-own-heap-memory-") + std::to_string(x));
 }
@@ -620,7 +629,8 @@ static auto put_keys(std::vector<std::string> keys, uint64_t v0)
       uint64_t x = v0;
       for (auto& k : keys)
       {
-         m.insert(k, mkv<V>(x));  // throws before the oracle learns of the key
+         V v = mkv<V>(x);
+         m.insert(k, std::move(v));  // throws before the oracle learns of the key
          o[k] = mks<V>(x);
          ++x;
       }
@@ -705,6 +715,50 @@ static void eh_bucket_erase(const char* cont, fault f)
    all.report(cont, "erase every key", f);
 }
 
+// audit #7: mode::adaptive turns a leaf at a deep, narrow split point into a bucket holding
+// the old entry and the new key. The old leaf was emptied and freed before the new value was
+// constructed, so a throwing constructor (emplace arguments, a copy, a move) left the slot
+// pointing at the freed leaf and leaked the new page.
+template <class Map>
+static auto emplace_key(std::string k)
+{
+   using V = typename Map::mapped_type;
+   return [k](Map& m, oracle_t& o) {
+      if constexpr (std::is_same_v<V, tvalue>)
+      {
+         if (m.emplace(k, "E", 7)) o[k] = "E7";  // constructed in place from the arguments
+      }
+      else
+      {
+         V v = mkv<V>(7);
+         if (m.emplace(k, std::move(v))) o[k] = mks<V>(7);
+      }
+   };
+}
+template <class Map>
+static void eh_adaptive_collapse(const char* cont, fault f)
+{
+   using V = typename Map::mapped_type;
+   const std::vector<std::pair<std::vector<std::string>, std::string>> shapes = {
+       {{"a", "ab", "abc"}, "abcd"},                                  // the new key extends the leaf's
+       {{"a", "ab", "abc" + std::string(30, 'x')}, "abcd"},           // old and new diverge, long old suffix
+       {{"a", "ab", "abcd"}, "abc"},                                  // the new key ends where the leaf starts
+       {{"q", "qr", "qrs", "qrst", "qrstu"}, "qrstu" + std::string(60, 'v')},
+   };
+   tally t;
+   for (auto& [pre, nk] : shapes)
+   {
+      eh_point<Map>(t, f, put_keys<Map>(pre, 0), emplace_key<Map>(nk));
+      eh_point<Map>(t, f, put_keys<Map>(pre, 0), put_keys<Map>({nk}, 7));  // insert(k, T&&)
+      eh_point<Map>(t, f, put_keys<Map>(pre, 0), [&](Map& m, oracle_t& o) {
+         const V v = mkv<V>(8);
+         m.insert_or_assign(nk, v);  // copies
+         o[nk] = mks<V>(8);
+      });
+   }
+   t.report(cont, "leaf -> bucket collapse", f);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -725,6 +779,7 @@ static void run_scenarios(const char* cont)
 
 int main()
 {
+   std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a crash must not swallow the lines before it
    using RefAlloc = throwing_alloc<std::pair<const std::string, counted>>;
    using RefMap   = std::map<std::string, counted, std::less<>, RefAlloc>;
    using HkvRadix = map<std::string_view, counted, mode::none, throwing_alloc<counted>>;  // flat (default)
@@ -839,6 +894,8 @@ int main()
    using BTv  = map<std::string_view, tvalue, mode::buckets, throwing_alloc<tvalue>>;
    using AStr = map<std::string_view, std::string, mode::adaptive, throwing_alloc<std::string>>;
    using ATv  = map<std::string_view, tvalue, mode::adaptive, throwing_alloc<tvalue>>;
+   using AU64 = map<std::string_view, uint64_t, mode::adaptive, throwing_alloc<uint64_t>>;
+   using AU32 = map<std::string_view, uint32_t, mode::adaptive, throwing_alloc<uint32_t>>;
    using BDenseU64  = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers, throwing_alloc<uint64_t>>;
    using BDense8U64 = map<std::string_view, uint64_t, mode::buckets | mode::dense_tiers | mode::ladder_c8,
                           throwing_alloc<uint64_t>>;
@@ -853,6 +910,11 @@ int main()
    eh_bucket_erase<BTv>("bucket/tvalue", fault::value);
    eh_bucket_erase<AStr>("adaptive/string", fault::alloc);
    eh_bucket_erase<ATv>("adaptive/tvalue", fault::value);
+   eh_adaptive_collapse<ATv>("adaptive/tvalue", fault::value);
+   eh_adaptive_collapse<ATv>("adaptive/tvalue", fault::alloc);
+   eh_adaptive_collapse<AStr>("adaptive/string", fault::alloc);
+   eh_adaptive_collapse<AU64>("adaptive/u64", fault::alloc);
+   eh_adaptive_collapse<AU32>("adaptive/u32", fault::alloc);
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");

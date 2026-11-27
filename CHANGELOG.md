@@ -76,6 +76,11 @@ before 1.0 a minor version may change the API.
   value was still in the map (use-after-free, double destruction). `erase`
   no longer throws in any mode: it repacks the bucket before destroying
   anything and, if that cannot be done, removes the entry in place (#6).
+- `mode::adaptive`: when a leaf was collapsed into a bucket and the new
+  value's constructor threw (`emplace` arguments, a throwing copy or move),
+  the tree kept pointing at the leaf it had already freed and leaked the new
+  bucket page. The page is now completed before the leaf is touched, so the
+  insert is all-or-nothing (#7).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #7 (exception safety in
