@@ -238,7 +238,7 @@ namespace artpp
       // (std::system_error with the errno; everything is released regardless). The destructor
       // does the same and has to ignore failures. Closing does NOT checkpoint. Afterwards the
       // pool is dead: no container may still be using it, and only close() and the destructor
-      // may be called.
+      // may be called (checkpoint() throws std::logic_error, an allocation pool_exhausted).
       void close()
       {
          int         err  = 0;
@@ -324,12 +324,12 @@ namespace artpp
       }
       void checkpoint(uint64_t root, uint64_t count)
       {
+         if (dead_) throw std::logic_error("artpp::line_pool::checkpoint: the pool is closed");
          if (count == 0)
             root = null_root;
          else if (!root_ok_(root, frontier_, tfrontier_))
             throw std::invalid_argument(
                 "artpp::line_pool::checkpoint: the root handle does not address this pool");
-         if (!nbase_) throw std::logic_error("artpp::line_pool::checkpoint: the pool is closed");
          if (file_backed()) write_image_(root, count, checkpoints_ + 1);
          ++checkpoints_;
          uroot_  = root;
@@ -369,11 +369,21 @@ namespace artpp
          std::memcpy(tfree_, s.tfree_, sizeof(tfree_));
       }
 
+      // free_max_ / tfree_max_ (see mark_dirty_) are the table sizes or 0. Stated for the
+      // optimizer, which otherwise cannot bound the index into the free-list tables (and, in
+      // GCC's case, warns about it); it generates no code.
+#if defined(__GNUC__)
+#define ARTPP_POOL_ASSUME_(cond) \
+   do { if (!(cond)) __builtin_unreachable(); } while (0)
+#else
+#define ARTPP_POOL_ASSUME_(cond) ((void)0)
+#endif
       // Allocate n contiguous lines: exact-size free list first, else bump the frontier
       // (committing more chunks as needed). Throws std::bad_alloc on cap/OS failure — the
       // tree's strong-guarantee fault point, same as any allocator.
       void* alloc_lines(size_t n)
       {
+         ARTPP_POOL_ASSUME_(free_max_ <= FREE_MAX);
          if (n <= free_max_)
          {
             if (const uint32_t head = free_[n]; head != NIL)
@@ -395,6 +405,7 @@ namespace artpp
       void free_lines(void* p, size_t n) noexcept
       {
          const uint32_t idx = uint32_t((static_cast<std::byte*>(p) - base_) / line_bytes);
+         ARTPP_POOL_ASSUME_(free_max_ <= FREE_MAX);
          if (n <= free_max_)
          {
             std::memcpy(p, &free_[n], 4);
@@ -407,6 +418,7 @@ namespace artpp
       // Terminal-region twins of alloc_lines/free_lines, in 16-byte units.
       void* alloc_term(size_t n)
       {
+         ARTPP_POOL_ASSUME_(tfree_max_ <= TFREE_MAX);
          if (n <= tfree_max_)
          {
             if (const uint32_t head = tfree_[n]; head != NIL)
@@ -426,6 +438,7 @@ namespace artpp
       void free_term(void* p, size_t n) noexcept
       {
          const uint32_t idx = uint32_t((static_cast<std::byte*>(p) - tbase_) / term_unit);
+         ARTPP_POOL_ASSUME_(tfree_max_ <= TFREE_MAX);
          if (n <= tfree_max_)
          {
             std::memcpy(p, &tfree_[n], 4);
@@ -439,6 +452,7 @@ namespace artpp
       static constexpr uint32_t NIL       = 0xFFFFFFFFu;
       static constexpr size_t   FREE_MAX  = 1024;  // node lists cover up to 128 KB
       static constexpr size_t   TFREE_MAX = 4096;  // terminal lists cover up to 64 KB
+#undef ARTPP_POOL_ASSUME_
 
       // ── the image: a header at the front of each region file ─────────────────────────
       // A file-backed pool reserves `hdr_` bytes at the front of BOTH files and maps the
