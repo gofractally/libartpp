@@ -29,9 +29,9 @@
 #include <unistd.h>
 
 static int g_fail = 0;
-#define CHECK(cond)                                                                          \
-   do {                                                                                      \
-      if (!(cond)) { std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); ++g_fail; } \
+#define CHECK(...)                                                                                    \
+   do {                                                                                               \
+      if (!(__VA_ARGS__)) { std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #__VA_ARGS__); ++g_fail; } \
    } while (0)
 
 using A   = artpp::pool_alloc<std::uint64_t>;
@@ -849,6 +849,138 @@ static void a_second_opener_is_refused_while_the_first_is_open()
    }
 }
 
+// ── #10: the store remembers which map wrote it ─────────────────────────────────────────
+// The bytes of a tree only mean something to the instantiation that wrote them. Attaching
+// another one (another mapped type, mode, key encoding, or a set) used to "work" and then
+// read nodes with the wrong layout.
+struct reversed_u64  // a key type with its own codec, which names its encoding
+{
+   std::uint64_t v;
+};
+namespace artpp
+{
+   template <>
+   struct key_codec<reversed_u64>
+   {
+      static constexpr std::uint64_t image_id = 0x7265767536340001ULL;
+      struct scratch
+      {
+         char b[8];
+      };
+      static std::string_view encode(const reversed_u64& k, scratch& s) noexcept
+      {
+         std::memcpy(s.b, &k.v, 8);
+         return std::string_view(s.b, 8);
+      }
+      static reversed_u64 decode(std::string_view b) noexcept
+      {
+         reversed_u64 k;
+         std::memcpy(&k.v, b.data(), 8);
+         return k;
+      }
+   };
+}  // namespace artpp
+template <class M>
+static bool attach_refused(const temp_store& s, bool low_level)
+{
+   using MA = typename M::allocator_type;
+   artpp::line_pool pool(s.c_str());
+   bool             refused = false;
+   try
+   {
+      if (low_level)
+         M m{MA{&pool}, artpp::attach, pool.root(), size_t(pool.count())};
+      else
+         M m{MA{&pool}, artpp::attach};
+   }
+   catch (const artpp::store_incompatible& e)
+   {
+      refused = std::string(e.what()).find(s.dir) != std::string::npos;
+   }
+   CHECK(!pool.dirty());  // a refused attach changes nothing
+   return refused;
+}
+static void attaching_another_instantiation_is_refused()
+{
+   using namespace artpp;
+   using SV = std::string_view;
+   using U64 = std::uint64_t;
+   temp_store s;
+   build_store(s, 500);  // written by map<string_view, uint64_t, mode::none>
+   for (int low_level = 0; low_level < 2; ++low_level)
+   {
+      const bool ll = low_level != 0;
+      CHECK(attach_refused<map<SV, std::uint32_t, mode::none, pool_alloc<std::uint32_t>>>(s, ll));  // sizeof(T)
+      struct alignas(16) wide { U64 a; };
+      CHECK(attach_refused<map<SV, wide, mode::none, pool_alloc<wide>>>(s, ll));                    // alignof(T)
+      CHECK(attach_refused<map<SV, U64, mode::buckets, A>>(s, ll));                                 // mode
+      CHECK(attach_refused<map<SV, U64, mode::adaptive, A>>(s, ll));
+      CHECK(attach_refused<map<SV, U64, mode::dense_tiers, A>>(s, ll));
+      CHECK(attach_refused<map<SV, U64, mode::wide_stems, A>>(s, ll));
+      CHECK(attach_refused<compact_map<SV, U64, 1000, A>>(s, ll));                // a hint that turns the ladder on
+      CHECK(attach_refused<map<U64, U64, mode::none, A>>(s, ll));                                   // key encoding
+      CHECK(attach_refused<map<std::int64_t, U64, mode::none, A>>(s, ll));
+      CHECK(attach_refused<map<reversed_u64, U64, mode::none, A>>(s, ll));
+      CHECK(attach_refused<set<SV, mode::none, pool_alloc<SV>>>(s, ll));                            // no value at all
+      CHECK(store_is_intact(s, 500));
+   }
+   {  // the same bytes under another key TYPE are the same image: std::string keys encode alike
+      line_pool pool(s.c_str());
+      map<std::string, U64, mode::none, A> m{A{&pool}, attach};
+      CHECK(m.size() == 500 && m.contains(key(17)));
+      map<SV, U64, mode::flat_full, A> f{A{&pool}, attach};  // flat_full only restates the default
+      CHECK(f.size() == 500);
+   }
+   {  // and each of the others refuses what it did not write, e.g. a set's image as a map
+      temp_store t;
+      {
+         line_pool                           pool(t.c_str());
+         set<SV, mode::none, pool_alloc<SV>> st{pool_alloc<SV>{&pool}, attach};
+         st.insert("one");
+         st.checkpoint();
+      }
+      CHECK(attach_refused<Map>(t, false));
+      CHECK(attach_refused<map<reversed_u64, U64, mode::none, A>>(t, false));
+      line_pool                           pool(t.c_str());
+      set<SV, mode::none, pool_alloc<SV>> st{pool_alloc<SV>{&pool}, attach};
+      CHECK(st.size() == 1 && st.contains("one"));
+   }
+}
+// The low-level calls carry the stamp as soon as a map has attached: pool.checkpoint(root,
+// count) writes the stamp of the map that was bound in this session.
+static void the_stamp_follows_the_low_level_calls()
+{
+   using namespace artpp;
+   using Other = map<std::string_view, std::uint64_t, mode::buckets, A>;
+   temp_store s;
+   {
+      line_pool pool(s.c_str());
+      Map       m{A{&pool}, attach, pool.root(), size_t(pool.count())};  // binds: this store is a Map's
+      for (int i = 0; i < 100; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      pool.checkpoint(m.root_handle(), m.size());
+   }
+   CHECK(attach_refused<Other>(s, true));
+   CHECK(attach_refused<Other>(s, false));
+   {
+      line_pool pool(s.c_str());
+      Map       m{A{&pool}, attach, pool.root(), size_t(pool.count())};
+      m.insert(key(100), 101);
+      pool.checkpoint(m.root_handle(), m.size());
+      bool refused = false;  // one store, one instantiation: a second kind cannot bind either
+      try
+      {
+         Other o{A{&pool}, attach};
+      }
+      catch (const store_incompatible&)
+      {
+         refused = true;
+      }
+      CHECK(refused);
+   }
+   CHECK(attach_refused<Other>(s, true));
+   CHECK(store_is_intact(s, 101));
+}
+
 int main()
 {
    struct test_case
@@ -879,6 +1011,8 @@ int main()
         a_change_that_allocates_nothing_is_detected_on_release},
        {"a_second_opener_is_refused_while_the_first_is_open",
         a_second_opener_is_refused_while_the_first_is_open},
+       {"attaching_another_instantiation_is_refused", attaching_another_instantiation_is_refused},
+       {"the_stamp_follows_the_low_level_calls", the_stamp_follows_the_low_level_calls},
    };
    for (const test_case& c : cases)
    {

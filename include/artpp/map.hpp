@@ -470,8 +470,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
    // file-backed line_pool). artpp_retains() says whether this allocator's storage is one
    // right now; the container then leaves its tree in place when it is destroyed instead of
    // freeing it node by node, and reports the tree it leaves behind with
-   // artpp_released(root, count). artpp_checkpoint(root, count) records the tree as the
-   // image's content and artpp_attach() returns the {root, count} last recorded.
+   // artpp_released(root, count). artpp_checkpoint(root, count, stamp) records the tree as
+   // the image's content, artpp_attach(stamp) returns the {root, count} last recorded and
+   // artpp_bind(stamp) only binds; `stamp` is the container's image_stamp(), which the
+   // image keeps and checks.
    template <class A, class = void>
    struct has_artpp_image_ : std::false_type
    {
@@ -549,6 +551,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
       template <class C>
       struct codec_zc_<C, std::void_t<decltype(C::zero_copy)>> : std::bool_constant<C::zero_copy> {};
       static constexpr bool codec_zero_copy = codec_zc_<codec>::value;
+      // The codec's name for its encoding, if it gives one (see key_codec.hpp); 0 = unknown.
+      template <class C, class = void>
+      struct codec_image_id_ : std::integral_constant<std::uint64_t, 0> {};
+      template <class C>
+      struct codec_image_id_<C, std::void_t<decltype(C::image_id)>>
+          : std::integral_constant<std::uint64_t, C::image_id> {};
       // The key-parameter type, three tiers:
       //  * zero-copy codecs whose Key converts to string_view (std::string,
       //    std::string_view): take std::string_view BY VALUE — map<string,T> and
@@ -910,9 +918,36 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          static_assert(indexed, "map attach is only for indexed (pool-backed) handles");
          rebase_();
+         // A persistent image is bound to the instantiation that attaches it, and refuses one
+         // that is not the instantiation that wrote it (throws store_incompatible).
+         if constexpr (has_artpp_image_<Allocator>::value) alloc_.artpp_bind(image_stamp());
          if (count == 0) return;  // root_ is null by default
          const uint32_t raw = uint32_t(root_handle);
          std::memcpy(root_.b, &raw, sizeof(root_.b));  // line_ptr is 4 bytes: reconstruct the root
+      }
+
+      // What this instantiation tells a persistent image about itself: everything the bytes of
+      // its tree depend on that the map can know. Two instantiations with equal stamps read
+      // and write the same image; a store keeps the stamp of the map that wrote it, and
+      // attaching any other is refused (store_incompatible) instead of reading nodes with the
+      // wrong layout. It cannot tell two mapped types of the same size and alignment apart
+      // (uint64_t and double), nor two key codecs that do not name their encoding.
+      static constexpr std::uint64_t image_layout = 1;  // bump when a node or leaf layout changes
+      static constexpr artpp::image_stamp image_stamp() noexcept
+      {
+         return {
+             (std::uint64_t(0x6172747070ULL) << 24) | (std::uint64_t(K_max) << 16) | image_layout,
+             std::uint64_t(sizeof(T)) | (std::uint64_t(alignof(T)) << 32),
+             // the EFFECTIVE configuration: flat_full and a capacity hint only choose DenseTiers
+             std::uint64_t(Buckets) | (std::uint64_t(Adaptive) << 1) | (std::uint64_t(DenseTiers) << 2) |
+                 (std::uint64_t(LadderC8) << 3) | (std::uint64_t(WideStems) << 4),
+             std::uint64_t(sizeof(Ptr)) | (std::uint64_t(HasValue) << 8) | (std::uint64_t(inlineable) << 9) |
+                 (std::uint64_t(inline_children_ok) << 10) | (std::uint64_t(term_unit) << 16),
+             codec_image_id_<codec>::value,
+             std::uint64_t(max_key_bytes),
+             0,
+             0,
+         };
       }
 
       // Attach to the tree the allocator's persistent image holds (a file-backed line_pool):
@@ -924,7 +959,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          static_assert(std::is_trivially_copyable_v<T>,
                        "a persistent image stores T's bytes: T must be trivially copyable");
          rebase_();
-         const auto [root_handle, count] = alloc_.artpp_attach();
+         const auto [root_handle, count] = alloc_.artpp_attach(image_stamp());  // throws if not ours
          if (count == 0) return;
          const uint32_t raw = uint32_t(root_handle);
          std::memcpy(root_.b, &raw, sizeof(root_.b));
@@ -939,7 +974,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                        "checkpoint needs an allocator with a persistent image (artpp::pool_alloc)");
          static_assert(std::is_trivially_copyable_v<T>,
                        "a persistent image stores T's bytes: T must be trivially copyable");
-         alloc_.artpp_checkpoint(root_.raw(), count_);
+         alloc_.artpp_checkpoint(root_.raw(), count_, image_stamp());
       }
 
       // Walk the tree, destroy every T and free every node — unless the tree lives in a

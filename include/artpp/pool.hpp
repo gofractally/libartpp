@@ -229,6 +229,39 @@ namespace artpp
       // Throws std::invalid_argument when `root` cannot be the root of a tree in this pool (a
       // count of 0 records the empty tree, whatever `root` is), std::system_error when the
       // image cannot be written.
+      //
+      // This two-argument form is the low-level call: it records the stamp of the container
+      // that is bound to the store (see bind) — and NO stamp when none is, in which case
+      // the image can later be attached by any instantiation. map::checkpoint() always
+      // records its own.
+      void checkpoint(uint64_t root, uint64_t count, const image_stamp& stamp)
+      {
+         const image_stamp old_stamp = stamp_;
+         const bool        old_has = has_stamp_, old_bound = bound_;
+         stamp_     = stamp;  // the tree being recorded is this container's, whatever was here
+         has_stamp_ = bound_ = true;
+         try
+         {
+            checkpoint(root, count);
+         }
+         catch (...)
+         {
+            stamp_     = old_stamp;
+            has_stamp_ = old_has;
+            bound_     = old_bound;
+            throw;
+         }
+      }
+      // Bind a container instantiation to the store, by its image_stamp: what map's attach
+      // constructors do. Throws store_incompatible when the image was written by, or the
+      // store is already bound to, a different instantiation. No effect on an anonymous pool.
+      void bind(const image_stamp& stamp)
+      {
+         if (!file_backed()) return;
+         if (has_stamp_ && stamp_ != stamp) incompatible_(dir_, stamp_mismatch_(stamp_, stamp));
+         stamp_     = stamp;
+         has_stamp_ = bound_ = true;
+      }
       void checkpoint(uint64_t root, uint64_t count)
       {
          if (count == 0)
@@ -380,6 +413,8 @@ namespace artpp
          uint64_t generation;              // +1 on every image write; `terms` carries the same
          uint64_t checkpoints;             // user checkpoint() calls so far; 0 = never
          uint64_t dirty;                   // 1: modified since the last image write
+         uint64_t stamped;                 // 1: `stamp` is that of the container that wrote the tree
+         uint64_t stamp[8];                // its image_stamp (see map::image_stamp)
          uint64_t ncap, tcap, frontier, tfrontier, committed, tcommitted;
          uint32_t huge, thuge;
          uint64_t uroot, ucount;             // user metadata: tree root handle + element count
@@ -412,6 +447,15 @@ namespace artpp
                                  std::string("artpp::line_pool: ") + call + "(" + path + ")");
       }
       static std::string num_(uint64_t v) { return std::to_string(v); }
+      static std::string stamp_mismatch_(const image_stamp& have, const image_stamp& want)
+      {
+         std::string m = "the store was written by a different map instantiation (mapped type size/"
+                         "alignment, mode, key encoding or handle differ); image stamp words that differ:";
+         for (size_t i = 0; i < have.size(); ++i)
+            if (have[i] != want[i])
+               m += " [" + num_(i) + "] stored " + num_(have[i]) + ", attaching " + num_(want[i]) + ";";
+         return m;
+      }
 
       // Can `raw` be the root of a non-empty tree whose regions end at these frontiers?
       static bool root_ok_(uint64_t raw, uint64_t frontier, uint64_t tfrontier) noexcept
@@ -512,6 +556,7 @@ namespace artpp
             corrupt_(dir, "superblock field tfree_heads[" + num_(n) + "] = " + num_(sb.tfree_heads[n]) +
                               " is out of range");
          in_range(sb.dirty <= 1, "dirty", sb.dirty);
+         in_range(sb.stamped <= 1, "stamped", sb.stamped);
          if (sb.checkpoints == 0)  // never checkpointed: the empty image written at creation
             in_range(sb.uroot == null_root && sb.ucount == 0, "uroot", sb.uroot);
          else if (sb.ucount == 0)
@@ -694,6 +739,8 @@ namespace artpp
          checkpoints_ = sb.checkpoints;
          std::memcpy(free_, sb.free_heads, sizeof(free_));
          std::memcpy(tfree_, sb.tfree_heads, sizeof(tfree_));
+         has_stamp_ = sb.stamped != 0;
+         std::memcpy(stamp_.data(), sb.stamp, sizeof(sb.stamp));
          if (checkpoints_ != 0)  // else: only ever stamped at creation — an empty store
          {
             uroot_    = sb.uroot;
@@ -749,6 +796,11 @@ namespace artpp
          sb->generation   = gen;
          sb->checkpoints  = checkpoints;
          sb->dirty        = 0;
+         // The stamp of the container bound in THIS session, or none: a tree checkpointed by
+         // hand without any attach is not vouched for by the stamp of an earlier session.
+         if (!bound_) has_stamp_ = false, stamp_ = image_stamp{};
+         sb->stamped = has_stamp_;
+         std::memcpy(sb->stamp, stamp_.data(), sizeof(sb->stamp));
          sb->ncap         = ncap_;
          sb->tcap         = tcap_;
          sb->frontier     = frontier_;
@@ -920,6 +972,9 @@ namespace artpp
       uint64_t   store_id_   = 0;        // identity of the store on disk
       uint64_t   generation_ = 0;        // image writes so far (both headers carry it)
       std::string dir_;                  // the store directory, for messages
+      image_stamp stamp_{};              // of the container that wrote / is bound to the image
+      bool        has_stamp_ = false;    // stamp_ is one (an image written by hand has none)
+      bool        bound_     = false;    // a container bound itself in this session
       uint64_t   uroot_      = null_root;  // root handle of the last checkpoint (null: none yet)
       uint64_t   ucount_     = 0;        // element count of the last checkpoint
       uint64_t   checkpoints_ = 0;       // user checkpoint() calls over the store's life
@@ -982,8 +1037,16 @@ namespace artpp
       // says which tree it leaves behind (artpp_released).
       bool artpp_retains() const noexcept { return pool && pool->file_backed(); }
       void artpp_released(uint64_t root, uint64_t count) const noexcept { pool->released(root, count); }
-      void artpp_checkpoint(uint64_t root, uint64_t count) { pool->checkpoint(root, count); }
-      std::pair<uint64_t, uint64_t> artpp_attach() const { return {pool->root(), pool->count()}; }
+      void artpp_bind(const image_stamp& s) const { pool->bind(s); }
+      void artpp_checkpoint(uint64_t root, uint64_t count, const image_stamp& s)
+      {
+         pool->checkpoint(root, count, s);
+      }
+      std::pair<uint64_t, uint64_t> artpp_attach(const image_stamp& s) const
+      {
+         pool->bind(s);
+         return {pool->root(), pool->count()};
+      }
 
       // Opt-in bulk transport for map's cross-pool move assignment: adopt the source
       // pool's whole image (see line_pool::adopt). By providing this member the allocator

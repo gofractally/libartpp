@@ -139,10 +139,17 @@ before 1.0 a minor version may change the API.
   two, from opening the same store and overwriting each other's nodes. The
   pool now holds an advisory exclusive lock (`flock`) on the store while it is
   open; a second opener gets `artpp::store_locked` (#10).
+- File-backed `line_pool`: a store could be attached by any map
+  instantiation, which then read the nodes of another layout. The store now
+  records the `image_stamp` of the map that wrote it (size and alignment of
+  the mapped type, effective mode, handle width, whether it is a set, the key
+  codec's `image_id`), and attaching a different instantiation throws
+  `artpp::store_incompatible`. The built-in key codecs name their encoding;
+  a user codec can, with a `static constexpr std::uint64_t image_id` (#10).
 
 ### Known issues
-- Open bugs from the pre-release audit: #10 and #17 (file-backed
-  `line_pool`). Reproducers are in `tests/known_bugs`.
+- Open bug from the pre-release audit: #17 (file-backed `line_pool` on
+  kernels with 64 KB pages).
 
 ## 0.1.0
 

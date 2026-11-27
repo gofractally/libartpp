@@ -17,6 +17,13 @@
 //
 // Built-ins: std::string, std::string_view, std::vector<uint8_t>, and integral types
 // (fixed-width big-endian, sign-flipped for signed, so byte order == numeric order).
+//
+// A codec may also name its ENCODING with `static constexpr std::uint64_t image_id` (any
+// non-zero number of your choosing; change it when the bytes change). A map stored in a
+// file-backed line_pool records it, and attaching the store with a key type whose codec has
+// another image_id is refused. Codecs without one are all "unknown" (0) and cannot be told
+// apart. The string-like built-ins share one id: they encode the same bytes, so a store
+// written with std::string keys opens with std::string_view keys.
 #pragma once
 #include <bit>
 #include <cstdint>
@@ -34,9 +41,20 @@ namespace artpp
    // zero_copy codecs expose view(key) -> bytes (no buffer); the container then skips the
    // scratch object entirely on the hot path. Non-zero-copy codecs expose encode(key,
    // scratch) and serialize into scratch.
+   namespace detail
+   {
+      inline constexpr std::uint64_t codec_id_bytes = 1;  // the key's bytes, verbatim
+      // integral: big-endian, sign bit flipped; the width and signedness are the encoding
+      constexpr std::uint64_t codec_id_integral(std::size_t width, bool is_signed) noexcept
+      {
+         return 2 | (std::uint64_t(width) << 8) | (std::uint64_t(is_signed) << 16);
+      }
+   }  // namespace detail
+
    template <>
    struct key_codec<std::string>
    {
+      static constexpr std::uint64_t image_id = detail::codec_id_bytes;
       static constexpr bool   zero_copy = true;
       static std::string_view view(const std::string& k) noexcept { return k; }
       static std::string      decode(std::string_view b) { return std::string(b); }
@@ -45,6 +63,7 @@ namespace artpp
    template <>
    struct key_codec<std::string_view>
    {
+      static constexpr std::uint64_t image_id = detail::codec_id_bytes;
       static constexpr bool   zero_copy = true;
       static std::string_view view(std::string_view k) noexcept { return k; }
       static std::string_view decode(std::string_view b) noexcept { return b; }  // zero-copy
@@ -53,6 +72,7 @@ namespace artpp
    template <>
    struct key_codec<std::vector<std::uint8_t>>
    {
+      static constexpr std::uint64_t image_id = detail::codec_id_bytes;
       static constexpr bool   zero_copy = true;
       static std::string_view view(const std::vector<std::uint8_t>& k) noexcept
       {
@@ -90,6 +110,8 @@ namespace artpp
    {
       using U                 = typename detail::key_uint<std::remove_cv_t<I>>::type;
       static constexpr U SIGN = U(1) << (sizeof(U) * 8 - 1);
+      static constexpr std::uint64_t image_id =
+          detail::codec_id_integral(sizeof(U), std::is_signed_v<I>);
       struct scratch
       {
          char b[sizeof(U)];

@@ -8,6 +8,7 @@
 // 128-byte-line index (2^28 lines = 32 GB). Descent routes off the tag alone — it never
 // reads a node header to learn the node's shape.
 #pragma once
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cstddef>
@@ -38,6 +39,15 @@ namespace artpp
       explicit bad_allocation_address(const char* m) noexcept : msg_(m) {}
       const char* what() const noexcept override { return msg_; }
    };
+}  // namespace artpp
+
+namespace artpp
+{
+   // What a container instantiation tells a persistent image about itself (see
+   // map::image_stamp and line_pool): eight words that are equal for two instantiations
+   // exactly when — as far as the container can know — they read and write the same bytes.
+   // The image keeps the stamp of the container that wrote it and refuses another.
+   using image_stamp = std::array<std::uint64_t, 8>;
 }  // namespace artpp
 
 namespace artpp::detail

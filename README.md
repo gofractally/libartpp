@@ -671,8 +671,8 @@ A pre-release audit found bugs that are open in the
 [issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
 fixed:
 
-- **File-backed `line_pool`:** a damaged or stale store is not detected (#10),
-  and it cannot be opened on a kernel with 64 KB pages (#17).
+- **File-backed `line_pool`:** it cannot be opened on a kernel with 64 KB
+  pages (#17).
 
 Reproducers are in [tests/known_bugs](tests/known_bugs).
 
