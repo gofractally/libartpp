@@ -93,9 +93,15 @@ before 1.0 a minor version may change the API.
   sequences with every allocation and every value construction failed in turn,
   checked against a `std::map` oracle. The README's exception-safety section
   states the guarantee per operation and what the tests cover (#1).
+- File-backed `line_pool`: a store that was created but never checkpointed
+  reopened as `restored()` with root handle 0, which is not the null handle,
+  and the documented attach then crashed on the first lookup. Such a store is
+  now not `restored()`: `root()` is the null handle (`line_pool::null_root`)
+  and `count()` is 0, as for an anonymous pool, and attaching a count of 0
+  always gives an empty map. The image format version is now 2 (#9).
 
 ### Known issues
-- Open bugs from the pre-release audit: #8 to #10 and #17 (file-backed
+- Open bugs from the pre-release audit: #8, #10 and #17 (file-backed
   `line_pool`). Reproducers are in `tests/known_bugs`.
 
 ## 0.1.0

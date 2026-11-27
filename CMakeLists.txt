@@ -96,6 +96,7 @@ if(ARTPP_TESTS)
    artpp_test(exception_safety -O1 -g)
    artpp_test(wide_stems       -O3 -DNDEBUG)
    artpp_test(persistence      -O2 -g)  # file-backed line_pool survives close + reopen
+   artpp_test(pool_safety      -O2 -g)  # file-backed line_pool: lifecycle and validation on reopen
    artpp_test(fuzz_map         -O2 -g)  # differential fuzzer vs std::map (standalone RNG runner)
    artpp_test(fuzz_set         -O2 -g)  # differential fuzzer vs std::set (suffix-in-handle path)
    artpp_test(regression       -O2 -g)  # deterministic guards for fuzzer-caught (planted) bugs

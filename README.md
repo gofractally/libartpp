@@ -654,8 +654,8 @@ A pre-release audit found bugs that are open in the
 [issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
 fixed:
 
-- **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
-  stale or never-checkpointed store is not detected (#8 to #10).
+- **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged
+  or stale store is not detected (#8, #10).
 
 Reproducers are in [tests/known_bugs](tests/known_bugs).
 

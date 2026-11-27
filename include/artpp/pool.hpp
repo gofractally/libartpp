@@ -141,35 +141,22 @@ namespace artpp
       // into the superblock and flushes it, so a later line_pool(path) over the same file
       // restores them and the tree round-trips with no relocation (offset handles). The
       // data pages ride the page cache across a clean reopen; crash/reboot durability (a
-      // full data sync / WAL) is a further stage — see the file header. restored()/root()/
-      // count() report what a reopen recovered (false / 0 / 0 on a fresh file or anon pool).
+      // full data sync / WAL) is a further stage — see the file header.
+      //
+      // restored() is true when this open found an image that a checkpoint() call had written;
+      // root()/count() are then what that call recorded. A store that was created but never
+      // checkpointed — and an anonymous pool — is not restored: root() is the NULL handle
+      // (null_root, NOT 0: 0 decodes as a leaf at terminal offset 0) and count() is 0, so
+      // attaching them yields an empty map.
+      static constexpr uint64_t null_root = 0xFFFFFFFFu;  // == detail::line_ptr::null().raw()
       bool     restored() const noexcept { return restored_; }
       uint64_t root() const noexcept { return uroot_; }
       uint64_t count() const noexcept { return ucount_; }
       void     checkpoint(uint64_t root, uint64_t count) noexcept
       {
-         uroot_ = root;
-         ucount_ = count;
-         if (sb_bytes_ == 0) return;  // anonymous pool: nothing to persist
-         auto* sb       = reinterpret_cast<superblock*>(nbase_);  // header = nodes file, page(s) 0
-         sb->magic      = MAGIC;
-         sb->version    = VERSION;
-         sb->flags      = 0;
-         sb->ncap       = ncap_;
-         sb->tcap       = tcap_;
-         sb->frontier   = frontier_;
-         sb->tfrontier  = tfrontier_;
-         sb->committed  = committed_;
-         sb->tcommitted = tcommitted_;
-         sb->huge       = huge_;
-         sb->thuge      = thuge_;
-         sb->uroot      = root;
-         sb->ucount     = count;
-         std::memcpy(sb->free_heads, free_, sizeof(free_));
-         std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
-         ::msync(nbase_, sb_bytes_, MS_SYNC);  // header durable; data rides the page cache
+         ++checkpoints_;
+         stamp_(root, count);
       }
-
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
       // free lists — the intrusive links live inside freed lines, so they ride the byte
       // copy) so that every line index minted by `s` resolves identically against THIS
@@ -282,7 +269,7 @@ namespace artpp
       // over the same store restores them. Offset handles need no relocation — the bytes ARE the
       // structure across a close/reopen. The terminal region is a SEPARATE dense file (no header).
       static constexpr uint64_t MAGIC    = 0x6c6f6f7070747261ULL;  // "artppool" (little-endian)
-      static constexpr uint32_t VERSION  = 1;
+      static constexpr uint32_t VERSION  = 2;  // 2: `checkpoints`; a fresh store's root is null
       static constexpr size_t   SB_BYTES = 32768;  // header reservation (>= sizeof(superblock))
       struct superblock
       {
@@ -291,11 +278,38 @@ namespace artpp
          uint64_t ncap, tcap, frontier, tfrontier, committed, tcommitted;
          uint32_t huge, thuge;
          uint64_t uroot, ucount;             // user metadata: tree root handle + element count
+         uint64_t checkpoints;               // user checkpoint() calls so far; 0 = never
          uint32_t free_heads[FREE_MAX + 1];  // exact-size free-list heads
          uint32_t tfree_heads[TFREE_MAX + 1];
       };
       static_assert(sizeof(superblock) <= SB_BYTES, "superblock must fit its reservation");
 
+      // Write the superblock: the carving state, the root and count, and how many times the
+      // user has checkpointed (0 = the image is the empty one stamped at creation).
+      void stamp_(uint64_t root, uint64_t count) noexcept
+      {
+         uroot_  = root;
+         ucount_ = count;
+         if (sb_bytes_ == 0) return;  // anonymous pool: nothing to persist
+         auto* sb       = reinterpret_cast<superblock*>(nbase_);  // header = nodes file, page(s) 0
+         sb->magic      = MAGIC;
+         sb->version    = VERSION;
+         sb->flags      = 0;
+         sb->ncap       = ncap_;
+         sb->tcap       = tcap_;
+         sb->frontier   = frontier_;
+         sb->tfrontier  = tfrontier_;
+         sb->committed  = committed_;
+         sb->tcommitted = tcommitted_;
+         sb->huge       = huge_;
+         sb->thuge      = thuge_;
+         sb->uroot      = root;
+         sb->ucount     = count;
+         sb->checkpoints = checkpoints_;
+         std::memcpy(sb->free_heads, free_, sizeof(free_));
+         std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
+         ::msync(nbase_, sb_bytes_, MS_SYNC);  // header durable; data rides the page cache
+      }
       void destroy_() noexcept  // unwind a partially-constructed pool
       {
          if (nbase_) ::munmap(nbase_, node_resv_);
@@ -363,16 +377,20 @@ namespace artpp
             tfrontier_ = sb->tfrontier;
             huge_      = sb->huge;
             thuge_     = sb->thuge;
-            uroot_     = sb->uroot;
-            ucount_    = sb->ucount;
+            checkpoints_ = sb->checkpoints;
+            if (checkpoints_ != 0)  // else: only ever stamped at creation — an empty store
+            {
+               uroot_    = sb->uroot;
+               ucount_   = sb->ucount;
+               restored_ = true;
+            }
             std::memcpy(free_, sb->free_heads, sizeof(free_));
             std::memcpy(tfree_, sb->tfree_heads, sizeof(tfree_));
             if (const size_t want = sb->committed) commit_(want);    // re-map written region files
             if (const size_t twant = sb->tcommitted) tcommit_(twant);
-            restored_ = true;
          }
          else if (dir)
-            checkpoint(0, 0);  // stamp an initial empty image so a reopen is self-describing
+            stamp_(null_root, 0);  // an initial empty image, so a reopen is self-describing
       }
       // Grow a region's mapping to cover `need` bytes: extend its OWN file densely from `file_off`
       // and map the new chunks (MAP_FIXED over the PROT_NONE reservation), or mprotect for an
@@ -449,9 +467,10 @@ namespace artpp
       size_t     sb_bytes_   = 0;        // superblock reservation in the nodes file (0 anonymous)
       size_t     node_resv_  = 0;        // nodes mapping size = sb_bytes_ + ncap_
       size_t     term_resv_  = 0;        // terminal mapping size = tcap_
-      uint64_t   uroot_      = 0;        // tree root handle restored from the superblock on reopen
-      uint64_t   ucount_     = 0;        // element count restored on reopen
-      bool       restored_   = false;    // this open restored an existing image (vs fresh)
+      uint64_t   uroot_      = null_root;  // root handle of the last checkpoint (null: none yet)
+      uint64_t   ucount_     = 0;        // element count of the last checkpoint
+      uint64_t   checkpoints_ = 0;       // user checkpoint() calls over the store's life
+      bool       restored_   = false;    // this open restored a checkpointed image
       size_t     ncap_       = 0;
       size_t     tcap_       = 0;
       size_t     committed_  = 0;

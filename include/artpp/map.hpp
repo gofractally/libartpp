@@ -873,10 +873,14 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // bytes already ARE the tree; offset handles resolve against the reopened base after
       // rebase_(). Indexed handles only (a raw-pointer allocator's handles aren't stable across
       // runs). Pair with line_pool::root()/count(); the pool must back exactly this map.
+      // A count of 0 attaches an empty map whatever `root_handle` is: an empty tree has no
+      // root, and a handle that was never written (0 is a valid-looking leaf) must not be
+      // followed.
       map(const Allocator& a, attach_t, uint64_t root_handle, size_type count) : alloc_(a), count_(count)
       {
          static_assert(indexed, "map attach is only for indexed (pool-backed) handles");
          rebase_();
+         if (count == 0) return;  // root_ is null by default
          const uint32_t raw = uint32_t(root_handle);
          std::memcpy(root_.b, &raw, sizeof(root_.b));  // line_ptr is 4 bytes: reconstruct the root
       }
