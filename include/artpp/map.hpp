@@ -3162,43 +3162,126 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
       }
 
-      // Overflow: split a bucket at `depth` into a radix subtree. Extract the common
-      // prefix of all (sorted) suffixes, then re-insert every entry through bkt_put.
+      // Overflow: burst a bucket into a radix subtree — one router under the common prefix
+      // of all its (sorted) suffixes, the entry that ends at that prefix (if any) as the
+      // router's term, and one fresh bucket per distinct next byte holding that run's
+      // entries, each one byte shorter. A run is a subset of this page with shorter
+      // suffixes, so it always fits its bucket: the result is exactly two levels.
+      //
+      // Exception safety (strong, see relocate_src_ for the one exception): built in two
+      // phases so that nothing which can fail runs after a value has been disturbed.
+      //   1. STRUCTURE — every allocation: the router (widened as the fan-out requires),
+      //      the empty buckets, the term's leaf, the prefix. No value is touched; a failure
+      //      frees the new nodes and leaves the page exactly as it was.
+      //   2. VALUES — carried into their places by relocate_src_. Nothing allocates here. A
+      //      moved value cannot throw; a copied one can, and then the copies made so far
+      //      are destroyed with the new nodes while every original is still in the page.
+      // Only then are the originals destroyed and the page freed. (The previous version
+      // re-inserted the entries one at a time by MOVE, interleaving moves and allocations:
+      // an allocation failing part-way destroyed the values already moved and left their
+      // keys in the page with moved-from values.) A T that is move-only with a throwing
+      // move keeps that weaker outcome if its move throws: valid, but values moved-from.
       packed_ptr bkt_split(packed_ptr bp)
       {
-         bucket*    b = static_cast<bucket*>(deref_(bp));
-         const int  n = b->nent;
+         bucket*   b    = static_cast<bucket*>(deref_(bp));
+         const int n    = b->nent;
+         auto      sufx = [b](int i) noexcept {
+            const char* e = bkt_entry(b, i);
+            return std::string_view(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
+         };
          // common prefix of all suffixes == lcp(first, last) since lex-sorted
-         const char*      e0 = bkt_entry(b, 0);
-         const char*      eN = bkt_entry(b, n - 1);
-         std::string_view f0(reinterpret_cast<const char*>(bkt_suf(e0)), bkt_slen(e0));
-         std::string_view fN(reinterpret_cast<const char*>(bkt_suf(eN)), bkt_slen(eN));
-         const size_t     c = lcp(f0, fN);
-         setlist*         r = new_setlist();
-         packed_ptr       top = pack_(r, K::setlist_u8);
-         // Destructive rebuild: values are MOVED out of b. Strong isn't achievable without
-         // copying (T may be move-only), but basic-guarantee + leak-freedom is: guard the
-         // partial `top` so a throw reclaims it, and DON'T destroy the moved-from originals
-         // until the whole rebuild succeeds — on a throw, b keeps a full set of valid
-         // (moved-from) values, so it stays consistent and is reclaimed normally at teardown.
-         build_guard g{this, &top};  // guards `top` across the (throwing) apply_prefix + rebuild
-         // The shared prefix of ALL entries becomes this subtree's prefix in ONE node: inline
-         // when it fits a setlist, else a prefix_node above it (apply_prefix picks). It MUST be
-         // wrapped here — re-inserting the full suffixes does NOT re-form a long run as a prefix
-         // node; each shared byte would spawn its own single-branch setlist (a deep-narrow chain
-         // that, past the remove window, can't be unwound). Read straight from e0's suffix: it is
-         // stable until b is freed below, and apply_prefix/make_prefix copy the bytes immediately.
-         if (c)
-            top = apply_prefix(r, std::string_view(reinterpret_cast<const char*>(bkt_suf(e0)), c));
-         for (int i = 0; i < n; ++i)
+         const std::string_view f0 = sufx(0);
+         const size_t           c  = lcp(f0, sufx(n - 1));
+         const bool             has_term = (f0.size() == c);  // sorted: only the first can end here
+         const int              first    = has_term ? 1 : 0;
+
+         // ── phase 1: structure ──
+         packed_ptr  top = pack_(new_setlist(), K::setlist_u8);
+         build_guard g{this, &top};  // the buckets below it are empty, its term is null
+         for (int i = first; i < n;)
          {
-            char*            e = bkt_entry(b, i);
-            std::string_view suf(reinterpret_cast<const char*>(bkt_suf(e)), bkt_slen(e));
-            bkt_put<true>(&top, suf, 0, std::move(*bkt_val(e)));  // MOVE into target
+            const uint8_t byte  = uint8_t(sufx(i)[c]);
+            packed_ptr    child = pack_(new_bucket(), K::bucket);
+            {
+               build_guard gc{this, &child};
+               while (!router_try_set(top, byte, child)) top = widen(top);  // widen: all-or-nothing
+               gc.release();
+            }
+            while (i < n && uint8_t(sufx(i)[c]) == byte) ++i;
          }
+         // A term that needs a leaf (a map whose T does not fit the handle): allocate it now,
+         // construct into it in phase 2.
+         static constexpr bool term_is_leaf = HasValue && !inlineable;
+         const size_t          tsz          = leaf_size(0);
+         char*                 tleaf        = nullptr;
+         if constexpr (term_is_leaf)
+            if (has_term)
+            {
+               tleaf = static_cast<char*>(term_alloc_(tsz));
+               leaf_set_hdr(tleaf, 0, 0);
+            }
+         // The shared prefix of ALL entries becomes this subtree's prefix in ONE node: inline
+         // in a setlist when it fits, in a node_full's header when that fits, else a prefix
+         // node above. It MUST be attached here — routing the full suffixes instead would
+         // spawn one single-branch router per shared byte. Read straight from the first
+         // entry's suffix: the page is untouched until the commit below.
+         const packed_ptr router = top;  // the handle the values are routed through in phase 2
+         if (c)
+         {
+            try
+            {
+               top = (top.tag() == K::setlist_u8)
+                         ? apply_prefix(static_cast<setlist*>(deref_(top)), f0.substr(0, c))
+                         : make_prefix(f0.substr(0, c), top);
+            }
+            catch (...)
+            {
+               if (tleaf) term_free_(tleaf, tsz);
+               throw;
+            }
+         }
+
+         // ── phase 2: values (no allocation from here on) ──
+         router_hdr* rh = static_cast<router_hdr*>(deref_(router));
+         if (has_term)
+         {
+            if constexpr (term_is_leaf)
+            {
+               try { v_construct(alloc_, leaf_val(tleaf), relocate_src_(*bkt_val(bkt_entry(b, 0)))); }
+               catch (...)
+               {
+                  term_free_(tleaf, tsz);
+                  throw;
+               }
+               rh->term         = pack_term_(tleaf, K::value_ptr);
+               rh->hdr.has_term = 1;
+            }
+            else if constexpr (HasValue) set_term(rh, std::move(*bkt_val(bkt_entry(b, 0))));  // in the handle
+            else                         set_term(rh, none_t{});
+         }
+         for (int i = first; i < n;)
+         {
+            const uint8_t byte = uint8_t(sufx(i)[c]);
+            bucket*       cb   = static_cast<bucket*>(deref_(*router_find_slot(router, byte)));
+            for (; i < n && uint8_t(sufx(i)[c]) == byte; ++i)
+            {
+               const std::string_view rest = sufx(i).substr(c + 1);
+               if constexpr (HasValue)
+               {
+                  [[maybe_unused]] const int r = bkt_insert_entry(cb, rest, relocate_src_(*bkt_val(bkt_entry(b, i))));
+                  assert(r == 1 && "artpp: a run of a page fits a fresh page");
+               }
+               else
+               {
+                  [[maybe_unused]] const int r = bkt_insert_entry(cb, rest, none_t{});
+                  assert(r == 1 && "artpp: a run of a page fits a fresh page");
+               }
+            }
+         }
+
+         // ── commit: nothing below can fail ──
          g.release();
-         for (int i = 0; i < n; ++i)  // committed: destroy all moved-from originals, free b
-            v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
+         for (int i = 0; i < n; ++i) v_destroy(alloc_, bkt_val(bkt_entry(b, i)));
          node_free_(b, sizeof(bucket));
          return top;
       }

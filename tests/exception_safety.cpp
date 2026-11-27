@@ -605,21 +605,23 @@ static void eh_point(const char* cont, const char* scen, fault f, Build build, O
    t.report(cont, scen, f);
 }
 
-// How many keys `under + <letter> + tail` share one bucket page before the next one bursts it
-// (depends on sizeof(T)): the number that go in on a single allocation.
+// The leading keys of `cand` that share one bucket page (how many depends on sizeof(T)):
+// those that go in on a single allocation. `*next` is the key that then bursts the page.
 template <class Map>
-static int page_fill(const std::string& tail)
+static std::vector<std::string> one_page(const std::vector<std::string>& cand, std::string* next)
 {
    using V = typename Map::mapped_type;
    fail_counter fc;
    Map          m{typename Map::allocator_type(&fc)};
-   int          c = 0;
-   for (; c < 26; ++c)
+   size_t       c = 0;
+   for (; c < cand.size(); ++c)
    {
-      m.insert(std::string(1, char('A' + c)) + tail, mkv<V>(0));
+      m.insert(cand[c], mkv<V>(0));
       if (fc.allocs > 1) break;
    }
-   return c;
+   if (c == cand.size()) { ++g_fail; std::printf("  one_page: the candidates never filled a page\n"); c = cand.size() - 1; }
+   *next = cand[c];
+   return std::vector<std::string>(cand.begin(), cand.begin() + long(c));
 }
 template <class Map>
 static auto put_keys(std::vector<std::string> keys, uint64_t v0)
@@ -641,17 +643,29 @@ static auto put_keys(std::vector<std::string> keys, uint64_t v0)
 // existed only in a local while the new key's own bucket was allocated, so a failure there
 // left the parent slot (or the root) pointing at the freed page.
 template <class Map>
-static void eh_bucket_burst(const char* cont)
+static void eh_bucket_burst(const char* cont, fault f = fault::alloc)
 {
    const std::string        tail(40, 't');
-   const int                fill = page_fill<Map>(tail);
-   std::vector<std::string> root, child;
-   for (int c = 0; c < fill; ++c) root.push_back(std::string(1, char('A' + c)) + tail);
-   eh_point<Map>(cont, "burst root bucket", fault::alloc, put_keys<Map>(root, 0), put_keys<Map>({"Z" + tail}, 99));
+   std::vector<std::string> cand, child;
+   std::string              next;
+   for (int c = 0; c < 26; ++c) cand.push_back(std::string(1, char('A' + c)) + tail);
+   const std::vector<std::string> root = one_page<Map>(cand, &next);
+   eh_point<Map>(cont, "burst root bucket", f, put_keys<Map>(root, 0), put_keys<Map>({next}, 99));
    // the same page one level down, reached through a router: the slot is a branch, not the root
    for (int c = 0; c < 30; ++c) child.push_back(std::string(1, char('A' + c)) + tail);
-   for (int c = 0; c + 1 < fill; ++c) child.push_back(std::string("A") + char('a' + c) + tail);
-   eh_point<Map>(cont, "burst child bucket", fault::alloc, put_keys<Map>(child, 0), put_keys<Map>({"Az" + tail}, 99));
+   for (size_t c = 0; c + 1 < root.size(); ++c) child.push_back(std::string("A") + char('a' + c) + tail);
+   eh_point<Map>(cont, "burst child bucket", f, put_keys<Map>(child, 0), put_keys<Map>({"Az" + tail}, 99));
+   // every part of the burst at once: a shared prefix (short: inline in the router; long: a
+   // prefix node), a key that ends at the prefix (the router's term), and as many distinct
+   // next bytes as a page holds (for small values more than a setlist: it widens mid-burst)
+   for (const std::string& pfx : {std::string("shared/"), std::string(20, 'P')})
+   {
+      cand = {pfx};
+      for (int c = 0; c < 60; ++c) cand.push_back(pfx + char('0' + c) + "x");
+      const std::vector<std::string> page = one_page<Map>(cand, &next);
+      eh_point<Map>(cont, pfx.size() < 9 ? "burst: term+prefix+fan" : "burst: term+long prefix", f,
+                    put_keys<Map>(page, 0), put_keys<Map>({next}, 99));
+   }
 }
 
 // audit #4: a router that is full takes one more child by widening, in one step or (dense
@@ -902,6 +916,10 @@ int main()
    std::printf("\nbucket and adaptive modes, one faulted operation against a std::map oracle:\n");
    eh_bucket_burst<BU64>("bucket/u64");
    eh_bucket_burst<BU32>("bucket/u32");
+   eh_bucket_burst<BStr>("bucket/string");
+   eh_bucket_burst<BTv>("bucket/tvalue");
+   eh_bucket_burst<BTv>("bucket/tvalue", fault::value);
+   eh_bucket_burst<BDenseU64>("bucket+dense/u64");
    eh_bucket_widen<BU64>("bucket/u64");
    eh_bucket_widen<BDenseU64>("bucket+dense/u64");
    eh_bucket_widen<BDense8U64>("bucket+dense+c8/u64");

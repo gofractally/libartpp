@@ -81,6 +81,11 @@ before 1.0 a minor version may change the API.
   the tree kept pointing at the leaf it had already freed and leaked the new
   bucket page. The page is now completed before the leaf is touched, so the
   insert is all-or-nothing (#7).
+- `mode::buckets` and `mode::adaptive`: an insert that overflowed a bucket and
+  then failed (an allocation, or a throwing copy) left the keys of that bucket
+  in place but, for a mapped type that is not trivially copyable, with
+  moved-from values: their contents were lost. Bursting a bucket is now
+  all-or-nothing (#1).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #7 (exception safety in
