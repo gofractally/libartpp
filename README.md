@@ -531,8 +531,7 @@ data pages ride the page cache across a clean reopen.
   top. Limits of the testing: these sequences do not produce wide
   (`setlist_u16`) nodes, whose fusion and re-striding are fault-tested by a
   bulk-insert sweep that checks validity and leaks rather than contents;
-  `line_pool` allocators (see [Known issues](#known-issues)) and key codecs
-  that throw are not fault-tested.
+  `line_pool` allocators and key codecs that throw are not fault-tested.
 - **Thread safety** — that of a standard container: concurrent reads on a
   `const` tree are fine; any write requires exclusive access. No internal
   threads, no locks.
@@ -664,17 +663,6 @@ The current version is **0.1.0**. Before 1.0 the API may change between minor
 versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The layout of a
 file-backed `line_pool` image is not a stable format: an image is only
 guaranteed to reopen with the library version that wrote it.
-
-### Known issues
-
-A pre-release audit found bugs that are open in the
-[issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
-fixed:
-
-- **File-backed `line_pool`:** it cannot be opened on a kernel with 64 KB
-  pages (#17).
-
-Reproducers are in [tests/known_bugs](tests/known_bugs).
 
 ## Contributing
 

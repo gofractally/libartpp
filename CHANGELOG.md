@@ -146,10 +146,15 @@ before 1.0 a minor version may change the API.
   codec's `image_id`), and attaching a different instantiation throws
   `artpp::store_incompatible`. The built-in key codecs name their encoding;
   a user codec can, with a `static constexpr std::uint64_t image_id` (#10).
-
-### Known issues
-- Open bug from the pre-release audit: #17 (file-backed `line_pool` on
-  kernels with 64 KB pages).
+- File-backed `line_pool` could not be opened on a kernel with 64 KB pages
+  (ppc64le, some arm64): the superblock reservation, which is the file offset
+  of the mapped data, was a constant 32 KB. It is now computed from the page
+  size with a floor of 64 KB (`line_pool::header_bytes_for`), recorded in the
+  store and checked against the page size of the system that opens it; the
+  layout is the same for 4, 16 and 64 KB pages, so a store moves between such
+  systems. Not run on a 64 KB-page kernel; the arithmetic is unit-tested for
+  page sizes from 4 KB to 4 MB, and the whole path with a simulated page size
+  (#17).
 
 ## 0.1.0
 

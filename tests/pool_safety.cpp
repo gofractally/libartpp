@@ -6,6 +6,7 @@
 #include "artpp/map.hpp"
 #include "artpp/pool.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -503,6 +504,8 @@ static void corrupted_superblock_fields_are_refused()
        POKE(magic, 0x0123456789abcdefULL),
        {"version", offsetof(SB, version), sizeof(SB::version), std::uint64_t(sb.version) + 1, true},
        {"version", offsetof(SB, version), sizeof(SB::version), 1, true},
+       POKE(header_bytes, 0),
+       POKE(header_bytes, sb.header_bytes * 2),                 // the data is not where it says
        POKE(ncap, 0),
        POKE(ncap, sb.ncap + 4096),                              // not a whole number of chunks
        POKE(ncap, artpp::line_pool::max_bytes * 2),             // beyond what a handle addresses
@@ -981,6 +984,97 @@ static void the_stamp_follows_the_low_level_calls()
    CHECK(store_is_intact(s, 101));
 }
 
+// ── #17: nothing about the layout may assume 4 KB or 16 KB pages ────────────────────────
+// The header reservation is the file offset at which the data of each file is mapped, so
+// it has to be a multiple of the page size of the system that maps it. It was a constant
+// 32768: on a kernel with 64 KB pages every mmap of the data failed with EINVAL.
+static void header_reservation_is_page_size_driven()
+{
+   using LP = artpp::line_pool;
+   const size_t sb = sizeof(LP::superblock);
+   for (size_t page : {size_t(4096), size_t(8192), size_t(16384), size_t(65536), size_t(262144),
+                       size_t(1) << 20, size_t(2) << 20, LP::chunk_bytes})
+   {
+      const size_t h = LP::header_bytes_for(page);
+      CHECK(h % page == 0);                    // mappable at that page size
+      CHECK(h >= sb);                          // holds the superblock
+      CHECK(h >= LP::min_header_bytes);        // and never less than the portable minimum
+      CHECK(h - page < std::max(sb, LP::min_header_bytes));  // the smallest such multiple
+      CHECK(LP::header_fits_pages(h, page));
+   }
+   // One layout for every common page size: a store made with 4 KB pages maps with 64 KB ones.
+   CHECK(LP::header_bytes_for(4096) == LP::header_bytes_for(16384));
+   CHECK(LP::header_bytes_for(4096) == LP::header_bytes_for(65536));
+   CHECK(LP::header_fits_pages(LP::header_bytes_for(4096), 65536));
+   CHECK(LP::header_fits_pages(LP::header_bytes_for(65536), 4096));
+   CHECK(!LP::header_fits_pages(LP::header_bytes_for(4096), size_t(1) << 20));  // not with 1 MB pages
+   CHECK(LP::header_fits_pages(LP::header_bytes_for(size_t(1) << 20), 4096));   // the other way is fine
+   CHECK(!LP::header_fits_pages(32768, 65536));          // the old constant, on the kernel of the issue
+   CHECK(!LP::header_fits_pages(65536, 0));
+   CHECK(!LP::header_fits_pages(65536, LP::chunk_bytes * 2));  // the commit unit must be whole pages too
+   CHECK(!LP::header_fits_pages(4096, 4096));            // too small for a superblock
+   CHECK(LP::system_page_size() >= 4096 && LP::header_fits_pages(LP::header_bytes_for(LP::system_page_size()), LP::system_page_size()));
+}
+// The pool can be told to lay a store out for larger pages than the system has (any
+// multiple is mappable here), which runs the whole open / grow / checkpoint / reopen path
+// with the offsets of a 64 KB-page or a 1 MB-page system.
+static void stores_laid_out_for_larger_pages()
+{
+   using LP = artpp::line_pool;
+   const size_t sys = LP::system_page_size();
+   for (size_t page : {size_t(0), size_t(65536), size_t(1) << 20})
+   {
+      if (page != 0 && page % sys != 0) continue;
+      const size_t eff = page ? page : sys;
+      temp_store   s;
+      {
+         LP pool(s.c_str(), LP::max_bytes, page);
+         CHECK(size_t(s.size("nodes")) == LP::header_bytes_for(eff));
+         CHECK(size_t(s.size("terms")) == LP::header_bytes_for(eff));
+         Map m{A{&pool}, artpp::attach};
+         for (int i = 0; i < 120000; ++i) m.insert(key(i), std::uint64_t(i) + 1);  // several chunks
+         CHECK(pool.term_committed() > LP::chunk_bytes);  // grown past the first mapping
+         m.checkpoint();
+         CHECK(size_t(s.size("nodes")) == LP::header_bytes_for(eff) + pool.committed());
+         CHECK(size_t(s.size("terms")) == LP::header_bytes_for(eff) + pool.term_committed());
+         CHECK(size_t(s.size("nodes")) % eff == 0 && size_t(s.size("terms")) % eff == 0);
+         CHECK(pool.file_extent() == size_t(s.size("nodes")) + size_t(s.size("terms")));
+      }
+      {
+         LP  pool(s.c_str(), LP::max_bytes, page);  // the same system reopens it
+         Map m{A{&pool}, artpp::attach};
+         CHECK(m.size() == 120000 && missing(m, 0, 120000) == 0);
+      }
+      CHECK(store_is_intact(s, 120000));  // and so does this one, with its smaller pages
+   }
+   {  // a store laid out for smaller pages than the opener's is refused, not mapped askew
+      temp_store s;
+      build_store(s, 100);
+      bool refused = false;
+      try
+      {
+         LP pool(s.c_str(), LP::max_bytes, size_t(1) << 20);
+      }
+      catch (const artpp::store_incompatible& e)
+      {
+         refused = std::string(e.what()).find("page") != std::string::npos;
+      }
+      CHECK(refused);
+      CHECK(store_is_intact(s, 100));
+   }
+   bool threw = false;  // a page size the system cannot map with is a caller error
+   try
+   {
+      temp_store s;
+      LP         pool(s.c_str(), LP::max_bytes, sys + 512);
+   }
+   catch (const std::invalid_argument&)
+   {
+      threw = true;
+   }
+   CHECK(threw);
+}
+
 int main()
 {
    struct test_case
@@ -1013,6 +1107,8 @@ int main()
         a_second_opener_is_refused_while_the_first_is_open},
        {"attaching_another_instantiation_is_refused", attaching_another_instantiation_is_refused},
        {"the_stamp_follows_the_low_level_calls", the_stamp_follows_the_low_level_calls},
+       {"header_reservation_is_page_size_driven", header_reservation_is_page_size_driven},
+       {"stores_laid_out_for_larger_pages", stores_laid_out_for_larger_pages},
    };
    for (const test_case& c : cases)
    {

@@ -170,11 +170,16 @@ namespace artpp
       // validated before anything is mapped or written, and the open throws — store_corrupt,
       // store_incompatible (see above) or std::system_error — rather than use, repair or
       // overwrite files it cannot vouch for.
-      explicit line_pool(const char* dir, size_t cap = max_bytes)
+      //
+      // `page_size` is the page size the store is laid out and checked for: 0, the default,
+      // means the system's. A multiple of it may be given to create a store for, or to open
+      // one as, a system with larger pages would (the layout is the same for every page
+      // size up to 64 KB, so this only matters beyond that, and to tests).
+      explicit line_pool(const char* dir, size_t cap = max_bytes, size_t page_size = 0)
       {
          try
          {
-            open_store_(dir, cap);
+            open_store_(dir, cap, page_size);
          }
          catch (...)
          {
@@ -394,10 +399,10 @@ namespace artpp
       // tests can name the fields.
       static constexpr uint64_t MAGIC      = 0x6c6f6f7070747261ULL;  // "artppool" (little-endian)
       static constexpr uint64_t TERM_MAGIC = 0x6d72657470747261ULL;  // "artpterm"
-      // 2: null root in a fresh store, checkpoint count, identity fields, a header in `terms`.
+      // 2: null root in a fresh store, checkpoint count, identity fields, a header in `terms`,
+      //    dirty flag, container stamp, page-size-driven header reservation (64 KB, was 32 KB).
       static constexpr uint32_t VERSION         = 2;
       static constexpr uint32_t BYTE_ORDER_MARK = 0x01020304u;
-      static constexpr size_t   SB_BYTES        = 32768;  // header reservation
       struct superblock
       {
          uint64_t magic;
@@ -428,7 +433,36 @@ namespace artpp
          uint32_t byte_order;
          uint64_t header_bytes, store_id, generation;
       };
-      static_assert(sizeof(superblock) <= SB_BYTES, "superblock must fit its reservation");
+
+      // ── page size ─────────────────────────────────────────────────────────────────────
+      // The header reservation is the FILE OFFSET at which each file's data is mapped, and
+      // mmap wants that to be a multiple of the page size — of the system doing the mapping,
+      // which is not a constant: 4 KB on x86-64, 16 KB on Apple silicon, 64 KB on ppc64le
+      // and on arm64 kernels configured that way. So the reservation is computed from the
+      // page size, with a floor of 64 KB: one layout for all of those, and a store moves
+      // between them. It is recorded in the superblock, and a store whose reservation this
+      // system cannot map (made for smaller pages than ours) is refused, never mapped askew.
+      // Everything else the pool maps is at a multiple of chunk_bytes past the reservation.
+      static constexpr size_t min_header_bytes = 65536;
+      static_assert(sizeof(superblock) <= min_header_bytes && chunk_bytes % min_header_bytes == 0);
+      // The reservation of a store created where pages are `page_size` bytes.
+      static constexpr size_t header_bytes_for(size_t page_size) noexcept
+      {
+         const size_t need = std::max(sizeof(superblock), min_header_bytes);
+         return (need + page_size - 1) / page_size * page_size;
+      }
+      // Can a store with this reservation be mapped where pages are `page_size` bytes?
+      static constexpr bool header_fits_pages(uint64_t header_bytes, size_t page_size) noexcept
+      {
+         return page_size != 0 && header_bytes >= sizeof(superblock) && header_bytes % page_size == 0 &&
+                chunk_bytes % page_size == 0;
+      }
+      static size_t system_page_size()
+      {
+         const long p = ::sysconf(_SC_PAGESIZE);
+         if (p <= 0) throw std::system_error(errno, std::generic_category(), "artpp::line_pool: sysconf(_SC_PAGESIZE)");
+         return size_t(p);
+      }
 
      private:
       // ── refusals ──────────────────────────────────────────────────────────────────────
@@ -510,7 +544,7 @@ namespace artpp
       // Everything that can be checked about an existing store without reading its data.
       // Throws store_corrupt / store_incompatible; reads only, never writes.
       static void validate_(const std::string& dir, const superblock& sb, const terms_header& th,
-                            uint64_t nodes_size, uint64_t terms_size)
+                            uint64_t nodes_size, uint64_t terms_size, size_t page_size)
       {
          // 1. Is it a store, and one this build reads?
          if (sb.magic == byteswap64_(MAGIC))
@@ -535,7 +569,13 @@ namespace artpp
          same("node free-list table size", sb.free_max, FREE_MAX);
          same("terminal free-list table size", sb.tfree_max, TFREE_MAX);
          same("commit unit", sb.chunk_bytes, chunk_bytes);
-         same("header reservation", sb.header_bytes, SB_BYTES);
+         if (sb.header_bytes < sizeof(superblock) || sb.header_bytes > nodes_size)
+            corrupt_(dir, "superblock field header_bytes = " + num_(sb.header_bytes) + " is out of range");
+         if (!header_fits_pages(sb.header_bytes, page_size))
+            incompatible_(dir, "the store's header reservation (" + num_(sb.header_bytes) +
+                                   " bytes) is not a whole number of this system's pages (" +
+                                   num_(page_size) + " bytes): it was created for smaller pages and "
+                                   "cannot be mapped here");
 
          // 2. Geometry and carving state: every field within what the others allow.
          const auto in_range = [&](bool ok, const char* field, uint64_t v) {
@@ -574,7 +614,7 @@ namespace artpp
 
          // 4. `terms` is the other half of THIS store at THIS checkpoint.
          if (th.magic != TERM_MAGIC || th.version != sb.version || th.byte_order != sb.byte_order ||
-             th.header_bytes != sb.header_bytes)
+             th.header_bytes != sb.header_bytes || sb.header_bytes > terms_size)
             corrupt_(dir, "'terms' is not the terminal file of an artpp line_pool store");
          if (th.store_id != sb.store_id)
             corrupt_(dir, "'nodes' and 'terms' belong to different stores");
@@ -634,9 +674,15 @@ namespace artpp
       superblock*   sb_() const noexcept { return reinterpret_cast<superblock*>(nbase_); }
       terms_header* th_() const noexcept { return reinterpret_cast<terms_header*>(tmap_); }
 
-      void open_store_(const char* dir, size_t cap)
+      void open_store_(const char* dir, size_t cap, size_t page)
       {
          if (!dir || !*dir) throw std::invalid_argument("artpp::line_pool: empty store directory name");
+         const size_t sys_page = system_page_size();
+         if (page == 0) page = sys_page;
+         if (page % sys_page != 0 || chunk_bytes % page != 0)
+            throw std::invalid_argument("artpp::line_pool: page_size must be a multiple of the system's page "
+                                        "size (" + num_(sys_page) + ") that divides the commit unit (" +
+                                        num_(chunk_bytes) + ")");
          dir_                 = dir;
          const std::string np = dir_ + "/nodes";  // 128 B lines, behind the superblock
          const std::string tp = dir_ + "/terms";  // 16 B terminal units, behind their header
@@ -671,10 +717,10 @@ namespace artpp
          }
          const uint64_t nsz = uint64_t(file_size_(nfd_, np, dir_));
          const uint64_t tsz = uint64_t(file_size_(tfd_, tp, dir_));
-         hdr_ = SB_BYTES;
          reset_lists_();
          if (nsz == 0 && tsz == 0)
          {
+            hdr_ = header_bytes_for(page);
             create_(cap);
             return;
          }
@@ -688,7 +734,8 @@ namespace artpp
          if (!read_header_(tfd_, &th, sizeof th, tp))
             corrupt_(dir_, "'terms' is not the terminal file of an artpp line_pool store (" + num_(tsz) +
                                " bytes: too short)");
-         validate_(dir_, sb, th, nsz, tsz);
+         validate_(dir_, sb, th, nsz, tsz, page);
+         hdr_ = sb.header_bytes;
          if (sb.dirty && sb.checkpoints != 0)
             throw store_dirty("artpp::line_pool: " + dir_ +
                               ": the store was modified after its last checkpoint and not checkpointed "
@@ -701,6 +748,7 @@ namespace artpp
             // Start it over as the empty store it still is.
             if (::ftruncate(nfd_, 0) != 0) os_error_(errno, "ftruncate", np);
             if (::ftruncate(tfd_, 0) != 0) os_error_(errno, "ftruncate", tp);
+            hdr_ = header_bytes_for(page);
             create_(cap);
             return;
          }
