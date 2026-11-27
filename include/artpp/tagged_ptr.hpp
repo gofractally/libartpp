@@ -16,6 +16,12 @@
 
 namespace artpp::detail
 {
+   // memcpy whose source may be an empty view: std::string_view{}.data() is null, and
+   // passing null to memcpy is undefined even for a zero length.
+   inline void copy_bytes(void* dst, const void* src, size_t n) noexcept
+   {
+      if (n) std::memcpy(dst, src, n);
+   }
    // The "no value" mapped type: a map<Key, none_t> is a SET. One byte, empty, trivially
    // copyable — so map<Key, none_t> compiles through every node layout unchanged (Stage A),
    // and the value/T touchpoints are then elided under `if constexpr (HasValue)` (Stages B+).

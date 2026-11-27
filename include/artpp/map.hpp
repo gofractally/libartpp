@@ -2869,7 +2869,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else                    (void)val;  // set: entry is the key suffix only
          const uint16_t sl = uint16_t(suf.size());
          std::memcpy(e + bkt_val_bytes, &sl, 2);
-         std::memcpy(e + bkt_val_bytes + 2, suf.data(), suf.size());
+         copy_bytes(e + bkt_val_bytes + 2, suf.data(), suf.size());
          const uint16_t off = b->tail_used;
          d                  = bkt_div(b);
          uint16_t* so       = d + b->nent;      // old slot base
@@ -4435,7 +4435,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          char* p = static_cast<char*>(term_alloc_(leaf_size(suf.size())));
          leaf_set_hdr(p, uint16_t(suf.size()), 0);
-         std::memcpy(leaf_str(p), suf.data(), suf.size());
+         copy_bytes(leaf_str(p), suf.data(), suf.size());
          if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
          else                    (void)val;  // set: a leaf is the key bytes only, no value
          return pack_term_(p, K::value_ptr);
@@ -4445,8 +4445,8 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          char* p = static_cast<char*>(term_alloc_(leaf_size(pfx.size() + suf.size())));
          leaf_set_hdr(p, uint16_t(suf.size()), uint16_t(LEAF_FULL | pfx.size()));
-         std::memcpy(leaf_str(p), pfx.data(), pfx.size());
-         std::memcpy(leaf_str(p) + pfx.size(), suf.data(), suf.size());
+         copy_bytes(leaf_str(p), pfx.data(), pfx.size());
+         copy_bytes(leaf_str(p) + pfx.size(), suf.data(), suf.size());
          if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
          else                    (void)val;  // set: a leaf is the key bytes only, no value
          return pack_term_(p, K::value_ptr);
@@ -4542,7 +4542,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             {
                uint8_t* pb = f->hdr + 1;
                std::memmove(pb + pfx.size(), pb, pl);  // prepend before any existing
-               std::memcpy(pb, pfx.data(), pfx.size());
+               copy_bytes(pb, pfx.data(), pfx.size());
                f->hdr[0]            = uint8_t(K::node_full);
                f->rh.hdr.prefix_len = uint16_t(pfx.size() + pl) & 0x3F;
                return pack_(f, K::pfxd);
@@ -4552,7 +4552,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          uint16_t pl = uint16_t(pfx.size());
          std::memcpy(p, &pl, 2);
          pn_set_next(p, next);
-         std::memcpy(pn_pfx<Ptr>(p), pfx.data(), pfx.size());
+         copy_bytes(pn_pfx<Ptr>(p), pfx.data(), pfx.size());
          return pack_(p, K::prefix_node);
       }
       setlist* new_setlist()
@@ -4680,7 +4680,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          if (pfx.size() <= setlist::PREFIX_CAP)
          {
             r->rh.hdr.prefix_len = uint16_t(pfx.size());
-            std::memcpy(r->prefix, pfx.data(), pfx.size());
+            copy_bytes(r->prefix, pfx.data(), pfx.size());
             return top;
          }
          return make_prefix(pfx, top);
