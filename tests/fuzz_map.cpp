@@ -17,6 +17,9 @@
 //   * keys are drawn from a tiny alphabet AND a recently-used key POOL (extend / truncate / mutate
 //     a prior key), manufacturing the shared prefixes, prefix-of-another, and wide single-byte
 //     fan-out that drive the structural transitions a uniform-random key generator almost never hits.
+//   * two rare ops build and tear down a deep single-child CHAIN (base + s^i + "t" for i < n, plus
+//     base + s^n; n up to ~200): erasing the t-keys deepest first and then the last key makes one
+//     erase free a chain far longer than remove()'s 64-level path window (audit #3).
 #include "artpp/map.hpp"
 #include "artpp/pool.hpp"
 
@@ -150,12 +153,22 @@ static void run_impl(Tree& t, Reader& r)
    using V = typename Tree::mapped_type;
    std::map<std::string, V> m;
    std::vector<std::string> pool;
+   struct chain { std::string base; int n; };
+   std::vector<chain>       chains;  // deep single-child chains built by op 8, awaiting op 9
+   auto chain_key = [](const chain& c, int i, bool leaf) {
+      std::string k = c.base;
+      k.append(size_t(i), 's');
+      if (leaf) k.push_back('t');
+      return k;
+   };
    const bool               wide = r.u8() & 1;  // per-run: narrow (clustered) vs wide (fan-out) keys
    int                      op   = 0;
    for (; !r.done(); ++op)
    {
       const std::string k      = gen_key(r, pool, wide);
-      const uint8_t     choice = r.u8() % 8;
+      const uint8_t     raw    = r.u8();
+      // 0..7 as before; the top 16 byte values are the two (rare, expensive) chain ops
+      const uint8_t     choice = raw >= 248 ? 8 : raw >= 240 ? 9 : raw % 8;
       if (g_trace)
          std::fprintf(stderr, "op#%d choice=%d klen=%zu sz=%zu k0=%d\n", op, choice, k.size(),
                       m.size(), k.empty() ? -1 : (int)(unsigned char)k[0]);
@@ -218,6 +231,36 @@ static void run_impl(Tree& t, Reader& r)
             const bool present = m.count(k) != 0;
             FZCHECK(threw == !present, op);
             if (!threw) FZCHECK(tv == m.at(k), op);
+            break;
+         }
+         case 8:  // build a deep chain under a short base: every level is a two-way router
+         build_chain:
+         {
+            chain c{k.substr(0, 6), 8 + int(r.u8() % 200)};
+            const V v = mkval<V>(r);
+            for (int i = 0; i < c.n; ++i)
+            {
+               const std::string ck = chain_key(c, i, true);
+               FZCHECK(t.insert(ck, v) == m.insert_or_assign(ck, v).second, op);
+            }
+            const std::string last = chain_key(c, c.n, false);
+            FZCHECK(t.insert(last, v) == m.insert_or_assign(last, v).second, op);
+            chains.push_back(std::move(c));
+            break;
+         }
+         case 9:  // tear the newest chain down deepest-first: the final erase frees ALL its levels
+         {
+            if (chains.empty()) goto build_chain;
+            const chain c = std::move(chains.back());
+            chains.pop_back();
+            for (int i = c.n - 1; i >= 0; --i)
+            {
+               const std::string ck = chain_key(c, i, true);
+               FZCHECK(t.erase(ck) == m.erase(ck), op);
+            }
+            const std::string last = chain_key(c, c.n, false);
+            FZCHECK(t.erase(last) == m.erase(last), op);
+            cross_check(t, m, op);  // a null child left behind crashes the walk right here
             break;
          }
       }

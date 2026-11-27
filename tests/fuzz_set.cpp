@@ -107,11 +107,24 @@ static void run_impl(Set& s, Reader& r)
 {
    std::set<std::string>    o;
    std::vector<std::string> pool;
+   // Deep single-child chains (audit #3): base + a^i + "b" for i < n plus base + a^n; erasing
+   // the b-keys deepest first and then the last key frees the whole chain in ONE erase — far
+   // past remove()'s 64-level path window.
+   struct chain { std::string base; int n; };
+   std::vector<chain>       chains;
+   auto chain_key = [](const chain& c, int i, bool leaf) {
+      std::string k = c.base;
+      k.append(size_t(i), 'a');
+      if (leaf) k.push_back('b');
+      return k;
+   };
    int                      op = 0;
    for (; !r.done(); ++op)
    {
       const std::string k      = gen_key(r, pool);
-      const uint8_t     choice = r.u8() % 8;
+      const uint8_t     raw    = r.u8();
+      // 0..7 as before; the top 8 byte values are the two (rare, expensive) chain ops
+      const uint8_t     choice = raw >= 252 ? 8 : raw >= 248 ? 9 : raw % 8;
       switch (choice)
       {
          case 0: FZCHECK(s.insert(k).second == o.insert(k).second, op); break;
@@ -152,6 +165,35 @@ static void run_impl(Set& s, Reader& r)
             if (mu != o.end()) FZCHECK(std::string(hi.key()) == *mu, op);
             auto er = s.equal_range(k);
             FZCHECK(er.first == lo && er.second == hi, op);
+            break;
+         }
+         case 8:  // build a deep chain under a short base
+         build_chain:
+         {
+            chain c{k.substr(0, 4), 8 + int(r.u8() % 200)};
+            for (int i = 0; i < c.n; ++i)
+            {
+               const std::string ck = chain_key(c, i, true);
+               FZCHECK(s.insert(ck).second == o.insert(ck).second, op);
+            }
+            const std::string last = chain_key(c, c.n, false);
+            FZCHECK(s.insert(last).second == o.insert(last).second, op);
+            chains.push_back(std::move(c));
+            break;
+         }
+         case 9:  // tear the newest chain down deepest-first, then prove the walk still works
+         {
+            if (chains.empty()) goto build_chain;
+            const chain c = std::move(chains.back());
+            chains.pop_back();
+            for (int i = c.n - 1; i >= 0; --i)
+            {
+               const std::string ck = chain_key(c, i, true);
+               FZCHECK(s.erase(ck) == o.erase(ck), op);
+            }
+            const std::string last = chain_key(c, c.n, false);
+            FZCHECK(s.erase(last) == o.erase(last), op);
+            cross_check(s, o, op);
             break;
          }
          default: FZCHECK(s.insert(k).second == o.insert(k).second, op); break;  // 6,7: more inserts

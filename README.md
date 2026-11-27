@@ -584,8 +584,6 @@ A pre-release audit found bugs that are open in the
 [issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
 fixed:
 
-- **Deep single-child chains:** erasing a chain of more than 64 nested keys can
-  leave the map in a state where iteration crashes (#3).
 - **Exception safety:** the guarantees under [Limits and guarantees](#limits-and-guarantees)
   do not hold in `mode::buckets` and `mode::adaptive`, nor for value types whose
   constructors throw (#4 to #7, #12, #13).

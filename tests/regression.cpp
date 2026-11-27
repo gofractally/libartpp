@@ -181,12 +181,95 @@ static void regression_walk_dense_routers()
    roundtrip<map<std::string_view, uint64_t, mode::wide_stems>, uint64_t>(wide, false, "walk wide fwd");
 }
 
+// ── audit #3: an erase cascade longer than the 64-level path window ──────────────
+// Keys a^i+"b" (i < N) plus a^N build an N-level chain of two-way routers. Erasing the
+// b-keys deepest first leaves a chain of single-child nodes leading to the one remaining
+// leaf; erasing that leaf kills the whole chain in ONE erase. remove() records only the
+// deepest 64 levels of the path, and at that window's edge it used to write a null handle
+// into a surviving ancestor instead of unlinking the edge: size() == 0 with a non-null
+// root holding a null child, so begin() / for_each / lower_bound crashed. The shapes put
+// the cascade's survivor at each interesting place: none (the root dies), a second branch
+// at the root, a term part-way down the chain, a second branch part-way down.
+template <class V>
+static V chain_val(int x)
+{
+   if constexpr (std::is_same_v<V, std::string>) return "v" + std::to_string(x);
+   else return V(x + 1);
+}
+template <class Tree, class V>
+static void deep_chain(int N, int shape, const char* where)
+{
+   Tree                     t;
+   std::map<std::string, V> oracle;
+   auto put = [&](const std::string& k, int x) {
+      const V v = chain_val<V>(x);
+      t.insert_or_assign(k, v);
+      oracle[k] = v;
+   };
+   auto del = [&](const std::string& k) { CHECK(t.erase(k) == oracle.erase(k)); };
+   const std::string last(size_t(N), 'a');
+   for (int i = 0; i < N; ++i) put(std::string(size_t(i), 'a') + "b", i);
+   put(last, N);
+   if (shape == 1) put("x", N + 1);                 // survivor: the root keeps a second branch
+   if (shape == 2) put("aaa", N + 1);               // survivor: a term 3 levels down
+   if (shape == 3) put("aaaaazz", N + 1);           // survivor: a second branch 5 levels down
+   for (int i = N - 1; i >= 0; --i) del(std::string(size_t(i), 'a') + "b");  // deepest first
+   agree<Tree, V>(t, oracle, where);
+   del(last);                                       // the whole chain dies in this one erase
+   agree<Tree, V>(t, oracle, where);
+   size_t n = 0;
+   t.for_each([&](std::string_view, const V&) { ++n; });
+   CHECK(n == oracle.size());
+   CHECK((t.lower_bound("a") == t.end()) == (oracle.lower_bound("a") == oracle.end()));
+   CHECK(t.empty() == oracle.empty());
+   if (shape == 0) CHECK(t.begin() == t.end());
+   // the tree must still be fully usable: rebuild the same shape on top of what is left
+   for (int i = 0; i < N; ++i) put(std::string(size_t(i), 'a') + "b", i);
+   put(last, N);
+   agree<Tree, V>(t, oracle, where);
+   for (int i = 0; i < N; ++i) del(std::string(size_t(i), 'a') + "b");       // shallowest first
+   del(last);
+   agree<Tree, V>(t, oracle, where);
+}
+static void regression_erase_cascade_past_window()
+{
+   for (int N : {40, 63, 64, 65, 66, 127, 128, 129, 200, 1000})
+      for (int shape = 0; shape < 4; ++shape)
+      {
+         deep_chain<map<std::string_view, std::string>, std::string>(N, shape, "chain string");
+         deep_chain<map<std::string_view, uint64_t>, uint64_t>(N, shape, "chain u64");
+         deep_chain<map<std::string_view, uint32_t>, uint32_t>(N, shape, "chain u32 (inline values)");
+         deep_chain<map<std::string_view, uint64_t, mode::dense_tiers>, uint64_t>(N, shape, "chain dense");
+         deep_chain<map<std::string_view, uint64_t, mode::wide_stems>, uint64_t>(N, shape, "chain wide");
+         deep_chain<map<std::string_view, uint64_t, mode::adaptive>, uint64_t>(N, shape, "chain adaptive");
+         deep_chain<map<std::string_view, std::string, mode::buckets>, std::string>(N, shape, "chain buckets");
+      }
+   // the set shares the erase path (terminals are suffix-in-handle there)
+   for (int N : {65, 200})
+   {
+      artpp::set<std::string> s;
+      std::set<std::string>   o;
+      const std::string       last(size_t(N), 'a');
+      for (int i = 0; i < N; ++i) { s.insert(std::string(size_t(i), 'a') + "bbbbbbbb"); o.insert(std::string(size_t(i), 'a') + "bbbbbbbb"); }
+      s.insert(last + "cccccccc");
+      o.insert(last + "cccccccc");
+      for (int i = N - 1; i >= 0; --i) CHECK(s.erase(std::string(size_t(i), 'a') + "bbbbbbbb") == 1);
+      CHECK(s.erase(last + "cccccccc") == 1);
+      CHECK(s.size() == 0);
+      CHECK(s.begin() == s.end());
+      size_t n = 0;
+      s.for_each([&](const std::string&) { ++n; });
+      CHECK(n == 0);
+   }
+}
+
 int main()
 {
    regression_bkt_split_long_prefix();
    regression_adaptive_collapse_pair_fit();
    regression_bkt_put_inline_leaf();
    regression_walk_dense_routers();
+   regression_erase_cascade_past_window();
    if (g_fail == 0) std::printf("artpp_regression: ALL OK\n");
    else std::printf("artpp_regression: %d FAILURE(S)\n", g_fail);
    return g_fail ? 1 : 0;

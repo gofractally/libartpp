@@ -3133,7 +3133,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
          packed_ptr* slot;
          uint16_t    edge;  // byte (u8 routers/full/cN), 2-byte stem (u16); unused for pn/root
       };
-      static constexpr uint32_t RM_LVN     = 64;  // shrink window: deeper ancestors stay unshrunk
+      static constexpr uint32_t RM_LVN     = 64;  // path window; longer cascades: rm_unwind_deep_
       static constexpr int      SHRINK_MAX = setlist::CAP - 4;  // de-widen full/cN below the
                                                                 // setlist CAP with hysteresis
                                                                 // against widen/shrink ping-pong
@@ -3293,7 +3293,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
 
       // Walk the recorded path upward: drop the freed child's edge from its parent, then
       // shrink each ancestor until one survives. `j` starts at the freed node's parent.
-      void rm_unwind_(rm_lvl* path, uint32_t n, uint32_t j) noexcept
+      // The path is a ring of the deepest RM_LVN levels; a cascade that climbs past it
+      // (more than RM_LVN nodes dying in one erase) finishes in rm_unwind_deep_.
+      void rm_unwind_(rm_lvl* path, uint32_t n, uint32_t j, std::string_view key) noexcept
       {
          bool unlink = true;
          for (;; --j)
@@ -3308,7 +3310,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   char* P = static_cast<char*>(deref_(nd));
                   node_free_(P, pn_size<Ptr>(pn_plen(P)));
                   if (j == 0) break;
-                  if (n - j >= RM_LVN) { *L.slot = packed_ptr::null(); return; }  // window edge
+                  if (n - j >= RM_LVN) { rm_unwind_deep_(key, L.slot); return; }  // window edge
                   continue;
                }
                const uint16_t edge = path[(j + 1) % RM_LVN].edge;
@@ -3320,11 +3322,106 @@ namespace detail  // implementation types & node helpers — not part of the pub
             }
             if (!rm_shrink_(L.slot))
                return;  // node survived (possibly replaced in *L.slot)
-            if (j == 0) break;                                          // root died
-            if (n - j >= RM_LVN) { *L.slot = packed_ptr::null(); return; }  // window edge
+            if (j == 0) break;                                              // root died
+            if (n - j >= RM_LVN) { rm_unwind_deep_(key, L.slot); return; }  // window edge
             unlink = true;
          }
          root_ = packed_ptr::null();
+      }
+
+      // One step of a re-descent along a key KNOWN to be on the path through `cur` (a prefix
+      // node or router): returns the child slot the key takes, advances `depth` past the
+      // node, and reports the edge (byte / 2-byte stem; unused for a prefix node).
+      packed_ptr* rm_step_(packed_ptr cur, std::string_view key, size_t& depth, uint16_t& edge) const noexcept
+      {
+         const K k = cur.tag();
+         if (k == K::prefix_node)
+         {
+            char* P = static_cast<char*>(deref_(cur));
+            depth += pn_plen(P);
+            return reinterpret_cast<packed_ptr*>(P + 2);
+         }
+         if (k == K::setlist_u16)
+         {
+            edge = two_stem(key, depth);
+            depth += 2;
+            return sl16_find_slot(static_cast<setlist16*>(deref_(cur)), edge);
+         }
+         if (k == K::setlist_u8 || k == K::pfxd)  // kinds with an inline prefix
+            depth += static_cast<const router_hdr*>(deref_(cur))->hdr.prefix_len;
+         edge = uint8_t(key[depth]);
+         ++depth;
+         return router_find_slot(cur, uint8_t(edge));
+      }
+
+      // The cascade outran the path window. The node `*dead` used to hold is already freed
+      // (with everything below it) and the entries for the levels above were overwritten, so
+      // recover them from the tree itself: re-descend along `key` to `dead`, remembering the
+      // deepest node that SURVIVES losing its on-path child (a router with a term or a second
+      // branch — exactly the nodes rm_shrink_ would not free). Everything between that node
+      // and `dead` is the rest of the dying single-child chain: free it top-down, cut the
+      // survivor's edge and shrink the survivor. No survivor means the whole tree was the
+      // chain. Two linear passes, no allocation, no recursion — correct at any depth.
+      void rm_unwind_deep_(std::string_view key, packed_ptr* dead) noexcept
+      {
+         packed_ptr* surv      = nullptr;  // slot holding the survivor (null: none, root dies)
+         uint16_t    surv_edge = 0;        // the survivor's edge towards the dying chain
+         packed_ptr* cut       = &root_;   // slot holding the first dying node
+         size_t      cut_depth = 0;
+         {
+            packed_ptr* slot  = &root_;
+            size_t      depth = 0;
+            while (slot != dead)
+            {
+               const packed_ptr cur  = *slot;
+               uint16_t         edge = 0;
+               packed_ptr*      next = rm_step_(cur, key, depth, edge);
+               if (cur.tag() != K::prefix_node)
+               {
+                  const router_hdr* rh = static_cast<const router_hdr*>(deref_(cur));
+                  if (rh->hdr.nbranch >= 2 || !rh->term.is_null())
+                  {
+                     surv      = slot;
+                     surv_edge = edge;
+                     cut       = next;
+                     cut_depth = depth;
+                  }
+               }
+               slot = next;
+            }
+         }
+         if (cut != dead)  // free the chain [*cut .. owner of dead]; read each link before freeing
+         {
+            packed_ptr cur   = *cut;
+            size_t     depth = cut_depth;
+            for (;;)
+            {
+               uint16_t          edge = 0;
+               packed_ptr* const next = rm_step_(cur, key, depth, edge);
+               const packed_ptr  nxt  = next == dead ? packed_ptr::null() : *next;
+               if (cur.tag() == K::prefix_node)
+               {
+                  char* P = static_cast<char*>(deref_(cur));
+                  node_free_(P, pn_size<Ptr>(pn_plen(P)));
+               }
+               else
+                  rm_free_(cur);
+               if (next == dead) break;
+               cur = nxt;
+            }
+         }
+         if (!surv)
+         {
+            root_ = packed_ptr::null();
+            return;
+         }
+         const packed_ptr sn = *surv;
+         if (sn.tag() == K::setlist_u16)
+            sl16_remove(static_cast<setlist16*>(deref_(sn)), surv_edge);
+         else
+            router_remove(sn, uint8_t(surv_edge));
+         [[maybe_unused]] const bool freed = rm_shrink_(surv);  // collapse / de-widen as usual
+         assert(!freed && "artpp: a node with a term or a second branch survives the unlink");
       }
 
      public:
@@ -3334,8 +3431,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // term-less router collapses into its child (edge byte + inline prefix absorbed, a
       // prefix node allocated only when the child can't take them for free), and a sparse
       // dense node (full/cN, <= 12 branches) de-widens back to a setlist. Allocating
-      // collapses are best-effort: on bad_alloc the tree simply stays unshrunk. Ancestors
-      // beyond the deepest 64 levels are left unshrunk (the window covers any practical key).
+      // collapses are best-effort: on bad_alloc the tree simply stays unshrunk. A cascade of
+      // dying single-child nodes may be any length: the deepest 64 levels unwind from the
+      // recorded path, a longer one continues by re-descent (rm_unwind_deep_).
       // NOTE: not noexcept — removing a non-POD value from a bucket rebuilds it (allocates),
       // and a custom key_codec may allocate. Nothrow in practice for POD values / radix mode.
       bool remove(key_param k)
@@ -3373,7 +3471,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      return false;
                   free_leaf(L);
                   --count_;
-                  if (n >= 2) rm_unwind_(path, n, n - 2);  // n-2: the leaf's parent
+                  if (n >= 2) rm_unwind_(path, n, n - 2, key);  // n-2: the leaf's parent
                   else root_ = packed_ptr::null();         // the leaf WAS the root
                   return true;
                }
@@ -3386,7 +3484,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                   else if (depth != key.size())
                      return false;  // map: inline terminal matches only at key end; nothing to free
                   --count_;
-                  if (n >= 2) rm_unwind_(path, n, n - 2);
+                  if (n >= 2) rm_unwind_(path, n, n - 2, key);
                   else root_ = packed_ptr::null();
                   return true;
                }
@@ -3402,7 +3500,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                      if (b->nent == 0)
                      {
                         node_free_(b, sizeof(bucket));
-                        if (n >= 2) rm_unwind_(path, n, n - 2);
+                        if (n >= 2) rm_unwind_(path, n, n - 2, key);
                         else root_ = packed_ptr::null();
                      }
                      else if (nb.raw() != cur.raw())
@@ -3486,7 +3584,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
                            --count_;
                            if (rm_shrink_(slot))  // cur emptied/collapsed → unlink from parent
                            {
-                              if (n >= 2) rm_unwind_(path, n, n - 2);
+                              if (n >= 2) rm_unwind_(path, n, n - 2, key);
                               else        root_ = packed_ptr::null();
                            }
                            return true;
@@ -3512,7 +3610,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
             --count_;
             if (rm_shrink_(slot))  // emptied outright: unlink from the parent and cascade
             {
-               if (n >= 2) rm_unwind_(path, n, n - 2);
+               if (n >= 2) rm_unwind_(path, n, n - 2, key);
                else root_ = packed_ptr::null();  // the root router emptied
             }
             return true;

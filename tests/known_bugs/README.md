@@ -10,12 +10,11 @@ Build one from the repository root:
 
 ```sh
 c++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-    -Iinclude tests/known_bugs/rm_window.cpp -o rm_window
+    -Iinclude tests/known_bugs/iter_assign.cpp -o iter_assign
 ```
 
 | File | Issue | Run |
 |---|---|---|
-| `rm_window.cpp` | #3 erase leaves a null child; `begin()` crashes | `./rm_window 0 200` |
 | `repro_eh.cpp` | #4, #5, #6, #7, #13 exception paths | `./repro_eh 2 1`, `7 9`, `1 0`, `5 -1`, `4 1` |
 | `fault.cpp` | #5, #6, #12 allocation and value fault sweep | `./fault 1 1 1 250` |
 | `pool_tests.cpp` | #8, #9, #10 file-backed `line_pool` | `./pool_tests 1` to `6` |
