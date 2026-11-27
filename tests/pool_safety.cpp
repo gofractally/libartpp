@@ -20,10 +20,13 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -1075,6 +1078,264 @@ static void stores_laid_out_for_larger_pages()
    CHECK(threw);
 }
 
+// ── limits and failures of the allocation path (audit follow-up, #1) ────────────────────
+// Running out is an allocation failure like any other: a std::bad_alloc (so the tree's
+// strong guarantee applies), of a type that says which limit, with the pool left usable.
+static void exhaustion_throws_cleanly_and_leaves_the_pool_usable()
+{
+   using LP = artpp::line_pool;
+   {  // a small pool: every line of its one chunk, then one more
+      LP                 pool(LP::chunk_bytes);
+      const size_t       lines = LP::chunk_bytes / LP::line_bytes;
+      std::vector<void*> got;
+      for (size_t i = 0; i < lines; ++i) got.push_back(pool.alloc_lines(1));
+      CHECK(pool.used_lines() == lines);
+      bool exhausted = false;
+      try
+      {
+         pool.alloc_lines(1);
+      }
+      catch (const artpp::pool_exhausted& e)
+      {
+         const std::bad_alloc& as_bad_alloc = e;
+         exhausted = std::strstr(as_bad_alloc.what(), "line_pool") != nullptr;
+      }
+      CHECK(exhausted);
+      CHECK(pool.used_lines() == lines);  // nothing moved
+      pool.free_lines(got.back(), 1);
+      CHECK(pool.alloc_lines(1) == got.back());  // and what is freed can be had again
+      const size_t units = pool.term_committed();  // the terminal region of the same pool
+      (void)units;
+      size_t n = 0;
+      bool   texhausted = false;
+      try
+      {
+         for (;; ++n) pool.alloc_term(4096);
+      }
+      catch (const artpp::pool_exhausted&)
+      {
+         texhausted = true;
+      }
+      CHECK(texhausted && n == LP::chunk_bytes / (4096 * LP::term_unit));
+   }
+   {  // a request so large that the byte count overflows must fail, not wrap to "fits"
+      LP pool(LP::chunk_bytes);
+      for (size_t n : {size_t(1) << 57, (size_t(1) << 57) + 3, ~size_t(0), ~size_t(0) / 128})
+      {
+         bool threw = false;
+         try
+         {
+            pool.alloc_lines(n);
+         }
+         catch (const std::bad_alloc&)
+         {
+            threw = true;
+         }
+         CHECK(threw && pool.used_lines() == 0);
+      }
+      for (size_t n : {size_t(1) << 60, ~size_t(0), ~size_t(0) / 16})
+      {
+         bool threw = false;
+         try
+         {
+            pool.alloc_term(n);
+         }
+         catch (const std::bad_alloc&)
+         {
+            threw = true;
+         }
+         CHECK(threw && pool.used_term_units() == 0);
+      }
+      artpp::pool_alloc<std::uint64_t> a{&pool};  // and through the allocator interface
+      bool                             threw = false;
+      try
+      {
+         (void)a.allocate(~size_t(0) / 4);  // * sizeof(uint64_t) overflows
+      }
+      catch (const std::bad_alloc&)
+      {
+         threw = true;
+      }
+      CHECK(threw && pool.used_lines() == 0);
+      threw = false;
+      try
+      {
+         (void)a.artpp_alloc_term(~size_t(0) - 3);  // rounding up to 16 overflows
+      }
+      catch (const std::bad_alloc&)
+      {
+         threw = true;
+      }
+      CHECK(threw && pool.used_term_units() == 0);
+   }
+}
+// The limits of the handle itself: 2^28 lines of nodes, 2^28 units (4 GB) of terminals. The
+// blocks are never touched, so this needs address space, not memory. A system that refuses
+// to commit that much (strict overcommit) fails earlier, with pool_commit_failed — just as
+// cleanly, and then there is no boundary to look at.
+static void the_handle_limits_are_exact()
+{
+   using LP = artpp::line_pool;
+   LP           pool;
+   const size_t max_lines = LP::max_bytes / LP::line_bytes, block = size_t(1) << 20;
+   CHECK(max_lines == (size_t(1) << 28));
+   std::byte* last  = nullptr;
+   size_t     taken = 0;
+   bool       os_refused = false, exhausted = false;
+   try
+   {
+      for (; taken < max_lines; taken += block) last = static_cast<std::byte*>(pool.alloc_lines(block));
+      pool.alloc_lines(1);  // line 2^28 does not exist
+   }
+   catch (const artpp::pool_exhausted&)
+   {
+      exhausted = true;
+   }
+   catch (const artpp::pool_commit_failed& e)
+   {
+      os_refused = true;
+      std::printf("     note: the system refused to commit the node region at %zu lines (errno %d)\n", taken, e.code());
+   }
+   CHECK(exhausted || os_refused);
+   if (exhausted)
+   {
+      CHECK(taken == max_lines && pool.used_lines() == max_lines);
+      // the last line is addressable by a handle, and decodes to itself
+      const size_t off = size_t(last - pool.base()) + (block - 1) * LP::line_bytes;
+      CHECK(off == LP::max_bytes - LP::line_bytes);
+      const auto h = artpp::detail::line_ptr::from_off(off, artpp::detail::K::node_full);
+      CHECK(((h.raw() & ~std::uint64_t(0xF)) << 3) == off && h.tag() == artpp::detail::K::node_full);
+      pool.free_lines(last, block);
+      CHECK(pool.alloc_lines(block) == last);  // from the giant-block list, at the very end
+   }
+   const size_t max_units = LP::max_term_bytes / LP::term_unit;
+   taken = 0;
+   exhausted = os_refused = false;
+   try
+   {
+      for (; taken < max_units; taken += block) last = static_cast<std::byte*>(pool.alloc_term(block));
+      pool.alloc_term(1);
+   }
+   catch (const artpp::pool_exhausted&)
+   {
+      exhausted = true;
+   }
+   catch (const artpp::pool_commit_failed&)
+   {
+      os_refused = true;
+   }
+   CHECK(exhausted || os_refused);
+   if (exhausted)
+   {
+      CHECK(taken == max_units && pool.used_term_units() == max_units);
+      const size_t off = size_t(last - pool.term_base()) + (block - 1) * LP::term_unit;
+      CHECK(off == LP::max_term_bytes - LP::term_unit);
+      const auto h = artpp::detail::line_ptr::from_toff(off, artpp::detail::K::value_ptr);
+      CHECK((h.raw() & ~std::uint64_t(0xF)) == off);
+   }
+}
+// Scenario 7 of the audit's reproducer (which passed, and must keep passing): a map that
+// runs its pool dry stays whole, in memory and — for a file-backed pool — on disk.
+static void a_map_that_exhausts_its_pool_stays_valid()
+{
+   temp_store s;
+   int        inserted = 0;
+   {
+      artpp::line_pool pool(s.c_str(), artpp::line_pool::chunk_bytes);  // one chunk per region
+      Map              m{A{&pool}, artpp::attach};
+      bool             threw = false;
+      try
+      {
+         for (;; ++inserted) m.insert(key(inserted), std::uint64_t(inserted) + 1);
+      }
+      catch (const artpp::pool_exhausted&)
+      {
+         threw = true;
+      }
+      CHECK(threw && inserted > 1000 && m.size() == size_t(inserted));
+      CHECK(missing(m, 0, inserted) == 0 && !m.contains(key(inserted)));
+      size_t n = 0;
+      for (auto it = m.begin(); it != m.end(); ++it) ++n;
+      CHECK(n == size_t(inserted));
+      for (int i = 0; i < inserted; i += 2) m.erase(key(i));
+      for (int i = 0; i < inserted; i += 2) m.insert(key(i), std::uint64_t(i) + 1);  // the freed space suffices
+      CHECK(m.size() == size_t(inserted));
+      m.checkpoint();
+   }
+   CHECK(store_is_intact(s, inserted));
+}
+// The operating system refusing to grow a file is reported with its errno, as a
+// std::bad_alloc; the pool and the tree stay usable and the store can still be checkpointed.
+static void a_failed_file_growth_reports_errno()
+{
+   temp_store s;
+   struct rlimit old_limit;
+   CHECK(::getrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+   void (*old_handler)(int) = ::signal(SIGXFSZ, SIG_IGN);  // the kernel also sends this; EFBIG is enough
+   int  inserted = 0, err = 0;
+   bool failed = false;
+   {
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}, artpp::attach};
+      m.insert(key(0), 1);
+      inserted = 1;
+      struct rlimit lim = old_limit;
+      lim.rlim_cur      = rlim_t(s.size("terms")) + 4096;  // `terms` cannot get its next chunk
+      CHECK(::setrlimit(RLIMIT_FSIZE, &lim) == 0);
+      try
+      {
+         for (; inserted < 2000000; ++inserted) m.insert(key(inserted), std::uint64_t(inserted) + 1);
+      }
+      catch (const artpp::pool_commit_failed& e)
+      {
+         failed = true;
+         err    = e.code();
+      }
+      catch (const std::bad_alloc&)
+      {
+      }
+      CHECK(::setrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+      CHECK(failed);
+      CHECK(err == EFBIG);
+      CHECK(m.size() == size_t(inserted) && missing(m, 0, inserted) == 0);
+      m.insert(key(inserted), std::uint64_t(inserted) + 1);  // with the limit gone it grows again
+      ++inserted;
+      m.checkpoint();
+   }
+   ::signal(SIGXFSZ, old_handler);
+   CHECK(store_is_intact(s, inserted));
+}
+// close(): the way to learn that releasing the store failed (a destructor cannot say).
+static void close_releases_the_store_and_is_checked()
+{
+   CHECK(!std::is_copy_constructible_v<artpp::line_pool> && !std::is_move_constructible_v<artpp::line_pool>);
+   CHECK(!std::is_copy_assignable_v<artpp::line_pool> && !std::is_move_assignable_v<artpp::line_pool>);
+   temp_store s;
+   build_store(s, 50);
+   artpp::line_pool pool(s.c_str());
+   {
+      Map m{A{&pool}, artpp::attach};
+      m.insert(key(50), 51);
+      m.checkpoint();
+   }
+   pool.close();
+   CHECK(store_is_intact(s, 51));  // the lock went with it: another pool can open the store
+   pool.close();                   // closing twice is nothing
+   bool threw = false;
+   try
+   {
+      pool.checkpoint(artpp::line_pool::null_root, 0);
+   }
+   catch (const std::logic_error&)
+   {
+      threw = true;
+   }
+   CHECK(threw);
+   CHECK(store_is_intact(s, 51));
+   artpp::line_pool anon;
+   anon.close();
+}
+
 int main()
 {
    struct test_case
@@ -1109,6 +1370,11 @@ int main()
        {"the_stamp_follows_the_low_level_calls", the_stamp_follows_the_low_level_calls},
        {"header_reservation_is_page_size_driven", header_reservation_is_page_size_driven},
        {"stores_laid_out_for_larger_pages", stores_laid_out_for_larger_pages},
+       {"exhaustion_throws_cleanly_and_leaves_the_pool_usable", exhaustion_throws_cleanly_and_leaves_the_pool_usable},
+       {"the_handle_limits_are_exact", the_handle_limits_are_exact},
+       {"a_map_that_exhausts_its_pool_stays_valid", a_map_that_exhausts_its_pool_stays_valid},
+       {"a_failed_file_growth_reports_errno", a_failed_file_growth_reports_errno},
+       {"close_releases_the_store_and_is_checked", close_releases_the_store_and_is_checked},
    };
    for (const test_case& c : cases)
    {

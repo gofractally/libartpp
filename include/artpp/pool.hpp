@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -101,6 +102,36 @@ namespace artpp
       };
       static_assert(sizeof(line_ptr) == 4, "line_ptr is exactly 4 bytes");
    }  // namespace detail
+
+   // ── what the allocation path throws ─────────────────────────────────────────────────
+   // Both are std::bad_alloc: to the tree, and to any caller, an allocation that failed.
+   // Neither allocates memory to say so.
+   //
+   // The region is full: the capacity given to the constructor, or the limit of the handle
+   // itself (2^28 lines = 32 GB of nodes, 2^28 units = 4 GB of terminals), is used up.
+   class pool_exhausted : public std::bad_alloc
+   {
+      const char* msg_;
+
+     public:
+      explicit pool_exhausted(const char* m) noexcept : msg_(m) {}
+      const char* what() const noexcept override { return msg_; }
+   };
+   // The operating system refused to give the pool more memory or to grow its file (mmap,
+   // mprotect, ftruncate, fstat): code() is the errno of the call.
+   class pool_commit_failed : public std::bad_alloc
+   {
+      int  err_;
+      char msg_[96];
+
+     public:
+      pool_commit_failed(int err, const char* what_failed) noexcept : err_(err)
+      {
+         std::snprintf(msg_, sizeof msg_, "artpp::line_pool: %s failed (errno %d)", what_failed, err);
+      }
+      int         code() const noexcept { return err_; }
+      const char* what() const noexcept override { return msg_; }
+   };
 
    // ── what opening a store directory can refuse ───────────────────────────────────────
    // All derive from store_error (a std::runtime_error) and name the store and the reason in
@@ -189,7 +220,24 @@ namespace artpp
       }
       line_pool(const line_pool&)            = delete;
       line_pool& operator=(const line_pool&) = delete;
-      ~line_pool() { destroy_(); }
+      // Not movable either: every allocator, and through it every map, holds a pointer to the
+      // pool, and the lifecycle state (lock, dirty mark, bound stamp) lives in it.
+      line_pool(line_pool&&)            = delete;
+      line_pool& operator=(line_pool&&) = delete;
+      ~line_pool() { destroy_(); }  // cannot report: see close()
+
+      // Release the mappings, the files and the lock now, and report a failure to do so
+      // (std::system_error with the errno; everything is released regardless). The destructor
+      // does the same and has to ignore failures. Closing does NOT checkpoint. Afterwards the
+      // pool is dead: no container may still be using it, and only close() and the destructor
+      // may be called.
+      void close()
+      {
+         int         err  = 0;
+         const char* call = nullptr;
+         destroy_(&err, &call);
+         if (err) os_error_(err, call, dir_.empty() ? std::string("anonymous pool") : dir_);
+      }
 
       // Terminal region: 16-byte-granular storage for leaves (tag K::value_ptr). A
       // terminal is pure payload — suffix bytes + value — with no branch slots, so it
@@ -204,7 +252,7 @@ namespace artpp
       // True when the image of a file-backed pool has been modified since it was last made
       // consistent (by checkpoint(), or by the open): closing now leaves a store that the next
       // open refuses with store_dirty. Always false for an anonymous pool, which has no image.
-      bool dirty() const noexcept { return file_backed() && free_max_ != 0; }
+      bool dirty() const noexcept { return file_backed() && !clean_() && !dead_; }
       std::byte* base() const noexcept { return base_; }
       std::byte* term_base() const noexcept { return tbase_; }
       size_t     committed() const noexcept { return committed_; }
@@ -274,6 +322,7 @@ namespace artpp
          else if (!root_ok_(root, frontier_, tfrontier_))
             throw std::invalid_argument(
                 "artpp::line_pool::checkpoint: the root handle does not address this pool");
+         if (!nbase_) throw std::logic_error("artpp::line_pool::checkpoint: the pool is closed");
          if (file_backed()) write_image_(root, count, checkpoints_ + 1);
          ++checkpoints_;
          uroot_  = root;
@@ -286,7 +335,7 @@ namespace artpp
       // key that fits a free slot of a node — reach the pool only this way.)
       void released(uint64_t root, uint64_t count) noexcept
       {
-         if (file_backed() && free_max_ == 0 && (root != uroot_ || count != ucount_)) mark_dirty_();
+         if (file_backed() && clean_() && (root != uroot_ || count != ucount_)) mark_dirty_();
       }
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
       // free lists — the intrusive links live inside freed lines, so they ride the byte
@@ -300,7 +349,7 @@ namespace artpp
       {
          const size_t used  = s.frontier_ * line_bytes;
          const size_t tused = s.tfrontier_ * term_unit;
-         if (free_max_ == 0) mark_dirty_();        // the whole image is about to be replaced
+         if (clean_()) mark_dirty_();              // the whole image is about to be replaced
          if (used > committed_) commit_(used);     // throws bad_alloc past our cap
          if (tused > tcommitted_) tcommit_(tused);
          std::memcpy(base_, s.base_, used);
@@ -329,8 +378,9 @@ namespace artpp
          }
          else if (void* p = alloc_lines_rare_(n))
             return p;
-         const size_t need = (frontier_ + n) * line_bytes;
-         if (need > committed_) commit_(need);
+         // Compared in lines, not bytes: `(frontier_ + n) * line_bytes` wraps for an absurd n
+         // and would then pass. frontier_ never exceeds the committed lines.
+         if (n > committed_ / line_bytes - frontier_) grow_lines_(n);
          std::byte* p = base_ + frontier_ * line_bytes;
          frontier_ += n;
          return p;
@@ -361,8 +411,7 @@ namespace artpp
          }
          else if (void* p = alloc_term_rare_(n))
             return p;
-         const size_t need = (tfrontier_ + n) * term_unit;
-         if (need > tcommitted_) tcommit_(need);
+         if (n > tcommitted_ / term_unit - tfrontier_) grow_terms_(n);
          std::byte* p = tbase_ + tfrontier_ * term_unit;
          tfrontier_ += n;
          return p;
@@ -624,14 +673,25 @@ namespace artpp
       }
 
       // ── construction ──────────────────────────────────────────────────────────────────
-      void destroy_() noexcept  // also unwinds a partially-constructed pool
+      // Release everything; also unwinds a partially-constructed pool. The first failure is
+      // handed to close() through err/call; the destructor passes none. Closing the nodes
+      // descriptor releases the lock.
+      void destroy_(int* err = nullptr, const char** call = nullptr) noexcept
       {
-         if (nbase_) ::munmap(nbase_, node_resv_);
-         if (tmap_) ::munmap(tmap_, term_resv_);
-         if (nfd_ >= 0) ::close(nfd_);
-         if (tfd_ >= 0) ::close(tfd_);
+         const auto note = [&](bool failed, const char* what) {
+            if (failed && err && !*err) *err = errno, *call = what;
+         };
+         if (nbase_) note(::munmap(nbase_, node_resv_) != 0, "munmap");
+         if (tmap_) note(::munmap(tmap_, term_resv_) != 0, "munmap");
+         if (tfd_ >= 0) note(::close(tfd_) != 0, "close");
+         if (nfd_ >= 0) note(::close(nfd_) != 0, "close");
          nbase_ = base_ = tmap_ = tbase_ = nullptr;
          nfd_ = tfd_ = -1;
+         huge_ = thuge_ = NIL;
+         committed_ = tcommitted_ = frontier_ = tfrontier_ = 0;  // nothing can be allocated from it
+         ncap_ = tcap_ = 0;
+         free_max_ = tfree_max_ = 0;  // every request takes the checked, out-of-line path
+         dead_ = true;
       }
       void set_caps_(size_t cap) noexcept
       {
@@ -662,7 +722,7 @@ namespace artpp
       [[noreturn]] void reserve_failed_(int err) const
       {
          if (file_backed()) os_error_(err, "mmap", dir_);
-         throw std::bad_alloc();
+         throw pool_commit_failed(err, "reserving address space (mmap)");
       }
       void map_headers_()
       {
@@ -812,11 +872,23 @@ namespace artpp
          z ^= z >> 31;
          return z ? z : 1;
       }
-      // Write the image headers: the carving state, the root and count, and how many times
-      // the user has checkpointed (0 = the empty image stamped at creation). `terms` first:
-      // the superblock is what makes the pair valid.
+      // Write the image: the carving state, the root and count, and how many times the user
+      // has checkpointed (0 = the empty image stamped at creation). In this order, each step
+      // flushed (msync MS_SYNC) and checked before the next:
+      //   1. the data of both regions, up to their frontiers — the tree itself;
+      //   2. the `terms` header;
+      //   3. the superblock, which is what declares the image valid, clean and of this
+      //      generation.
+      // So the superblock never describes data that was not handed to the file first, and a
+      // write error (a full disk under a file that grew, an I/O error) surfaces HERE, as an
+      // exception from checkpoint(), instead of being lost in the page cache after a close
+      // that looked clean. It is still not crash consistency: the image is updated in place.
       void write_image_(uint64_t root, uint64_t count, uint64_t checkpoints)
       {
+         if (frontier_ && ::msync(base_, frontier_ * line_bytes, MS_SYNC) != 0)
+            os_error_(errno, "msync", dir_ + "/nodes");
+         if (tfrontier_ && ::msync(tbase_, tfrontier_ * term_unit, MS_SYNC) != 0)
+            os_error_(errno, "msync", dir_ + "/terms");
          const uint64_t gen = generation_ + 1;
          terms_header*  th  = th_();
          th->magic          = TERM_MAGIC;
@@ -893,11 +965,40 @@ namespace artpp
       // Node lines and terminals both live past their file's header (file offset hdr_).
       void commit_(size_t need)
       {
-         if (commit_region_(base_, nfd_, hdr_, committed_, ncap_, need) != 0) throw std::bad_alloc();
+         if (const int e = commit_region_(base_, nfd_, hdr_, committed_, ncap_, need)) commit_failed_(e, false);
       }
       void tcommit_(size_t need)
       {
-         if (commit_region_(tbase_, tfd_, hdr_, tcommitted_, tcap_, need) != 0) throw std::bad_alloc();
+         if (const int e = commit_region_(tbase_, tfd_, hdr_, tcommitted_, tcap_, need)) commit_failed_(e, true);
+      }
+      [[noreturn]] void commit_failed_(int e, bool terms) const
+      {
+         if (dead_) throw pool_exhausted("artpp::line_pool: the pool is closed");
+         if (e < 0)
+            throw pool_exhausted(terms ? "artpp::line_pool: the terminal region is full (its capacity, or the "
+                                         "4 GB a handle can address)"
+                                       : "artpp::line_pool: the node region is full (its capacity, or the "
+                                         "2^28 lines a handle can address)");
+         throw pool_commit_failed(e, file_backed() ? (terms ? "growing the 'terms' file" : "growing the 'nodes' file")
+                                                   : "committing memory (mprotect)");
+      }
+      // The bump path found the committed range too small for n more units: commit more, or
+      // throw. Out of line; the capacity test is made in units so that it cannot overflow.
+#if defined(__GNUC__)
+      __attribute__((noinline))
+#endif
+      void grow_lines_(size_t n)
+      {
+         if (n > ncap_ / line_bytes - frontier_) commit_failed_(-1, false);
+         commit_((frontier_ + n) * line_bytes);
+      }
+#if defined(__GNUC__)
+      __attribute__((noinline))
+#endif
+      void grow_terms_(size_t n)
+      {
+         if (n > tcap_ / term_unit - tfrontier_) commit_failed_(-1, true);
+         tcommit_((tfrontier_ + n) * term_unit);
       }
 
       // ── the dirty mark, at no cost to the allocation path ─────────────────────────────
@@ -909,7 +1010,7 @@ namespace artpp
       // dirty, restores the two limits and retries. After that, and always for an anonymous
       // pool, the paths are exactly what they were — the limit is a member instead of a
       // constant, and there is no added branch or store.
-      bool clean_() const noexcept { return free_max_ == 0; }
+      bool clean_() const noexcept { return free_max_ == 0 && !dead_; }
       void mark_clean_() noexcept
       {
          if (file_backed()) free_max_ = tfree_max_ = 0;
@@ -1023,6 +1124,7 @@ namespace artpp
       image_stamp stamp_{};              // of the container that wrote / is bound to the image
       bool        has_stamp_ = false;    // stamp_ is one (an image written by hand has none)
       bool        bound_     = false;    // a container bound itself in this session
+      bool        dead_      = false;    // closed (or never constructed): nothing may be used
       uint64_t   uroot_      = null_root;  // root handle of the last checkpoint (null: none yet)
       uint64_t   ucount_     = 0;        // element count of the last checkpoint
       uint64_t   checkpoints_ = 0;       // user checkpoint() calls over the store's life
@@ -1071,14 +1173,13 @@ namespace artpp
       // Terminal-region hooks: leaves (tag K::value_ptr) are 16-byte-granular payloads
       // in their own region — see line_pool. Detected by the tree; allocators without
       // them store terminals through the normal (line/block) path.
-      void* artpp_alloc_term(size_t bytes)
+      // (Rounded up without `bytes + 15`, which wraps for a size near SIZE_MAX.)
+      static constexpr size_t units_(size_t bytes) noexcept
       {
-         return pool->alloc_term((bytes + line_pool::term_unit - 1) / line_pool::term_unit);
+         return bytes / line_pool::term_unit + (bytes % line_pool::term_unit != 0);
       }
-      void artpp_free_term(void* p, size_t bytes) noexcept
-      {
-         pool->free_term(p, (bytes + line_pool::term_unit - 1) / line_pool::term_unit);
-      }
+      void* artpp_alloc_term(size_t bytes) { return pool->alloc_term(units_(bytes)); }
+      void  artpp_free_term(void* p, size_t bytes) noexcept { pool->free_term(p, units_(bytes)); }
 
       // Persistent-image hooks (see has_artpp_image_ in map.hpp). A file-backed pool's content
       // outlives every container: a map on it never tears its tree down when destroyed, and
@@ -1101,16 +1202,27 @@ namespace artpp
       // author asserts the destination pool is exclusive to the destination tree.
       void artpp_adopt(const pool_alloc& o) { pool->adopt(*o.pool); }
 
-      static constexpr size_t lines_(size_t bytes) noexcept
+      // Lines for n objects of T. For a T that is a whole number of lines (the tree's node
+      // block) this is one multiplication by a constant and cannot round wrongly; a count
+      // too large to express saturates, and the pool then refuses it as beyond its capacity.
+      static constexpr size_t lines_for_(size_t n) noexcept
       {
-         return (bytes + line_pool::line_bytes - 1) / line_pool::line_bytes;
+         constexpr size_t L = line_pool::line_bytes;
+         if (sizeof(T) % L == 0)
+         {
+            constexpr size_t k = sizeof(T) / L;
+            return k == 1 ? n : (n > ~size_t(0) / k ? ~size_t(0) : n * k);
+         }
+         if (n > ~size_t(0) / sizeof(T)) return ~size_t(0);
+         const size_t bytes = n * sizeof(T);
+         return bytes / L + (bytes % L != 0);
       }
       T* allocate(size_t n)
       {
          static_assert(alignof(T) <= line_pool::line_bytes, "pool lines are 128-byte aligned");
-         return static_cast<T*>(pool->alloc_lines(lines_(n * sizeof(T))));
+         return static_cast<T*>(pool->alloc_lines(lines_for_(n)));
       }
-      void deallocate(T* p, size_t n) noexcept { pool->free_lines(p, lines_(n * sizeof(T))); }
+      void deallocate(T* p, size_t n) noexcept { pool->free_lines(p, lines_for_(n)); }
 
       template <class U>
       bool operator==(const pool_alloc<U>& o) const noexcept

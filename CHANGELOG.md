@@ -15,6 +15,9 @@ before 1.0 a minor version may change the API.
 - `map::checkpoint()` / `set::checkpoint()` and the two-argument attach
   constructor `map{alloc, artpp::attach}`: the lifecycle of a tree in a
   file-backed `line_pool` without passing root handles and counts by hand.
+- `line_pool::close()`: releases the mappings, files and lock and reports a
+  failure to do so, which the destructor cannot.
+- `artpp_pool_safety`, the test of the file-backed `line_pool` contract.
 - `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
   an allocator returns a block the tree's handles cannot address.
 
@@ -146,6 +149,19 @@ before 1.0 a minor version may change the API.
   codec's `image_id`), and attaching a different instantiation throws
   `artpp::store_incompatible`. The built-in key codecs name their encoding;
   a user codec can, with a `static constexpr std::uint64_t image_id` (#10).
+- `line_pool`: a request whose size in bytes overflowed (`alloc_lines`,
+  `alloc_term`, `pool_alloc::allocate` and `artpp_alloc_term` with an absurd
+  count) wrapped around, was taken to fit, and moved the frontier past the
+  mapping instead of failing. The limits are now compared in units, without
+  the multiplication (#1).
+- `line_pool`: running out of space throws `artpp::pool_exhausted` and a
+  failure of the operating system to commit memory or grow a file throws
+  `artpp::pool_commit_failed` with the `errno`; both derive from
+  `std::bad_alloc`, which is what was thrown before, without a reason (#1).
+- `line_pool::checkpoint` flushes the data of both regions before the headers
+  and checks every `msync`, so a write error surfaces from `checkpoint()`
+  rather than being lost after a close that looked clean; it flushed only the
+  superblock and ignored the result (#1).
 - File-backed `line_pool` could not be opened on a kernel with 64 KB pages
   (ppc64le, some arm64): the superblock reservation, which is the file offset
   of the mapped data, was a constant 32 KB. It is now computed from the page
