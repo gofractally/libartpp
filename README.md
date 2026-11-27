@@ -413,15 +413,13 @@ artpp::map<std::string_view, uint64_t, artpp::mode::none, A> t{A{&pool}};
 ```
 
 File backing is **two things at once**: out-of-core storage (page eviction,
-larger-than-RAM data sets) and a **durable store across a clean close/reopen**.
-A file-backed pool is a **directory with one dense file per address region** —
-`nodes` (128-byte lines; its first page(s) hold a self-describing superblock:
-geometry + carving state + the tree's root handle and count) and `terms`
-(16-byte terminal units). One file per region means each grows densely from
-offset 0 — **no sparse files, no 32 GB logical size, no dependency on sparse-file
-support** (so it's safe to `cp`/`tar`/`rsync`/back up). Reopening restores the
-prior image with **no relocation**: handles are byte offsets, so the bytes
-already *are* the tree.
+larger-than-RAM data sets) and a **store that survives a clean close and
+reopen**. A file-backed pool is a **directory with one dense file per address
+region** — `nodes` (128-byte lines) and `terms` (16-byte terminal units), each
+behind a 64 KB header. One file per region means each grows densely from
+offset 0 — **no sparse files, no 32 GB logical size, no dependency on
+sparse-file support**. Reopening restores the image with **no relocation**:
+handles are offsets, so the bytes already *are* the tree.
 
 ```c++
 using Map = artpp::map<std::string_view, uint64_t, artpp::mode::none, A>;
@@ -439,32 +437,99 @@ using Map = artpp::map<std::string_view, uint64_t, artpp::mode::none, A>;
 }
 ```
 
-The lifecycle is **attach → use → `checkpoint()` → close**:
+#### Lifecycle
 
-- `Map{alloc, artpp::attach}` binds a map to the tree of the last checkpoint in
-  O(1), or to an empty tree when the store is new (`pool.restored()` tells the
-  two apart).
-- `checkpoint()` records the tree as the store's content. What a later open
-  sees is what the last `checkpoint()` recorded.
-- **Destroying a map never tears down a tree in a file-backed pool.** The tree
-  belongs to the store, so the destructor leaves it in place (and close is
-  O(1)); it does not matter whether the map is destroyed before or after the
-  checkpoint, or the pool's root and count are read first. `clear()` is how to
-  give the space of a tree back to the pool. (The exception is a mapped type
-  with a destructor: those values are destroyed and their nodes freed, and such
-  a tree cannot be attached again in any case. `attach` and `checkpoint()`
-  require a trivially copyable mapped type.)
-- A store holds **one** tree. Other maps may use the same pool as scratch space,
-  but only the checkpointed one is found again.
+**open → attach → use → `checkpoint()` → close.**
+
+1. `line_pool pool(dir)` opens the store in `dir`, or creates one if there is
+   none (no files, or two empty ones). It takes an exclusive lock for as long
+   as the pool lives. `pool.restored()` says whether a checkpointed tree was
+   found.
+2. `Map t{alloc, artpp::attach}` binds a map to that tree in O(1) — or to an
+   empty tree, on a store that was never checkpointed.
+3. `t.checkpoint()` records the tree as the store's content and flushes it.
+   **What a later open sees is what the last `checkpoint()` recorded.**
+4. Close by destroying the map and the pool, in that order. **Destroying a map
+   never tears down a tree in a file-backed pool**: the tree belongs to the
+   store, so the destructor leaves it in place (and is O(1)). It does not
+   matter whether the map is destroyed before or after the checkpoint.
+   `clear()` is how to give a tree's space back to the pool.
+
+Rules that follow from this:
+
+- **Checkpoint last.** If the tree is changed after the last `checkpoint()` and
+  the store is closed — or the process dies — the image is neither the old tree
+  nor the new one, and the next open **refuses it** (`artpp::store_dirty`).
+  There is no way to open such a store; `pool.dirty()` tells you beforehand
+  whether you are in that state. A store that was *never* checkpointed is the
+  exception: it has nothing to lose and reopens empty.
+- **One store, one tree, one map type.** The store remembers which
+  instantiation wrote it, and attaching another is refused. Other maps may use
+  the same pool as scratch space; `clear()` them before the last checkpoint (a
+  scratch map that is destroyed with content leaves its nodes allocated in the
+  store, and one destroyed after the checkpoint marks the store as modified).
+- `attach` and `checkpoint()` need a trivially copyable mapped type: the image
+  stores its bytes. (A map of any other type can still *use* a file-backed pool
+  as out-of-core memory; its destructor destroys the values and frees the
+  nodes, as with any allocator.)
+- `line_pool` is neither copyable nor movable; a map on it moves as usual and
+  takes the tree, and the right to checkpoint it, along.
+- `pool.close()` does what the pool's destructor does and reports a failure,
+  which a destructor cannot. It does not checkpoint.
 
 `pool.checkpoint(root, count)` with `map::root_handle()` / `size()`, the
 four-argument `attach` constructor and `detach()` are the low-level calls
-underneath; `detach()` is only needed to hand a tree over within an anonymous
-pool.
+underneath. Prefer the calls above: `checkpoint(root, count)` records which map
+type the tree belongs to only if a map attached in the same session.
+`detach()` is needed only to hand a tree over within an anonymous pool.
 
-This is **clean-close** durability — crash/reboot durability (a full data
-sync + write-ahead log) is the next layer: `checkpoint` flushes the header, and
-data pages ride the page cache across a clean reopen.
+#### What is checked on open
+
+An existing store is validated before anything is mapped or written; a store
+that fails is left byte for byte as it was, and nothing is created beside it.
+
+| Refused with | When |
+|---|---|
+| `artpp::store_corrupt` | Not a store, or not a whole one: a foreign file, a missing, empty or truncated file (sizes are checked against what the checkpoint committed), a superblock field outside the range the others allow (capacities, committed sizes, frontiers, free-list heads, the root handle), or `nodes` and `terms` that are not from the same store and the same checkpoint. |
+| `artpp::store_incompatible` | A store this program cannot use: another format version, byte order, line size, handle layout or superblock layout; a header reservation the system's page size cannot map; or — thrown by `attach` — a different map instantiation: size or alignment of the mapped type, mode, handle width, map versus set, or key encoding. |
+| `artpp::store_dirty` | Modified after its last checkpoint (see above). |
+| `artpp::store_locked` | Open in another `line_pool`, in this process or another (`flock`). |
+| `std::system_error` | A system call failed (`open`, `mmap`, `ftruncate`, `flock`, `msync`, …); it carries the `errno` and names the file. |
+
+The first four derive from `artpp::store_error`, a `std::runtime_error`, and
+name the store and the reason in `what()`. While a pool is in use, running out
+of space throws `artpp::pool_exhausted` and a failure of the system to grow it
+`artpp::pool_commit_failed` (with the `errno`); both are `std::bad_alloc`, so
+the tree's exception guarantees apply.
+
+#### What is not guaranteed
+
+- **No crash durability.** This is clean-close persistence: there is no
+  write-ahead log and the image is updated in place. A crash of the process
+  after a change leaves a store that is refused (`store_dirty`), not one that
+  is recovered; a crash of the machine, or power loss, can lose or damage
+  anything written since the last checkpoint, and — because `msync` does not
+  force a drive's write cache on every system — possibly that checkpoint as
+  well. Keep a copy if the data matters.
+- **The on-disk format is specific to the library version.** A store is only
+  guaranteed to open with the version of the library that wrote it. The format
+  version and the layout parameters are stamped and checked, so an incompatible
+  store is refused rather than misread, but there is no migration.
+- **Not everything can be checked.** Validation reads the two headers, not the
+  data: damage inside the node or terminal data, or inside a free list, is not
+  detected. The stamp cannot tell apart two mapped types of the same size and
+  alignment (`uint64_t` and `double`), nor two user key codecs that do not name
+  their encoding (give a codec a `static constexpr std::uint64_t image_id` and
+  it can; the built-in codecs have one). A value overwritten in place after the
+  last checkpoint (`insert_or_assign` on a present key, a write through a
+  reference) changes no structure and is not noticed: it is simply part of the
+  image.
+- **The lock is advisory.** It keeps a second `line_pool` out, not other
+  programs; copy a store only while no pool has it open.
+- A store can be moved between machines of the same byte order with 4, 16 or
+  64 KB pages. It has not been run on a 64 KB-page kernel.
+- `checkpoint()` flushes the data it records, so its cost grows with the amount
+  changed since the previous one.
 
 ## Limits and guarantees
 
@@ -635,6 +700,7 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
 | `artpp_psio_codec` | (with `ARTPP_WITH_PSIO`) double / reflected-struct / optional keys vs `std::map` ordering oracles |
 | `artpp_persistence` | file-backed `line_pool` survives close + reopen: 40k-key round-trip through a full teardown, then further insert/erase; restores carving state + root with no relocation |
+| `artpp_pool_safety` | the file-backed `line_pool` contract: never-checkpointed stores, map destruction after a checkpoint, repeated attach / mutate / checkpoint / reopen cycles; refusal of truncated, foreign, mismatched and field-corrupted stores without modifying them, of stores mutated after their last checkpoint (also by a writer that died), of a second opener, and of another map instantiation; page-size arithmetic and stores laid out for 64 KB and 1 MB pages; exhaustion at the capacity and at the 2^28-unit handle limits, size overflow, `errno` reporting, `close()` |
 | `artpp_fuzz_map` | differential fuzzer vs `std::map` — every op mirrored on both, full forward/reverse/bound/size agreement; standalone seeded RNG runner (also replays corpus files) |
 
 ### Fuzzing
@@ -660,9 +726,10 @@ bytes for replay.
 ## Status and versioning
 
 The current version is **0.1.0**. Before 1.0 the API may change between minor
-versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The layout of a
-file-backed `line_pool` image is not a stable format: an image is only
-guaranteed to reopen with the library version that wrote it.
+versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The on-disk
+format of a file-backed `line_pool` is **specific to the library version**: a
+store is only guaranteed to open with the version that wrote it (see
+[What is not guaranteed](#what-is-not-guaranteed)).
 
 ## Contributing
 

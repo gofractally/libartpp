@@ -17,7 +17,10 @@ before 1.0 a minor version may change the API.
   file-backed `line_pool` without passing root handles and counts by hand.
 - `line_pool::close()`: releases the mappings, files and lock and reports a
   failure to do so, which the destructor cannot.
-- `artpp_pool_safety`, the test of the file-backed `line_pool` contract.
+- `artpp_pool_safety`, the test of the file-backed `line_pool` contract. The
+  README section on `line_pool` states the lifecycle, what an open validates
+  and what is not guaranteed (crash durability; the on-disk format is specific
+  to the library version).
 - `artpp::bad_allocation_address` (derived from `std::bad_alloc`), thrown when
   an allocator returns a block the tree's handles cannot address.
 

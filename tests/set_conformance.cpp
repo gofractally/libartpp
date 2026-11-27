@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 #include <stdexcept>
@@ -219,8 +220,8 @@ static void wipe(const char* dir)
 }
 static void test_line_pool_attach()
 {
-   const char* path = "/tmp/artpp_set_persist_store";
-   wipe(path);
+   char path[] = "/tmp/artpp_set_persist_XXXXXX";  // unique to this run
+   CHECK(mkdtemp(path) != nullptr);
    const int               N = 20000;
    std::vector<std::string> keys;
    std::set<std::string>    ref;

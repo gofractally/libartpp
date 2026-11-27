@@ -250,6 +250,51 @@ static void set_lifecycle()
    for (auto it = t.begin(); it != t.end(); ++it, ++ri) CHECK(ri != ref.end() && std::string(*it) == *ri);
    CHECK(ri == ref.end());
 }
+// Every node kind goes through the image the same way: the modes that use buckets, the
+// density ladder and wide stems, with values in leaves and values in the handle.
+template <class M>
+static void round_trip_mode(const char* name)
+{
+   using MA = typename M::allocator_type;
+   temp_store                           s;
+   std::map<std::string, std::uint32_t> ref;
+   std::mt19937_64                      rng(7);
+   for (int cycle = 0; cycle < 3; ++cycle)
+   {
+      artpp::line_pool pool(s.c_str());
+      M                m{MA{&pool}, artpp::attach};
+      if (m.size() != ref.size()) { std::printf("FAIL %s: size after reopen %d\n", name, cycle); ++g_fail; }
+      for (int i = 0; i < 4000; ++i)
+      {
+         std::string k(1 + rng() % 12, 'a');
+         for (auto& c : k) c = char('a' + rng() % 4);
+         if (rng() % 4 == 0) { m.erase(k); ref.erase(k); }
+         else { const auto v = std::uint32_t(rng() & 0xFFFF); m.insert_or_assign(k, typename M::mapped_type(v)); ref[k] = v; }
+      }
+      m.checkpoint();
+   }
+   artpp::line_pool pool(s.c_str());
+   M                m{MA{&pool}, artpp::attach};
+   bool             same = m.size() == ref.size();
+   auto             ri   = ref.begin();
+   for (auto it = m.begin(); same && it != m.end(); ++it, ++ri)
+      same = ri != ref.end() && std::string(it.key()) == ri->first && std::uint32_t(it.value()) == ri->second;
+   if (!same) { std::printf("FAIL %s: content after the last reopen\n", name); ++g_fail; }
+}
+static void every_mode_round_trips()
+{
+   using namespace artpp;
+   using SV = std::string_view;
+   using A8 = pool_alloc<std::uint64_t>;
+   using A2 = pool_alloc<std::uint16_t>;
+   round_trip_mode<map<SV, std::uint64_t, mode::buckets, A8>>("buckets");
+   round_trip_mode<map<SV, std::uint64_t, mode::adaptive, A8>>("adaptive");
+   round_trip_mode<map<SV, std::uint64_t, mode::dense_tiers | mode::ladder_c8, A8>>("dense_tiers|ladder_c8");
+   round_trip_mode<map<SV, std::uint64_t, mode::wide_stems, A8>>("wide_stems");
+   round_trip_mode<map<SV, std::uint64_t, mode::adaptive | mode::dense_tiers, A8>>("adaptive|dense_tiers");
+   round_trip_mode<map<SV, std::uint16_t, mode::none, A2>>("inline values");
+   round_trip_mode<map<SV, std::uint16_t, mode::buckets, A2>>("inline values, buckets");
+}
 // What "the destructor does not free" must NOT change: an anonymous pool gets its lines back
 // when a map dies, clear() gives a file-backed pool its space back, and moving a map moves
 // the tree and the right to checkpoint it.
@@ -1350,6 +1395,7 @@ int main()
        {"checkpoint_after_the_map_is_destroyed", checkpoint_after_the_map_is_destroyed},
        {"lifecycle_over_many_reopen_cycles", lifecycle_over_many_reopen_cycles},
        {"set_lifecycle", set_lifecycle},
+       {"every_mode_round_trips", every_mode_round_trips},
        {"retention_is_only_for_the_destructor_of_a_file_backed_map",
         retention_is_only_for_the_destructor_of_a_file_backed_map},
        {"truncated_terms_file_is_refused", truncated_terms_file_is_refused},

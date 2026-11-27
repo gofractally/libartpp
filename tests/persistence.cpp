@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <random>
 #include <string>
@@ -34,8 +35,8 @@ static void wipe(const char* dir)
 
 int main()
 {
-   const char* path = "/tmp/artpp_persist_test_store";  // a STORE DIRECTORY
-   wipe(path);
+   char path[] = "/tmp/artpp_persist_test_XXXXXX";  // a STORE DIRECTORY, unique to this run
+   if (!mkdtemp(path)) { std::perror("mkdtemp"); return 2; }
 
    const int                       N = 40000;
    std::mt19937_64                 rng(123);

@@ -6,18 +6,26 @@
 // (base never moves); memory is committed in 4 MB steps as the frontier grows; freed nodes
 // recycle through exact-size free lists (sizes are line counts).
 //
-// Backing is BOTH out-of-core storage (page eviction, >RAM data sets) AND a durable store
-// across a clean close/reopen. A file-backed pool is a DIRECTORY with one dense file per address
-// region — `nodes` (128-byte lines; its first page(s) hold a self-describing superblock: geometry
-// + carving state + the tree's root/count) and `terms` (16-byte terminal units). One file per
-// region means each grows densely from offset 0, so there are NO sparse holes and NO dependency on
-// sparse-file support (the earlier single-file layout put the terminal region at a fixed 32 GB
-// offset, forcing a sparse hole — hostile to FAT/exFAT and to copy/backup tools). Call
-// map::checkpoint() (or checkpoint(root, count)) before close to persist; a later line_pool(dir)
-// restores it with no relocation (offset handles need none) and map{alloc, artpp::attach} binds
-// to it. A map never tears its tree down when it is destroyed on a file-backed pool: the tree
-// belongs to the store. Crash/reboot durability (full data sync / WAL) is the next stage —
-// checkpoint flushes the header, and data pages ride the page cache across a reopen.
+// Backing is BOTH out-of-core storage (page eviction, >RAM data sets) AND a store that survives
+// a clean close/reopen. A file-backed pool is a DIRECTORY with one dense file per address region
+// — `nodes` (128-byte lines) and `terms` (16-byte terminal units), each behind a header whose
+// size is a whole number of pages (the `nodes` header is the superblock: identity, geometry,
+// carving state, the tree's root/count, the dirty mark, the stamp of the map that wrote it).
+// One file per region means each grows densely, so there are NO sparse holes and NO dependency
+// on sparse-file support (the earlier single-file layout put the terminal region at a fixed
+// 32 GB offset, forcing a sparse hole — hostile to FAT/exFAT and to copy/backup tools).
+//
+// The contract, in full in the README ("artpp::line_pool"):
+//   * open → map{alloc, artpp::attach} → use → map::checkpoint() → close. What a later open
+//     sees is what the last checkpoint recorded; no relocation (offset handles need none).
+//   * A map never tears its tree down when it is destroyed on a file-backed pool: the tree
+//     belongs to the store.
+//   * An existing store is validated before it is used and never modified when it is refused:
+//     store_corrupt, store_incompatible, store_dirty (changed after its last checkpoint),
+//     store_locked (open elsewhere), std::system_error (a system call failed).
+//   * CLEAN-CLOSE durability only. No write-ahead log, the image is updated in place: a crash
+//     is detected (store_dirty) where possible, never recovered from.
+//   * The format is specific to this version of the library.
 //
 // MEASURED vs std::allocator (M5, 5M keys, artpp_pool_ab INTERLEAVED per rep): inserts
 // recover the malloc cost and more (uniform u64 0.81x, clustered 0.94x), queries are
@@ -264,11 +272,10 @@ namespace artpp
       size_t file_extent() const noexcept { return 2 * hdr_ + committed_ + tcommitted_; }
 
       // ── persistence (file-backed, clean-close durability) ────────────────────────
-      // checkpoint() stamps the current carving state + the tree's root handle and count
-      // into the superblock and flushes it, so a later line_pool(path) over the same file
-      // restores them and the tree round-trips with no relocation (offset handles). The
-      // data pages ride the page cache across a clean reopen; crash/reboot durability (a
-      // full data sync / WAL) is a further stage — see the file header.
+      // checkpoint() flushes the data and then stamps the current carving state + the tree's
+      // root handle and count into the superblock, so a later line_pool(dir) over the same
+      // store restores them and the tree round-trips with no relocation (offset handles).
+      // Clean-close durability only — see the file header.
       //
       // restored() is true when this open found an image that a checkpoint() call had written;
       // root()/count() are then what that call recorded. A store that was created but never
