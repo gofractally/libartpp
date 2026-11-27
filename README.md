@@ -578,6 +578,24 @@ versions; changes are recorded in [CHANGELOG.md](CHANGELOG.md). The layout of a
 file-backed `line_pool` image is not a stable format: an image is only
 guaranteed to reopen with the library version that wrote it.
 
+### Known issues
+
+A pre-release audit found bugs that are open in the
+[issue tracker](https://github.com/gofractally/libartpp/issues). Until they are
+fixed:
+
+- **Deep single-child chains:** erasing a chain of more than 64 nested keys can
+  leave the map in a state where iteration crashes (#3).
+- **Exception safety:** the guarantees under [Limits and guarantees](#limits-and-guarantees)
+  do not hold in `mode::buckets` and `mode::adaptive`, nor for value types whose
+  constructors throw (#4 to #7, #12, #13).
+- **File-backed `line_pool`:** call `detach()` after `checkpoint()`; a damaged,
+  stale or never-checkpointed store is not detected (#8 to #10).
+- **Assigning to a present key** with `insert` or `insert_or_assign` can
+  invalidate iterators and references, contrary to [Iterators](#iterators) (#11).
+
+Reproducers are in [tests/known_bugs](tests/known_bugs).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests go to the

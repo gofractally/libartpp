@@ -25,8 +25,8 @@ jobs:
           - { name: linux-gcc-asan,    os: ubuntu-24.04, cxx: g++-14,     flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
           - { name: linux-clang-asan,  os: ubuntu-24.04, cxx: clang++-18, flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
           - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cxx: g++-14, flags: "" }
-          - { name: macos-clang,       os: macos-14,     cxx: clang++,    flags: "" }
-          - { name: macos-clang-asan,  os: macos-14,     cxx: clang++,    flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
+          - { name: macos-clang,       os: macos-15,     cxx: clang++,    flags: "" }
+          - { name: macos-clang-asan,  os: macos-15,     cxx: clang++,    flags: "-fsanitize=address,undefined -fno-sanitize-recover=undefined" }
     steps:
       - uses: actions/checkout@v4
       - name: configure

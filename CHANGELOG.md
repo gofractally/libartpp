@@ -15,6 +15,12 @@ before 1.0 a minor version may change the API.
 
 ### Fixed
 - GCC warnings (`-Wreturn-type`, `-Wmaybe-uninitialized`) in `map.hpp`.
+- Undefined behaviour: `memcpy` from a null pointer for an empty key suffix or
+  prefix (#2).
+
+### Known issues
+- Open bugs from the pre-release audit: #3 to #18. Reproducers are in
+  `tests/known_bugs`.
 
 ## 0.1.0
 
