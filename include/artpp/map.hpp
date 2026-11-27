@@ -469,8 +469,9 @@ namespace detail  // implementation types & node helpers — not part of the pub
    // Opt-in: the allocator's storage is a PERSISTENT IMAGE that outlives the container (a
    // file-backed line_pool). artpp_retains() says whether this allocator's storage is one
    // right now; the container then leaves its tree in place when it is destroyed instead of
-   // freeing it node by node. artpp_checkpoint(root, count) records the tree as the image's
-   // content and artpp_attach() returns the {root, count} last recorded.
+   // freeing it node by node, and reports the tree it leaves behind with
+   // artpp_released(root, count). artpp_checkpoint(root, count) records the tree as the
+   // image's content and artpp_attach() returns the {root, count} last recorded.
    template <class A, class = void>
    struct has_artpp_image_ : std::false_type
    {
@@ -817,6 +818,13 @@ namespace detail  // implementation types & node helpers — not part of the pub
          else
             return false;
       }
+      // Tell a persistent image which tree is being left in it (nothing, for an empty map: a
+      // tree that was emptied freed its nodes, which the pool saw).
+      void released_() noexcept
+      {
+         if constexpr (has_artpp_image_<Allocator>::value)
+            if (!root_.is_null()) alloc_.artpp_released(root_.raw(), count_);
+      }
       // Cache the allocator's mapping bases (indexed handles only; a no-op for direct).
       void rebase_() noexcept
       {
@@ -943,7 +951,10 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // tree of such values cannot be attached again anyway.)
       ~map()
       {
-         if (!retained_()) free_all_(root_);
+         if (!retained_())
+            free_all_(root_);
+         else
+            released_();
       }
 
       // The root as a raw handle, for persisting via line_pool::checkpoint (indexed pools).
@@ -954,6 +965,7 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // where the destructor never frees.
       void detach() noexcept
       {
+         released_();
          root_  = packed_ptr::null();
          count_ = 0;
       }

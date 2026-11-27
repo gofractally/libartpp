@@ -125,6 +125,15 @@ namespace artpp
       using store_error::store_error;
    };
 
+   // A store whose image was modified after its last checkpoint and not checkpointed again
+   // (the writer closed without one, or died). The superblock describes a tree that the pages
+   // no longer hold; there is nothing to repair it from.
+   class store_dirty : public store_error
+   {
+     public:
+      using store_error::store_error;
+   };
+
    // The line store. Single-threaded, like the tree. Not copyable/movable — every handle
    // in every tree on this pool encodes an offset from base_.
    class line_pool
@@ -180,6 +189,10 @@ namespace artpp
       static constexpr size_t max_term_bytes = size_t(1) << 32;  // 4 GB — u32 offsets
 
       bool       file_backed() const noexcept { return hdr_ != 0; }
+      // True when the image of a file-backed pool has been modified since it was last made
+      // consistent (by checkpoint(), or by the open): closing now leaves a store that the next
+      // open refuses with store_dirty. Always false for an anonymous pool, which has no image.
+      bool dirty() const noexcept { return file_backed() && free_max_ != 0; }
       std::byte* base() const noexcept { return base_; }
       std::byte* term_base() const noexcept { return tbase_; }
       size_t     committed() const noexcept { return committed_; }
@@ -221,6 +234,15 @@ namespace artpp
          uroot_  = root;
          ucount_ = count;
       }
+      // A container tells the pool which tree it is letting go of without freeing it (a map
+      // being destroyed or detached on a file-backed pool). If that is not the tree of the
+      // last checkpoint, the image is not what the superblock says, whether or not the pool
+      // saw an allocation in between: mark it. (Changes that allocate and free nothing — a
+      // key that fits a free slot of a node — reach the pool only this way.)
+      void released(uint64_t root, uint64_t count) noexcept
+      {
+         if (file_backed() && free_max_ == 0 && (root != uroot_ || count != ucount_)) mark_dirty_();
+      }
       // Wholesale image adoption: copy `s`'s used range AND its carving state (frontier,
       // free lists — the intrusive links live inside freed lines, so they ride the byte
       // copy) so that every line index minted by `s` resolves identically against THIS
@@ -233,6 +255,7 @@ namespace artpp
       {
          const size_t used  = s.frontier_ * line_bytes;
          const size_t tused = s.tfrontier_ * term_unit;
+         if (free_max_ == 0) mark_dirty_();        // the whole image is about to be replaced
          if (used > committed_) commit_(used);     // throws bad_alloc past our cap
          if (tused > tcommitted_) tcommit_(tused);
          std::memcpy(base_, s.base_, used);
@@ -250,7 +273,7 @@ namespace artpp
       // tree's strong-guarantee fault point, same as any allocator.
       void* alloc_lines(size_t n)
       {
-         if (n <= FREE_MAX)
+         if (n <= free_max_)
          {
             if (const uint32_t head = free_[n]; head != NIL)
             {
@@ -259,7 +282,7 @@ namespace artpp
                return p;
             }
          }
-         else if (void* p = pop_huge_(n))
+         else if (void* p = alloc_lines_rare_(n))
             return p;
          const size_t need = (frontier_ + n) * line_bytes;
          if (need > committed_) commit_(need);
@@ -270,23 +293,19 @@ namespace artpp
       void free_lines(void* p, size_t n) noexcept
       {
          const uint32_t idx = uint32_t((static_cast<std::byte*>(p) - base_) / line_bytes);
-         if (n <= FREE_MAX)
+         if (n <= free_max_)
          {
             std::memcpy(p, &free_[n], 4);
             free_[n] = idx;
          }
-         else  // rare giant node: one list, {next, nlines} kept in the block
-         {
-            const uint32_t hdr[2] = {huge_, uint32_t(n)};
-            std::memcpy(p, hdr, 8);
-            huge_ = idx;
-         }
+         else
+            free_lines_rare_(p, n, idx);
       }
 
       // Terminal-region twins of alloc_lines/free_lines, in 16-byte units.
       void* alloc_term(size_t n)
       {
-         if (n <= TFREE_MAX)
+         if (n <= tfree_max_)
          {
             if (const uint32_t head = tfree_[n]; head != NIL)
             {
@@ -295,7 +314,7 @@ namespace artpp
                return p;
             }
          }
-         else if (void* p = pop_thuge_(n))
+         else if (void* p = alloc_term_rare_(n))
             return p;
          const size_t need = (tfrontier_ + n) * term_unit;
          if (need > tcommitted_) tcommit_(need);
@@ -306,17 +325,13 @@ namespace artpp
       void free_term(void* p, size_t n) noexcept
       {
          const uint32_t idx = uint32_t((static_cast<std::byte*>(p) - tbase_) / term_unit);
-         if (n <= TFREE_MAX)
+         if (n <= tfree_max_)
          {
             std::memcpy(p, &tfree_[n], 4);
             tfree_[n] = idx;
          }
-         else  // giant terminal (very long key suffix): {next, nunits} in the block
-         {
-            const uint32_t hdr[2] = {thuge_, uint32_t(n)};
-            std::memcpy(p, hdr, 8);
-            thuge_ = idx;
-         }
+         else
+            free_term_rare_(p, n, idx);
       }
 
       static constexpr uint32_t INDEX_BITS = 28, TAG_BITS = 4;  // the handle: see detail::line_ptr
@@ -357,6 +372,7 @@ namespace artpp
          uint64_t store_id;                // drawn when the store is created
          uint64_t generation;              // +1 on every image write; `terms` carries the same
          uint64_t checkpoints;             // user checkpoint() calls so far; 0 = never
+         uint64_t dirty;                   // 1: modified since the last image write
          uint64_t ncap, tcap, frontier, tfrontier, committed, tcommitted;
          uint32_t huge, thuge;
          uint64_t uroot, ucount;             // user metadata: tree root handle + element count
@@ -488,6 +504,7 @@ namespace artpp
          if (const size_t n = bad_head_(sb.tfree_heads, TFREE_MAX, sb.tfrontier); n <= TFREE_MAX)
             corrupt_(dir, "superblock field tfree_heads[" + num_(n) + "] = " + num_(sb.tfree_heads[n]) +
                               " is out of range");
+         in_range(sb.dirty <= 1, "dirty", sb.dirty);
          if (sb.checkpoints == 0)  // never checkpointed: the empty image written at creation
             in_range(sb.uroot == null_root && sb.ucount == 0, "uroot", sb.uroot);
          else if (sb.ucount == 0)
@@ -609,6 +626,21 @@ namespace artpp
             corrupt_(dir_, "'terms' is not the terminal file of an artpp line_pool store (" + num_(tsz) +
                                " bytes: too short)");
          validate_(dir_, sb, th, nsz, tsz);
+         if (sb.dirty && sb.checkpoints != 0)
+            throw store_dirty("artpp::line_pool: " + dir_ +
+                              ": the store was modified after its last checkpoint and not checkpointed "
+                              "again (it was closed without one, or the process writing it died); the "
+                              "image is not the tree the checkpoint recorded and cannot be used");
+         if (sb.dirty)
+         {
+            // Our own store (it passed validation), never checkpointed: it holds nothing that
+            // a checkpoint promised, only the leftovers of a session that did not keep them.
+            // Start it over as the empty store it still is.
+            if (::ftruncate(nfd_, 0) != 0) os_error_(errno, "ftruncate", np);
+            if (::ftruncate(tfd_, 0) != 0) os_error_(errno, "ftruncate", tp);
+            create_(cap);
+            return;
+         }
          restore_(sb);
       }
       // A new store: both files are empty. Stamp the empty image so that a reopen is
@@ -650,6 +682,7 @@ namespace artpp
             ucount_   = sb.ucount;
             restored_ = true;
          }
+         mark_clean_();
       }
       // Identifies a store among others: `nodes` and `terms` must agree on it. Not a secret
       // and not a hash of the content — time, process and address mixed (splitmix64).
@@ -697,6 +730,7 @@ namespace artpp
          sb->store_id     = store_id_;
          sb->generation   = gen;
          sb->checkpoints  = checkpoints;
+         sb->dirty        = 0;
          sb->ncap         = ncap_;
          sb->tcap         = tcap_;
          sb->frontier     = frontier_;
@@ -711,6 +745,7 @@ namespace artpp
          std::memcpy(sb->tfree_heads, tfree_, sizeof(tfree_));
          if (::msync(nbase_, hdr_, MS_SYNC) != 0) os_error_(errno, "msync", dir_ + "/nodes");
          generation_ = gen;
+         mark_clean_();
       }
       // Grow a region's mapping to cover `need` bytes: extend its OWN file densely from `file_off`
       // and map the new chunks (MAP_FIXED over the PROT_NONE reservation), or mprotect for an
@@ -746,6 +781,73 @@ namespace artpp
       {
          if (commit_region_(tbase_, tfd_, hdr_, tcommitted_, tcap_, need) != 0) throw std::bad_alloc();
       }
+
+      // ── the dirty mark, at no cost to the allocation path ─────────────────────────────
+      // While the image of a file-backed pool is CLEAN (nothing changed since the open or the
+      // last checkpoint), free_max_ and tfree_max_ are 0 instead of FREE_MAX / TFREE_MAX. The
+      // size test that alloc/free make anyway (`n <= free_max_`: does this size have an exact
+      // list?) then sends every request down the branch of the rare giant block, and that
+      // branch, out of line, is where the first mutation is noticed: it marks the superblock
+      // dirty, restores the two limits and retries. After that, and always for an anonymous
+      // pool, the paths are exactly what they were — the limit is a member instead of a
+      // constant, and there is no added branch or store.
+      bool clean_() const noexcept { return free_max_ == 0; }
+      void mark_clean_() noexcept
+      {
+         if (file_backed()) free_max_ = tfree_max_ = 0;
+      }
+      void mark_dirty_() noexcept
+      {
+         free_max_  = FREE_MAX;
+         tfree_max_ = TFREE_MAX;
+         sb_()->dirty = 1;  // through the shared mapping: on disk even if this process dies
+      }
+#if defined(__GNUC__)
+#define ARTPP_POOL_RARE_ __attribute__((noinline, cold))
+#else
+#define ARTPP_POOL_RARE_
+#endif
+      ARTPP_POOL_RARE_ void* alloc_lines_rare_(size_t n)
+      {
+         if (clean_())
+         {
+            mark_dirty_();
+            return alloc_lines(n);
+         }
+         return pop_huge_(n);  // null: nothing of that size, bump the frontier
+      }
+      ARTPP_POOL_RARE_ void free_lines_rare_(void* p, size_t n, uint32_t idx) noexcept
+      {
+         if (clean_())
+         {
+            mark_dirty_();
+            return free_lines(p, n);
+         }
+         const uint32_t hdr[2] = {huge_, uint32_t(n)};  // giant node: one list, {next, nlines}
+         std::memcpy(p, hdr, 8);                        // kept in the block
+         huge_ = idx;
+      }
+      ARTPP_POOL_RARE_ void* alloc_term_rare_(size_t n)
+      {
+         if (clean_())
+         {
+            mark_dirty_();
+            return alloc_term(n);
+         }
+         return pop_thuge_(n);
+      }
+      ARTPP_POOL_RARE_ void free_term_rare_(void* p, size_t n, uint32_t idx) noexcept
+      {
+         if (clean_())
+         {
+            mark_dirty_();
+            return free_term(p, n);
+         }
+         const uint32_t hdr[2] = {thuge_, uint32_t(n)};  // giant terminal (very long key
+         std::memcpy(p, hdr, 8);                         // suffix): {next, nunits} in the block
+         thuge_ = idx;
+      }
+#undef ARTPP_POOL_RARE_
 
       void* pop_huge_(size_t n) noexcept  // exact-size scan of the rare >FREE_MAX list
       {
@@ -812,6 +914,9 @@ namespace artpp
       size_t     tfrontier_  = 0;  // terminal bump position, in 16 B units
       int        nfd_        = -1;  // nodes file (128 B lines; holds the superblock header)
       int        tfd_        = -1;  // terminals file (16 B units)
+      // FREE_MAX / TFREE_MAX — or 0 while a file-backed image is clean (see mark_dirty_).
+      size_t     free_max_   = FREE_MAX;
+      size_t     tfree_max_  = TFREE_MAX;
       uint32_t   huge_       = NIL;
       uint32_t   thuge_      = NIL;
       uint32_t   free_[FREE_MAX + 1];
@@ -855,8 +960,10 @@ namespace artpp
       }
 
       // Persistent-image hooks (see has_artpp_image_ in map.hpp). A file-backed pool's content
-      // outlives every container: a map on it never tears its tree down when destroyed.
+      // outlives every container: a map on it never tears its tree down when destroyed, and
+      // says which tree it leaves behind (artpp_released).
       bool artpp_retains() const noexcept { return pool && pool->file_backed(); }
+      void artpp_released(uint64_t root, uint64_t count) const noexcept { pool->released(root, count); }
       void artpp_checkpoint(uint64_t root, uint64_t count) { pool->checkpoint(root, count); }
       std::pair<uint64_t, uint64_t> artpp_attach() const { return {pool->root(), pool->count()}; }
 

@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int g_fail = 0;
@@ -520,6 +521,7 @@ static void corrupted_superblock_fields_are_refused()
        POKE(tfrontier, ~std::uint64_t(0) / 16),
        POKE(huge, sb.frontier),                                // a free block at or past the frontier
        POKE(thuge, sb.tfrontier + 5),
+       POKE(dirty, 2),                                         // a flag, not a counter
        POKE(uroot, artpp::line_pool::null_root),               // count != 0 needs a root
        POKE(uroot, (sb.frontier << 4) | 4),                    // a node_full at the frontier
        POKE(uroot, (sb.tfrontier << 4) | 0),                   // a leaf at the terminal frontier
@@ -593,6 +595,206 @@ static void refused_opens_release_their_descriptors()
    CHECK(open_descriptors() == before);
 }
 
+// ── #10: the image was modified after its last checkpoint ───────────────────────────────
+template <class F>
+static bool opens(const temp_store& s, F&& then)
+{
+   artpp::line_pool pool(s.c_str());
+   then(pool);
+   return true;
+}
+template <class E>
+static bool open_throws(const temp_store& s)
+{
+   try
+   {
+      artpp::line_pool pool(s.c_str());
+   }
+   catch (const E& e)
+   {
+      CHECK(std::string(e.what()).find(s.dir) != std::string::npos);
+      return true;
+   }
+   catch (const std::exception& e)
+   {
+      std::printf("     wrong exception: %s\n", e.what());
+   }
+   return false;
+}
+// Scenario 6: checkpoint, erase and insert, close. The superblock described the tree of the
+// checkpoint, the pages held a different one: half the keys were missing, no error.
+static void mutation_after_the_last_checkpoint_is_detected()
+{
+   temp_store s;
+   {
+      artpp::line_pool pool(s.c_str());
+      Map              m{A{&pool}};
+      for (int i = 0; i < 2000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      pool.checkpoint(m.root_handle(), m.size());
+      CHECK(!pool.dirty());
+      for (int i = 0; i < 2000; i += 2) m.erase(key(i));
+      for (int i = 5000; i < 9000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      CHECK(pool.dirty());
+      m.detach();
+   }
+   CHECK(open_throws<artpp::store_dirty>(s));
+   CHECK(open_throws<artpp::store_dirty>(s));  // and it stays refused: nothing repairs it
+}
+// Every way of changing the tree counts, one at a time; reading does not.
+static void each_kind_of_mutation_marks_the_image()
+{
+   enum what { read_only, insert_one, erase_one, erase_then_insert, assign_only, clear_all, move_in, checkpointed_again };
+   for (int w = read_only; w <= checkpointed_again; ++w)
+   {
+      temp_store s;
+      build_store(s, 300);
+      {
+         artpp::line_pool pool(s.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         CHECK(!pool.dirty());
+         CHECK(missing(m, 0, 300) == 0);  // lookups and a full iteration leave it clean
+         size_t n = 0;
+         for (auto it = m.begin(); it != m.end(); ++it) ++n;
+         CHECK(n == 300 && !pool.dirty());
+         switch (w)
+         {
+            case read_only: break;
+            case insert_one: m.insert(key(1000), 1); break;
+            case erase_one: m.erase(key(7)); break;
+            case erase_then_insert:  // the freed leaf is reused: the carving state is as before
+               m.erase(key(7));
+               m.insert(key(8000), 1);
+               break;
+            case assign_only: m.insert_or_assign(key(7), 12345); break;  // in place: see below
+            case clear_all: m.clear(); break;
+            case move_in:
+            {
+               artpp::line_pool other;
+               Map              o{A{&other}};
+               o.insert("from another pool", 1);
+               m = std::move(o);  // adopts the other pool's image wholesale
+               break;
+            }
+            case checkpointed_again:
+               m.insert(key(1000), 1);
+               CHECK(pool.dirty());
+               m.checkpoint();
+               break;
+         }
+         const bool expect_dirty = !(w == read_only || w == assign_only || w == checkpointed_again);
+         CHECK(pool.dirty() == expect_dirty);
+      }
+      if (w == read_only)
+         CHECK(store_is_intact(s, 300));
+      else if (w == assign_only)
+      {
+         // Overwriting a value in place changes no structure: the image is still the tree of
+         // the checkpoint, with the new value (documented: such a write is not undone).
+         artpp::line_pool pool(s.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         std::uint64_t    v = 0;
+         CHECK(m.size() == 300 && m.find(key(7), v) && v == 12345);
+      }
+      else if (w == checkpointed_again)
+      {
+         artpp::line_pool pool(s.c_str());
+         Map              m{A{&pool}, artpp::attach};
+         CHECK(m.size() == 301 && m.contains(key(1000)) && missing(m, 0, 300) == 0);
+      }
+      else
+      {
+         if (!open_throws<artpp::store_dirty>(s)) { std::printf("FAIL mutation kind %d was not detected\n", w); ++g_fail; }
+      }
+   }
+}
+// The flag is on disk from the first mutation on, not written at close: a process that dies
+// after mutating (no destructor runs) leaves a store that is refused, not one that is read.
+static void a_writer_that_dies_leaves_the_store_marked()
+{
+   temp_store s;
+   build_store(s, 300);
+   std::fflush(nullptr);
+   const pid_t pid = ::fork();
+   CHECK(pid >= 0);
+   if (pid == 0)
+   {
+      {
+         auto* pool = new artpp::line_pool(s.c_str());
+         auto* m    = new Map{A{pool}, artpp::attach};
+         m->erase(key(3));
+      }
+      ::_exit(0);  // no destructors, no checkpoint
+   }
+   int status = -1;
+   CHECK(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+   CHECK(open_throws<artpp::store_dirty>(s));
+}
+// A store that was never checkpointed holds nothing that could be lost, so a mutated one is
+// not refused: it reopens as the empty store it still is (#9), and gives its space back.
+static void a_never_checkpointed_store_is_reset_not_refused()
+{
+   temp_store s;
+   off_t      fresh_nodes = 0, fresh_terms = 0;
+   {
+      artpp::line_pool pool(s.c_str());
+      fresh_nodes = s.size("nodes");
+      fresh_terms = s.size("terms");
+      Map m{A{&pool}};
+      for (int i = 0; i < 2000; ++i) m.insert(key(i), std::uint64_t(i) + 1);
+      CHECK(pool.dirty());
+      CHECK(s.size("nodes") > fresh_nodes && s.size("terms") > fresh_terms);
+   }  // closed without a checkpoint
+   for (int again = 0; again < 2; ++again)
+   {
+      artpp::line_pool pool(s.c_str());
+      CHECK(!pool.restored() && pool.count() == 0 && !pool.dirty());
+      CHECK(pool.used_lines() == 0 && pool.used_term_units() == 0);
+      CHECK(s.size("nodes") == fresh_nodes && s.size("terms") == fresh_terms);
+      Map m{A{&pool}, artpp::attach};
+      CHECK(m.empty() && !m.contains(key(1)));
+      for (int i = 0; i < 50; ++i) m.insert(key(i), std::uint64_t(i) + 1);  // dirty again, no checkpoint
+   }
+   build_store(s, 100);  // and now it is checkpointed like any other
+   CHECK(store_is_intact(s, 100));
+}
+// A change that allocates and frees nothing (a set's short key goes into a slot of an
+// existing node) is invisible to the pool, but it changes the count: the map reports the
+// tree it is letting go of, and a tree that is not the checkpointed one marks the image.
+static void a_change_that_allocates_nothing_is_detected_on_release()
+{
+   using SA  = artpp::pool_alloc<std::string_view>;
+   using Set = artpp::set<std::string_view, artpp::mode::none, SA>;
+   for (int how = 0; how < 3; ++how)  // 0: destructor, 1: detach(), 2: moved first
+   {
+      temp_store s;
+      {
+         artpp::line_pool pool(s.c_str());
+         Set              t{SA{&pool}, artpp::attach};
+         t.insert("a");
+         t.insert("b");
+         t.checkpoint();
+      }
+      {
+         artpp::line_pool pool(s.c_str());
+         Set              t{SA{&pool}, artpp::attach};
+         CHECK(t.size() == 2 && !pool.dirty());
+         const size_t lines = pool.used_lines(), terms = pool.used_term_units();
+         t.insert("c");
+         CHECK(t.size() == 3);
+         // the premise of this case: the pool saw nothing
+         CHECK(pool.used_lines() == lines && pool.used_term_units() == terms && !pool.dirty());
+         if (how == 1) t.detach();
+         if (how == 2)
+         {
+            Set u{std::move(t)};
+            CHECK(u.size() == 3 && !pool.dirty());
+         }
+         if (how != 0) CHECK(pool.dirty());
+      }
+      CHECK(open_throws<artpp::store_dirty>(s));
+   }
+}
+
 int main()
 {
    struct test_case
@@ -615,6 +817,12 @@ int main()
        {"files_of_different_checkpoints_are_refused", files_of_different_checkpoints_are_refused},
        {"corrupted_superblock_fields_are_refused", corrupted_superblock_fields_are_refused},
        {"refused_opens_release_their_descriptors", refused_opens_release_their_descriptors},
+       {"mutation_after_the_last_checkpoint_is_detected", mutation_after_the_last_checkpoint_is_detected},
+       {"each_kind_of_mutation_marks_the_image", each_kind_of_mutation_marks_the_image},
+       {"a_writer_that_dies_leaves_the_store_marked", a_writer_that_dies_leaves_the_store_marked},
+       {"a_never_checkpointed_store_is_reset_not_refused", a_never_checkpointed_store_is_reset_not_refused},
+       {"a_change_that_allocates_nothing_is_detected_on_release",
+        a_change_that_allocates_nothing_is_detected_on_release},
    };
    for (const test_case& c : cases)
    {

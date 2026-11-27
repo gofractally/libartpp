@@ -124,6 +124,17 @@ before 1.0 a minor version may change the API.
   system call, instead of `std::bad_alloc`; it modifies and creates nothing.
   `line_pool::checkpoint` throws on a root handle that cannot belong to the
   pool and on a failed write (it was `noexcept` and ignored `msync`) (#10).
+- File-backed `line_pool`: a store that was modified after its last
+  checkpoint and then closed reopened with the superblock of the checkpoint
+  over the pages of a different tree (half the keys missing, no error). The
+  superblock now carries a dirty flag, set through the mapping by the first
+  allocation or free after an open or a checkpoint and cleared by
+  `checkpoint()`; a map that is destroyed or detached holding a tree other
+  than the checkpointed one sets it as well. Reopening such a store throws
+  `artpp::store_dirty`, also when the writing process died without closing.
+  A store that was never checkpointed is reset to empty instead.
+  `line_pool::dirty()` reports the state. The flag costs the allocation path
+  no branch and no store (#10).
 
 ### Known issues
 - Open bugs from the pre-release audit: #10 and #17 (file-backed
