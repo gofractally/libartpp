@@ -163,6 +163,141 @@ static void eh_bulk(const char* cont, const char* scen, const std::vector<std::s
                ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
 }
 
+// ── throwing VALUE constructors (audit #12) ──────────────────────────────────────
+// The allocator sweep above never throws from a value. `tvalue` throws from whichever of
+// its constructors is the n-th to run; sweeping n over an operation arms every value
+// construction it performs: emplace's in-place construction from arguments, the copy
+// insert(k, const T&) makes, the move into the leaf, and the move of an OLD value when a
+// leaf splits. A leaf allocated for a value whose constructor then throws must be freed.
+static long g_vcountdown = -1;  // -1 = never; else the constructor that finds 0 throws
+struct value_error {};
+struct tvalue
+{
+   std::string s;
+   static void tick() { if (g_vcountdown >= 0 && g_vcountdown-- == 0) throw value_error{}; }
+   tvalue() { tick(); ++g_live; }
+   tvalue(std::string v) : s(std::move(v)) { tick(); ++g_live; }
+   tvalue(const char* a, int n) : s(std::string(a) + std::to_string(n)) { tick(); ++g_live; }  // emplace args
+   tvalue(const tvalue& o) : s(o.s) { tick(); ++g_live; }
+   tvalue(tvalue&& o)  // throws BEFORE touching the source, so a failed move leaves o intact
+   {
+      tick();
+      s = std::move(o.s);
+      ++g_live;
+   }
+   tvalue& operator=(const tvalue&) = default;
+   tvalue& operator=(tvalue&&)      = default;
+   ~tvalue() { --g_live; }
+   operator std::string() const { return s; }
+};
+
+// op 0: emplace(nk, "E", 7)   op 1: insert_or_assign(nk, const tvalue&)   op 2: insert(nk, tvalue&&)
+// On every induced throw: the contents are unchanged (strong), the map still iterates, and
+// after destruction every block and every value is accounted for.
+template <class Map>
+static void eh_value(const char* cont, const char* scen, const std::vector<std::string>& pre,
+                     const std::string& nk, int opk)
+{
+   int violations = 0, leaks = 0, vleaks = 0, swept = 0;
+   for (int n = 0;; ++n)
+   {
+      fail_counter fc;
+      bool         completed = false, threw = false;
+      const long   vbase     = g_live;
+      {
+         typename Map::allocator_type al(&fc);
+         Map                          m(al);
+         for (size_t i = 0; i < pre.size(); ++i) m.insert_or_assign(pre[i], std::string(8, char('a' + (i & 15))));
+         auto         before = dump(m);
+         const tvalue src(std::string("NEWVALUE"));
+         tvalue       mv(std::string("NEWVALUE"));
+         g_vcountdown = n;  // arm the (n+1)-th value construction to throw
+         try
+         {
+            if constexpr (requires { typename Map::key_compare; })  // the std::map oracle's spellings
+            {
+               if (opk == 0) m.try_emplace(nk, "E", 7);
+               else if (opk == 1) m.insert_or_assign(nk, src);
+               else m.insert_or_assign(nk, std::move(mv));
+            }
+            else
+            {
+               if (opk == 0) m.emplace(nk, "E", 7);
+               else if (opk == 1) m.insert_or_assign(nk, src);
+               else m.insert(nk, std::move(mv));
+            }
+            completed = true;
+         }
+         catch (const value_error&) { threw = true; }
+         g_vcountdown = -1;
+         auto after = dump(m);
+         if (threw && after != before) ++violations;
+         if (completed && !m.contains(nk)) ++violations;
+         if (m.size() != after.size()) ++violations;
+      }
+      if (fc.allocs != fc.frees) ++leaks;
+      if (g_live != vbase) ++vleaks;
+      ++swept;
+      if (completed) break;
+   }
+   const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
+   if (!ok) ++g_fail;
+   static const char* const opn[] = {"emplace", "insert copy", "insert move"};
+   std::printf("  %-10s %-14s %-11s  %s  (%d pts, %d strong-viol, %d mem-leak, %d dtor-leak)\n", cont,
+               scen, opn[opk], ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
+}
+template <class Map>
+static void run_value_scenarios(const char* cont)
+{
+   std::vector<std::string> fan;
+   for (int b = 0; b < 16; ++b) fan.push_back(std::string(1, char('a' + b)));
+   for (int opk = 0; opk < 3; ++opk)
+   {
+      eh_value<Map>(cont, "empty->x", {}, "x", opk);                                  // make_leaf_full
+      eh_value<Map>(cont, "long-key", {}, std::string(300, 'k'), opk);                // make_leaf
+      eh_value<Map>(cont, "leaf-split", {"apple"}, "apricot", opk);                   // + old value moves
+      eh_value<Map>(cont, "key-is-prefix", {"apple"}, "app", opk);                    // new key is the term
+      eh_value<Map>(cont, "extends-key", {"app"}, "apple", opk);                      // old key is the term
+      eh_value<Map>(cont, "prefix-split", {"abcdefgh1", "abcdefgh2"}, "abcZ", opk);
+      eh_value<Map>(cont, "new-branch", {"node_aa", "node_ab", "node_ba"}, "node_c", opk);
+      eh_value<Map>(cont, "setlist-widen", fan, "Z", opk);
+      eh_value<Map>(cont, "present-key", {"apple", "apricot"}, "apple", opk);
+   }
+}
+
+// Repeated throwing emplaces must not consume anything: 1,000 of them leak 0 blocks and —
+// in bucket mode — leave the page's free space intact, so a key that fits still goes in
+// without a single allocation (a constructor that threw after its entry bytes were claimed
+// used to eat the page until the next insert burst the bucket).
+template <class Map>
+static void eh_value_repeat(const char* cont, bool expect_no_alloc_after)
+{
+   fail_counter fc;
+   const long   vbase = g_live;
+   bool         ok    = true;
+   {
+      typename Map::allocator_type al(&fc);
+      Map                          m(al);
+      m.insert_or_assign("seed", std::string("s"));
+      for (int i = 0; i < 1000; ++i)
+      {
+         g_vcountdown = 0;
+         try { m.emplace("some-key", "E", i); ok = false; }
+         catch (const value_error&) {}
+         g_vcountdown = -1;
+      }
+      ok = ok && m.size() == 1 && !m.contains("some-key");
+      const long a0 = fc.allocs;
+      m.emplace("sx", "E", 1);  // shares the bucket page with "seed"
+      ok = ok && m.size() == 2 && m.contains("sx");
+      if (expect_no_alloc_after) ok = ok && fc.allocs == a0;
+   }
+   ok = ok && fc.allocs == fc.frees && g_live == vbase;
+   if (!ok) ++g_fail;
+   std::printf("  %-10s 1000 throwing emplaces  %s  (%ld allocs, %ld frees)\n", cont, ok ? "OK  " : "FAIL",
+               fc.allocs, fc.frees);
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -223,6 +358,33 @@ int main()
    eh_bulk<RefMap>("std::map", "fanout", wide);
    eh_bulk<HkvDense>("artpp-dense", "fanout", wide);
    eh_bulk<HkvWide>("artpp-wide", "fanout", wide);
+
+   // Throwing value constructors (audit #12). The radix modes are swept in full; the bucket
+   // and adaptive insert paths have open exception-safety issues of their own (#4 to #7,
+   // tests/known_bugs), so there only the paths #12 fixed are asserted.
+   using TRef   = std::map<std::string, tvalue, std::less<>, throwing_alloc<std::pair<const std::string, tvalue>>>;
+   using TRadix = map<std::string_view, tvalue, mode::none, throwing_alloc<tvalue>>;
+   using TDense = map<std::string_view, tvalue, mode::dense_tiers, throwing_alloc<tvalue>>;
+   using TWide  = map<std::string_view, tvalue, mode::wide_stems, throwing_alloc<tvalue>>;
+   using TBkt   = map<std::string_view, tvalue, mode::buckets, throwing_alloc<tvalue>>;
+   using TAdp   = map<std::string_view, tvalue, mode::adaptive, throwing_alloc<tvalue>>;
+   std::printf("\nthrowing value constructors (strong, no leak):\n");
+   run_value_scenarios<TRef>("std::map");
+   run_value_scenarios<TRadix>("artpp-radix");
+   run_value_scenarios<TDense>("artpp-dense");
+   run_value_scenarios<TWide>("artpp-wide");
+   for (int opk = 0; opk < 3; ++opk)
+   {
+      eh_value<TBkt>("artpp-bucket", "empty->x", {}, "x", opk);                    // make_bucket_branch
+      eh_value<TBkt>("artpp-bucket", "long-key", {}, std::string(700, 'k'), opk);  // over a page: a leaf
+      eh_value<TBkt>("artpp-bucket", "same-bucket", {"apple"}, "apricot", opk);    // bkt_insert_entry
+      eh_value<TAdp>("artpp-adapt", "empty->x", {}, "x", opk);
+      eh_value<TAdp>("artpp-adapt", "leaf-split", {"apple"}, "apricot", opk);
+   }
+   eh_value_repeat<TRadix>("artpp-radix", false);
+   eh_value_repeat<TDense>("artpp-dense", false);
+   eh_value_repeat<TBkt>("artpp-bucket", true);
+   eh_value_repeat<TAdp>("artpp-adapt", false);
 
    std::printf(g_fail ? "\nartpp_eh: %d containers/scenarios FAILED\n" : "\nartpp_eh: ALL OK\n", g_fail);
    return g_fail ? 1 : 0;

@@ -2842,9 +2842,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
       {
          if (!bkt_fits(key.size() - at))
             return make_value_at(key, at, std::forward<VF>(val));
-         bucket*                    b = new_bucket();
-         [[maybe_unused]] const int r = bkt_insert_entry(b, key.substr(at), std::forward<VF>(val));
-         assert(r == 1 && "artpp: a bkt_fits-checked entry cannot overflow a fresh page");
+         bucket* b = new_bucket();
+         try
+         {
+            [[maybe_unused]] const int r = bkt_insert_entry(b, key.substr(at), std::forward<VF>(val));
+            assert(r == 1 && "artpp: a bkt_fits-checked entry cannot overflow a fresh page");
+         }
+         catch (...)  // T's constructor threw: the page holds no entry and is not linked yet
+         {
+            node_free_(b, sizeof(bucket));
+            throw;
+         }
          return pack_(b, K::bucket);
       }
       // Adaptive collapse: turn the leaf at a deep-narrow split point into a bucket
@@ -2920,10 +2928,12 @@ namespace detail  // implementation types & node helpers — not part of the pub
          const size_t esz   = bkt_esize(suf.size());
          const size_t freeb = size_t(bucket::PAGE - 4) - 4u * b->nent - b->tail_used;
          if (freeb < 4 + esz) return -1;  // page full
-         b->tail_used += uint16_t(esz);
-         char* e = reinterpret_cast<char*>(b->data) + (bucket::PAGE - 4) - b->tail_used;  // aligned
+         // Construct BEFORE claiming the tail space: if T's constructor throws, the page is
+         // exactly as it was (claiming first would leak the entry's bytes inside the page).
+         char* e = reinterpret_cast<char*>(b->data) + (bucket::PAGE - 4) - b->tail_used - esz;  // aligned
          if constexpr (HasValue) vf_construct(std::forward<V>(val), bkt_val(e));  // construct at the entry (non-POD safe)
          else                    (void)val;  // set: entry is the key suffix only
+         b->tail_used += uint16_t(esz);
          const uint16_t sl = uint16_t(suf.size());
          std::memcpy(e + bkt_val_bytes, &sl, 2);
          copy_bytes(e + bkt_val_bytes + 2, suf.data(), suf.size());
@@ -4593,25 +4603,43 @@ namespace detail  // implementation types & node helpers — not part of the pub
          }
       }
 
+      // Construct the leaf's value in its freshly allocated storage. T's constructor (an
+      // emplace argument set, or a throwing copy/move) may throw: the block is not linked
+      // anywhere yet, so it must go back to the allocator here or it is lost. (try/catch,
+      // not a guard object: zero-cost on the non-throwing path, nothing for trivial T.)
+      template <class VF>
+      void leaf_construct_(char* p, size_t alloc_bytes, VF&& val)
+      {
+         if constexpr (HasValue)
+         {
+            try { vf_construct(std::forward<VF>(val), leaf_val(p)); }
+            catch (...)
+            {
+               term_free_(p, alloc_bytes);
+               throw;
+            }
+         }
+         else { (void)p; (void)alloc_bytes; (void)val; }  // set: a leaf is the key bytes only
+      }
       template <class VF>
       packed_ptr make_leaf(std::string_view suf, VF&& val)  // suffix-only (compressed) leaf
       {
-         char* p = static_cast<char*>(term_alloc_(leaf_size(suf.size())));
+         const size_t sz = leaf_size(suf.size());
+         char*        p  = static_cast<char*>(term_alloc_(sz));
          leaf_set_hdr(p, uint16_t(suf.size()), 0);
          copy_bytes(leaf_str(p), suf.data(), suf.size());
-         if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
-         else                    (void)val;  // set: a leaf is the key bytes only, no value
+         leaf_construct_(p, sz, std::forward<VF>(val));
          return pack_term_(p, K::value_ptr);
       }
       template <class VF>
       packed_ptr make_leaf_full(std::string_view pfx, std::string_view suf, VF&& val)  // whole key
       {
-         char* p = static_cast<char*>(term_alloc_(leaf_size(pfx.size() + suf.size())));
+         const size_t sz = leaf_size(pfx.size() + suf.size());
+         char*        p  = static_cast<char*>(term_alloc_(sz));
          leaf_set_hdr(p, uint16_t(suf.size()), uint16_t(LEAF_FULL | pfx.size()));
          copy_bytes(leaf_str(p), pfx.data(), pfx.size());
          copy_bytes(leaf_str(p) + pfx.size(), suf.data(), suf.size());
-         if constexpr (HasValue) vf_construct(std::forward<VF>(val), leaf_val(p));
-         else                    (void)val;  // set: a leaf is the key bytes only, no value
+         leaf_construct_(p, sz, std::forward<VF>(val));
          return pack_term_(p, K::value_ptr);
       }
       // A terminal value with key suffix `suf`: inline in the pointer when the suffix

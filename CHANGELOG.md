@@ -26,6 +26,10 @@ before 1.0 a minor version may change the API.
   valid as the README promises. Previously such a call could move the values
   of neighbouring keys, free the key's leaf (`mode::adaptive`) or free a prefix
   node that live iterators still pointed at (#11).
+- A value constructor that throws (from `emplace` arguments, or a throwing copy
+  or move in `insert`) no longer leaks the leaf allocated for it; in
+  `mode::buckets` it no longer leaks the new bucket page or consumes space in
+  an existing one (#12).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #18. Reproducers are in
