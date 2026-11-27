@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <new>
 #include <string>
@@ -56,6 +57,9 @@ struct throwing_alloc
    void deallocate(T* p, std::size_t n) noexcept
    {
       ++fc->frees;
+      // Scribble over the block before releasing it: a tree that still reads a node it has
+      // freed then sees garbage in a plain build too, not only under AddressSanitizer.
+      std::memset(static_cast<void*>(p), 0xDD, n * sizeof(T));
       ::operator delete(p, std::align_val_t(alignof(T)));
    }
    template <class U>
@@ -470,6 +474,163 @@ static void eh_erase(const char* cont, const char* scen, const std::vector<std::
                ok ? "OK  " : "FAIL", swept, violations, leaks, vleaks);
 }
 
+// ── bucket and adaptive modes: one faulted operation against a std::map oracle ────
+// (audit #4 to #7 and the sweep that followed.) `build` fills the map and the oracle; `op`
+// performs ONE mutating call on the map and, only once that has returned, the same change on
+// the oracle. The sweep fails the n-th allocation of `op` (or throws from the n-th value
+// construction) for every n until the fault no longer fires. After each run:
+//   * an operation that threw left the contents exactly as they were (keys AND values);
+//   * one that returned made its change, whatever best-effort allocation failed inside;
+//   * iteration, size(), contains() and find() agree with the oracle;
+//   * the map is then worked on some more (inserts, assignments, erases) and must still
+//     agree, and after destruction every block and every value is accounted for.
+template <class V>
+static V mkv(uint64_t x)
+{
+   if constexpr (std::is_arithmetic_v<V>) return V(x);
+   else return V(std::string("value-long-enough-to-own-heap-memory-") + std::to_string(x));
+}
+[[maybe_unused]] static std::string vstr(const std::string& s) { return s; }
+[[maybe_unused]] static std::string vstr(uint64_t v) { return std::to_string(v); }
+[[maybe_unused]] static std::string vstr(uint32_t v) { return std::to_string(v); }
+[[maybe_unused]] static std::string vstr(const tvalue& v) { return v.s; }
+template <class V>
+static std::string mks(uint64_t x) { return vstr(mkv<V>(x)); }
+
+using oracle_t = std::map<std::string, std::string>;
+// Does the map hold exactly `want`? Checked three ways: ordered iteration, size(), lookups.
+template <class Map>
+static bool same_as(const Map& m, const oracle_t& want)
+{
+   if (m.size() != want.size()) return false;
+   auto w = want.begin();
+   for (auto it = m.begin(); it != m.end(); ++it, ++w)
+      if (w == want.end() || it.key_bytes() != w->first || vstr(it.value()) != w->second) return false;
+   if (w != want.end()) return false;
+   for (auto& kv : want)
+   {
+      auto it = m.find(kv.first);
+      if (it == m.end() || vstr(it.value()) != kv.second || !m.contains(kv.first)) return false;
+   }
+   return true;
+}
+// Keep using a map that has been through a fault: it must behave like any other.
+template <class Map>
+static bool still_usable(Map& m, oracle_t& o)
+{
+   using V = typename Map::mapped_type;
+   std::vector<std::string> keys;
+   for (auto& kv : o) keys.push_back(kv.first);
+   uint64_t x = 5000;
+   for (size_t i = 0; i < keys.size(); ++i)
+   {
+      if (i % 3 == 0) { m.erase(keys[i]); o.erase(keys[i]); }
+      else if (i % 3 == 1) { m.insert_or_assign(keys[i], mkv<V>(++x)); o[keys[i]] = mks<V>(x); }
+      else { const std::string k = keys[i] + "+"; m.insert(k, mkv<V>(++x)); o[k] = mks<V>(x); }
+   }
+   for (int i = 0; i < 24; ++i)
+   {
+      const std::string k = std::string("~after/") + char('a' + i % 6) + std::string(size_t(i), 'q');
+      m.insert(k, mkv<V>(++x));
+      o[k] = mks<V>(x);
+   }
+   if (!same_as(m, o)) return false;
+   m.clear();
+   o.clear();
+   m.insert("again", mkv<V>(1));
+   o["again"] = mks<V>(1);
+   return same_as(m, o);
+}
+enum class fault { alloc, value };
+template <class Map, class Build, class Op>
+static void eh_point(const char* cont, const char* scen, fault f, Build build, Op op, bool may_throw = true)
+{
+   int violations = 0, leaks = 0, vleaks = 0, swept = 0, threw_n = 0;
+   for (int n = 0;; ++n)
+   {
+      fail_counter fc;
+      bool         fired = false;
+      const long   vbase = g_live;
+      {
+         typename Map::allocator_type al(&fc);
+         Map                          m(al);
+         oracle_t                     o;
+         build(m, o);
+         if (!same_as(m, o)) ++violations;
+         const oracle_t before = o;
+         bool           threw  = false;
+         (f == fault::alloc ? fc.countdown : g_vcountdown) = n;
+         try { op(m, o); }
+         catch (const std::bad_alloc&) { threw = true; }
+         catch (const value_error&) { threw = true; }
+         fired        = (f == fault::alloc ? fc.countdown : g_vcountdown) < 0;
+         fc.countdown = g_vcountdown = -1;
+         threw_n += threw;
+         if (threw && !may_throw) ++violations;
+         if (!same_as(m, threw ? before : o)) ++violations;
+         if (threw) o = before;
+         if (!still_usable(m, o)) ++violations;
+      }
+      if (fc.allocs != fc.frees) ++leaks;
+      if (g_live != vbase) ++vleaks;
+      ++swept;
+      if (!fired) break;
+   }
+   const bool ok = (violations == 0 && leaks == 0 && vleaks == 0);
+   if (!ok) ++g_fail;
+   std::printf("  %-14s %-22s %-5s  %s  (%d points, %d threw, %d violations, %d mem-leak, %d dtor-leak)\n", cont,
+               scen, f == fault::alloc ? "alloc" : "value", ok ? "OK  " : "FAIL", swept, threw_n, violations,
+               leaks, vleaks);
+}
+
+// How many keys `under + <letter> + tail` share one bucket page before the next one bursts it
+// (depends on sizeof(T)): the number that go in on a single allocation.
+template <class Map>
+static int page_fill(const std::string& tail)
+{
+   using V = typename Map::mapped_type;
+   fail_counter fc;
+   Map          m{typename Map::allocator_type(&fc)};
+   int          c = 0;
+   for (; c < 26; ++c)
+   {
+      m.insert(std::string(1, char('A' + c)) + tail, mkv<V>(0));
+      if (fc.allocs > 1) break;
+   }
+   return c;
+}
+template <class Map>
+static auto put_keys(std::vector<std::string> keys, uint64_t v0)
+{
+   using V = typename Map::mapped_type;
+   return [keys, v0](Map& m, oracle_t& o) {
+      uint64_t x = v0;
+      for (auto& k : keys)
+      {
+         m.insert(k, mkv<V>(x));  // throws before the oracle learns of the key
+         o[k] = mks<V>(x);
+         ++x;
+      }
+   };
+}
+
+// audit #5: the insert that overflows a bucket page bursts it into a router; the router then
+// existed only in a local while the new key's own bucket was allocated, so a failure there
+// left the parent slot (or the root) pointing at the freed page.
+template <class Map>
+static void eh_bucket_burst(const char* cont)
+{
+   const std::string        tail(40, 't');
+   const int                fill = page_fill<Map>(tail);
+   std::vector<std::string> root, child;
+   for (int c = 0; c < fill; ++c) root.push_back(std::string(1, char('A' + c)) + tail);
+   eh_point<Map>(cont, "burst root bucket", fault::alloc, put_keys<Map>(root, 0), put_keys<Map>({"Z" + tail}, 99));
+   // the same page one level down, reached through a router: the slot is a branch, not the root
+   for (int c = 0; c < 30; ++c) child.push_back(std::string(1, char('A' + c)) + tail);
+   for (int c = 0; c + 1 < fill; ++c) child.push_back(std::string("A") + char('a' + c) + tail);
+   eh_point<Map>(cont, "burst child bucket", fault::alloc, put_keys<Map>(child, 0), put_keys<Map>({"Az" + tail}, 99));
+}
+
 template <class Map>
 static void run_scenarios(const char* cont)
 {
@@ -596,6 +757,13 @@ int main()
       eh_clone<TBkt>("artpp-bucket", "mixed", mixed, true);
       eh_clone<TAdp>("artpp-adapt", "mixed", mixed, false);
    }
+
+   // Bucket and adaptive modes: the audited fault paths (#4 to #7), one operation at a time.
+   using BU64 = map<std::string_view, uint64_t, mode::buckets, throwing_alloc<uint64_t>>;
+   using BU32 = map<std::string_view, uint32_t, mode::buckets, throwing_alloc<uint32_t>>;
+   std::printf("\nbucket and adaptive modes, one faulted operation against a std::map oracle:\n");
+   eh_bucket_burst<BU64>("bucket/u64");
+   eh_bucket_burst<BU32>("bucket/u32");
 
    // Inline (in-handle) values under allocation failure (audit #13).
    std::printf("\ninline uint32_t values (strong insert under bad_alloc injection):\n");

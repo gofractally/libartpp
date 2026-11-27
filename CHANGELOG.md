@@ -61,6 +61,11 @@ before 1.0 a minor version may change the API.
 - README: the fault-injection and exception-safety statements now say what is
   tested; the test suite gained throwing-value, erase and cross-allocator-move
   fault sweeps to back them (#18).
+- `mode::buckets`: when the insert that overflowed a bucket page then failed to
+  allocate, the parent (or the root) was left pointing at the freed page: every
+  key of that bucket was lost and the next access was a use-after-free. The
+  router that replaces the page is now linked before anything else can fail
+  (#5).
 
 ### Known issues
 - Open bugs from the pre-release audit: #4 to #7 (exception safety in
