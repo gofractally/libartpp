@@ -62,11 +62,12 @@ static void test_single_element()
    --e;
    CHECK(std::string(*e) == "solo");
    CHECK(e == s.begin());
-   // rbegin: deref via .base() (the key is a by-value proxy viewing the iterator's own
-   // buffer — like the map, deref the LIVE base iterator, not reverse_iterator's temporary)
+   // rbegin: the set's own reverse iterator holds the iterator positioned on the element, so
+   // *r is valid until r moves; base() keeps the std meaning (one past the element)
    auto r = s.rbegin();
    CHECK(r != s.rend());
-   { auto fwd = r.base(); --fwd; CHECK(std::string(fwd.key()) == "solo"); }
+   CHECK(std::string(*r) == "solo");
+   { auto fwd = r.base(); CHECK(fwd == s.end()); --fwd; CHECK(std::string(fwd.key()) == "solo"); }
    ++r;
    CHECK(r == s.rend());
 }
@@ -91,9 +92,14 @@ static void test_end_decrement()
       CHECK(std::string(it.key()) == *oi);
    }
    CHECK(it == s.begin());
-   // reverse_iterator agreement (deref the live base, per the by-value-key contract)
+   // reverse iterator agreement, dereferenced directly and through base()
    std::vector<std::string> rev;
-   for (auto r = s.rbegin(); r != s.rend(); ++r) { auto fwd = r.base(); --fwd; rev.emplace_back(fwd.key()); }
+   for (auto r = s.rbegin(); r != s.rend(); ++r)
+   {
+      auto fwd = r.base(); --fwd;
+      CHECK(std::string(*r) == std::string(fwd.key()));
+      rev.emplace_back(*r);
+   }
    std::vector<std::string> orev(o.rbegin(), o.rend());
    CHECK(rev == orev);
 }

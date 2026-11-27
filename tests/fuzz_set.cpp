@@ -93,6 +93,16 @@ static void cross_check(const Set& s, const std::set<std::string>& o, int op)
       }
       FZCHECK(it == s.begin(), op);
    }
+   {  // reverse range — dereferences the reverse iterator (the key view lives in it: #19)
+      auto oi = o.rbegin();
+      for (auto it = s.rbegin(); it != s.rend(); ++it, ++oi)
+      {
+         FZCHECK(oi != o.rend(), op);
+         auto&& k = *it;
+         FZCHECK(std::string(k) == *oi && std::string(it.key()) == *oi, op);
+      }
+      FZCHECK(oi == o.rend(), op);
+   }
    {  // for_each — separate walk, same order
       std::vector<std::string> fe;
       s.for_each([&](std::string_view k) { fe.emplace_back(k); });

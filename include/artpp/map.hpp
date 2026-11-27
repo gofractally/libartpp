@@ -1821,11 +1821,17 @@ namespace detail  // implementation types & node helpers — not part of the pub
       // Yields (key, value) in ascending lexicographic key order. Keys aren't stored
       // whole — they're rebuilt along the descent path into key_ (a key_buf: push
       // prefix/byte on the way down, set the length back on backtrack — no std::string
-      // churn). key() / *it return a string_view over that buffer. Bucket entries are
-      // sorted by full suffix on entry (the bucket's div index orders only by 2 bytes).
+      // churn). key_bytes() returns a string_view over that buffer (or over the leaf, when
+      // the leaf stores the whole key); key() / *it decode it to Key. For Key =
+      // std::string_view the decoded key IS that view, so it is valid only until the
+      // iterator is advanced or destroyed — as is a reference to a value held in the handle
+      // (val_ is the iterator's copy). Bucket entries are sorted by full suffix on entry
+      // (the bucket's div index orders only by 2 bytes).
      public:
+      class const_reverse_iterator;
       class const_iterator
       {
+         friend const_reverse_iterator;  // steps it_ directly; its end state stands for rend()
          struct Frame  // node + scan cursor; plen/cbase used only once key maintenance is on
          {
             packed_ptr node;
@@ -2694,13 +2700,19 @@ namespace detail  // implementation types & node helpers — not part of the pub
         public:
          // LegacyBidirectionalIterator surface. NOTE: reference is a proxy (key is rebuilt,
          // value may be inline), so this is NOT a C++20 std::bidirectional_iterator — same
-         // status as std::vector<bool>::iterator. Works with range-for, std::reverse_iterator
-         // and the classic algorithms.
+         // status as std::vector<bool>::iterator. Works with range-for and the classic
+         // algorithms. NOT with std::reverse_iterator: a string_view key and a reference to an
+         // inline value point INTO this iterator (key_ / val_), and std::reverse_iterator
+         // dereferences a temporary copy — the container's const_reverse_iterator holds the
+         // iterator positioned on the element instead.
          using iterator_category = std::bidirectional_iterator_tag;
          using key_type          = Key;
          using mapped_type       = T;
          using value_type        = std::pair<const Key, T>;
-         using reference         = std::pair<Key, const T&>;  // key decoded by value (see key_codec)
+         // The key is DECODED on demand (see key_codec), not stored: for an owning Key
+         // (std::string, integers) the pair holds its own copy; for Key = std::string_view
+         // the decoded "value" is a view of this iterator's key buffer or of the leaf.
+         using reference         = std::pair<Key, const T&>;
          using difference_type   = std::ptrdiff_t;
          struct arrow_proxy  // operator-> for a proxy reference (holds the pair, hands back &it)
          {
@@ -2879,10 +2891,94 @@ namespace detail  // implementation types & node helpers — not part of the pub
       const_iterator cbegin() const { return begin(); }
       const_iterator cend() const { return end(); }
 
-      using reverse_iterator       = std::reverse_iterator<const_iterator>;
-      using const_reverse_iterator = reverse_iterator;
+      // ── reverse iterator ────────────────────────────────────────────────────────
+      // NOT std::reverse_iterator<const_iterator>. That adaptor keeps the iterator one PAST
+      // the element and dereferences a temporary (`It tmp = current; return *--tmp;`), which
+      // is only sound when what `*it` returns outlives the iterator it came from. Here it
+      // does not: a std::string_view key views the iterator's key buffer, and a value stored
+      // in the handle is a copy held by the iterator. So this type holds the forward iterator
+      // positioned ON the element, and everything it hands out — *r, r->, r.key(),
+      // r.key_bytes(), r.value() — stays valid until r is advanced or destroyed, the same
+      // rule as the forward iterator. It is the forward iterator's size; the forward
+      // iterator's end state stands for rend(). base() has the std meaning (the iterator one
+      // past the element in forward order: rbegin().base() == end(), rend().base() ==
+      // begin()); it costs a copy and a step, or a begin() seek for rend().
+      class const_reverse_iterator
+      {
+         const_iterator it_;  // on the element; end state == rend()
+         friend map;
+         struct rend_tag
+         {
+         };
+         const_reverse_iterator(const_iterator&& e, rend_tag) : it_(std::move(e)) {}
+
+        public:
+         using iterator_type     = const_iterator;
+         using iterator_category = std::bidirectional_iterator_tag;
+         using key_type          = Key;
+         using mapped_type       = T;
+         using value_type        = typename const_iterator::value_type;
+         using reference         = typename const_iterator::reference;
+         using difference_type   = std::ptrdiff_t;
+         using pointer           = typename const_iterator::pointer;
+
+         const_reverse_iterator() = default;  // == rend() of any tree
+         // std::reverse_iterator's meaning: the element BEFORE `it` (rend() for begin()).
+         explicit const_reverse_iterator(const_iterator it) : it_(std::move(it)) { --it_; }
+         const_iterator base() const
+         {
+            if (it_.end_) return it_.t_ ? it_.t_->begin() : const_iterator();
+            const_iterator f = it_;
+            ++f;
+            return f;
+         }
+
+         const_reverse_iterator& operator++()  // towards rend(): the previous key
+         {
+            it_.retreat_();  // off the first key → end state == rend()
+            return *this;
+         }
+         const_reverse_iterator operator++(int)
+         {
+            const_reverse_iterator tmp = *this;
+            ++(*this);
+            return tmp;
+         }
+         const_reverse_iterator& operator--()  // towards rbegin(): the next key
+         {
+            if (!it_.end_)
+               ++it_;  // (--rbegin() is undefined, as for any reverse iterator)
+            else if (it_.t_)
+               it_ = it_.t_->begin();  // --rend(): the first key
+            return *this;
+         }
+         const_reverse_iterator operator--(int)
+         {
+            const_reverse_iterator tmp = *this;
+            --(*this);
+            return tmp;
+         }
+         bool operator==(const const_reverse_iterator& o) const noexcept { return it_ == o.it_; }
+         bool operator!=(const const_reverse_iterator& o) const noexcept { return !(it_ == o.it_); }
+
+         Key              key() const { return it_.key(); }
+         std::string_view key_bytes() const { return it_.key_bytes(); }
+         const T&         value() const noexcept
+            requires(HasValue)
+         { return it_.value(); }
+         reference operator*() const
+            requires(HasValue)
+         { return *it_; }
+         pointer operator->() const
+            requires(HasValue)
+         { return it_.operator->(); }
+      };
+      using reverse_iterator = const_reverse_iterator;
       const_reverse_iterator rbegin() const { return const_reverse_iterator(end()); }
-      const_reverse_iterator rend() const { return const_reverse_iterator(begin()); }
+      const_reverse_iterator rend() const
+      {
+         return const_reverse_iterator(end(), typename const_reverse_iterator::rend_tag{});
+      }
       const_reverse_iterator crbegin() const { return rbegin(); }
       const_reverse_iterator crend() const { return rend(); }
 
@@ -6219,9 +6315,39 @@ namespace detail
          bool operator==(const const_iterator& o) const noexcept { return it_ == o.it_; }
          bool operator!=(const const_iterator& o) const noexcept { return it_ != o.it_; }
       };
-      using iterator               = const_iterator;
-      using reverse_iterator       = std::reverse_iterator<const_iterator>;
-      using const_reverse_iterator = reverse_iterator;
+      using iterator = const_iterator;
+      // Reverse: wraps the map's own reverse iterator (which holds the iterator positioned on
+      // the element — see map::const_reverse_iterator for why std::reverse_iterator is not
+      // used), * yields the KEY. A string_view key is valid until this iterator moves.
+      class const_reverse_iterator
+      {
+         friend class set;
+         typename impl_t::const_reverse_iterator it_;
+         explicit const_reverse_iterator(typename impl_t::const_reverse_iterator it) : it_(std::move(it)) {}
+
+        public:
+         using iterator_type     = const_iterator;
+         using iterator_category = std::bidirectional_iterator_tag;
+         using value_type        = Key;
+         using reference         = Key;
+         using difference_type   = std::ptrdiff_t;
+         using pointer           = typename const_iterator::arrow_proxy;
+
+         const_reverse_iterator() = default;
+         explicit const_reverse_iterator(const_iterator it) : it_(std::move(it.it_)) {}  // element before `it`
+         const_iterator          base() const { return const_iterator(it_.base()); }
+         Key                     key() const { return it_.key(); }
+         std::string_view        key_bytes() const { return it_.key_bytes(); }
+         reference               operator*() const { return it_.key(); }
+         pointer                 operator->() const { return pointer{it_.key()}; }
+         const_reverse_iterator& operator++() { ++it_; return *this; }
+         const_reverse_iterator  operator++(int) { auto t = *this; ++it_; return t; }
+         const_reverse_iterator& operator--() { --it_; return *this; }
+         const_reverse_iterator  operator--(int) { auto t = *this; --it_; return t; }
+         bool operator==(const const_reverse_iterator& o) const noexcept { return it_ == o.it_; }
+         bool operator!=(const const_reverse_iterator& o) const noexcept { return it_ != o.it_; }
+      };
+      using reverse_iterator = const_reverse_iterator;
 
       // ── construction / allocator / move ───────────────────────────────────────────
       set() = default;
@@ -6295,8 +6421,8 @@ namespace detail
       iterator end() const { return iterator(const_iterator(impl_.end())); }
       iterator cbegin() const { return begin(); }
       iterator cend() const { return end(); }
-      reverse_iterator rbegin() const { return reverse_iterator(end()); }
-      reverse_iterator rend() const { return reverse_iterator(begin()); }
+      reverse_iterator rbegin() const { return reverse_iterator(impl_.rbegin()); }
+      reverse_iterator rend() const { return reverse_iterator(impl_.rend()); }
       reverse_iterator crbegin() const { return rbegin(); }
       reverse_iterator crend() const { return rend(); }
       // Fast ordered key-only scan (the for_each model): calls f(std::string_view key_bytes)

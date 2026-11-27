@@ -12,8 +12,11 @@
 // serializes into `scratch` and returns a view of it. A codec may expose its own scratch
 // type (`using scratch = ...`) — fixed-width codecs use a plain char buffer so the hot
 // path never touches std::string machinery; the default scratch is std::string. decode()
-// rebuilds the key from the stored bytes — which is exactly why iteration returns the key
-// BY VALUE: a non-string key has no stored object to reference, it is rebuilt on demand.
+// rebuilds the key from the stored bytes — which is exactly why iteration returns a Key and
+// not a const Key&: a key has no stored object to reference, it is rebuilt on demand. The
+// bytes handed to decode() belong to the iterator (or to a leaf), so a codec that decodes
+// to a VIEW of them (the built-in std::string_view one) yields a key that is valid only
+// until that iterator is advanced or destroyed.
 //
 // Built-ins: std::string, std::string_view, std::vector<uint8_t>, and integral types
 // (fixed-width big-endian, sign-flipped for signed, so byte order == numeric order).

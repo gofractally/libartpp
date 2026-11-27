@@ -528,8 +528,18 @@ static void test_compile_constraints()
    static_assert(std::is_same_v<Leafed::reference, It::reference>);
    static_assert(std::is_same_v<Leafed::size_type, std::size_t>);
    static_assert(std::is_nothrow_swappable_v<Leafed>);
-   // reverse adaptor is the std one over the bidirectional iterator
-   static_assert(std::is_same_v<Leafed::reverse_iterator, std::reverse_iterator<It>>);
+   // The reverse iterator is the container's own (it holds the iterator positioned on the
+   // element: a string_view key and an inline value live in the iterator, so the std adaptor,
+   // which dereferences a temporary, would hand out dangling views — #19). Same size as the
+   // forward iterator, bidirectional, with std's base().
+   using RIt = Leafed::const_reverse_iterator;
+   static_assert(std::is_same_v<Leafed::reverse_iterator, RIt>);
+   static_assert(!std::is_same_v<RIt, std::reverse_iterator<It>>);
+   static_assert(sizeof(RIt) == sizeof(It));
+   static_assert(std::is_same_v<RIt::iterator_category, std::bidirectional_iterator_tag>);
+   static_assert(std::is_same_v<RIt::reference, It::reference>);
+   static_assert(std::is_same_v<decltype(std::declval<const RIt&>().base()), It>);
+   static_assert(std::is_constructible_v<RIt, It> && !std::is_convertible_v<It, RIt>);
 }
 
 // ── find_opt / for_each_value ─────────────────────────────────────────────────

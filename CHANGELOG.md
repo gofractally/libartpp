@@ -33,6 +33,15 @@ before 1.0 a minor version may change the API.
 - `docs/sal2.md`, a design note about another project.
 
 ### Fixed
+- `rbegin()` / `rend()` were `std::reverse_iterator` over the container's
+  iterator, which dereferences a temporary copy: with `std::string_view` keys
+  the key returned by `*r` viewed a freed buffer (heap-use-after-free), and a
+  reference to a value stored in the handle dangled. `map` and `set` now have
+  their own `const_reverse_iterator`, which holds the iterator positioned on
+  the element; `base()` keeps the standard meaning. The README states the
+  lifetime rule: a `string_view` key and a reference to an inline value
+  obtained from an iterator are valid until that iterator is advanced or
+  destroyed (#19).
 - GCC warnings (`-Wreturn-type`, `-Wmaybe-uninitialized`) in `map.hpp`.
 - Undefined behaviour: `memcpy` from a null pointer for an empty key suffix or
   prefix (#2).

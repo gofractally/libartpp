@@ -140,6 +140,17 @@ static void cross_check(const Tree& t, const std::map<std::string, V>& m, int op
       }
       FZCHECK(it == t.begin(), op);
    }
+   {  // reverse range — dereferences the reverse iterator (its key/value live in it: #19)
+      auto mi = m.rbegin();
+      for (auto it = t.rbegin(); it != t.rend(); ++it, ++mi)
+      {
+         FZCHECK(mi != m.rend(), op);
+         auto&& kv = *it;
+         FZCHECK(std::string(kv.first) == mi->first && kv.second == mi->second, op);
+         FZCHECK(std::string(it->first) == mi->first && it.value() == mi->second, op);
+      }
+      FZCHECK(mi == m.rend(), op);
+   }
    {  // value-only DFS (for_each_value) — a separate walk from the iterator; same values, key order
       std::vector<V> fv;
       t.for_each_value([&](const V& v) { fv.push_back(v); });

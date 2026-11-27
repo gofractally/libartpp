@@ -220,8 +220,11 @@ struct artpp::key_codec<MyKey>
 - Integral keys encode fixed-width big-endian with the sign bit flipped for
   signed types, so byte order equals numeric order — iteration, `lower_bound`,
   and `upper_bound` follow numeric semantics exactly.
-- `decode` is why iteration returns the key **by value**: a non-string key has
-  no stored object to reference; it is rebuilt from the path bytes on demand.
+- `decode` is why iteration returns a `Key`, not a `const Key&`: a key has no
+  stored object to reference; it is rebuilt from the path bytes on demand. (The
+  built-in `std::string_view` codec decodes to a view of those bytes, which is
+  why such a key is only valid while its iterator stays put — see
+  [Iterators](#iterators).)
 
 ## Arbitrary key types via psio
 
@@ -288,7 +291,7 @@ destroy-and-reconstruct, so a throwing assignment leaves a valid object behind.
 | Member | Semantics |
 |---|---|
 | `begin() / end() / cbegin() / cend()` | Bidirectional const iteration in ascending key order. `begin()` does not allocate. |
-| `rbegin() / rend()` (+`cr` forms) | `std::reverse_iterator` over the same. |
+| `rbegin() / rend()` (+`cr` forms) | The same in descending order, through the container's own `const_reverse_iterator` (see [Iterators](#iterators)). |
 | `for_each(f)` | Recursive visitor `f(std::string_view key_bytes, const T&)` in ascending order — roughly 3× the iterator on cache-resident scans (no per-element resumption). |
 | `for_each_value(f)` | `f(const T&)` in ascending key order without materializing keys. |
 
@@ -310,13 +313,29 @@ iterators) is a **bidirectional proxy iterator**:
 
 - `iterator_category` is `std::bidirectional_iterator_tag` in the legacy sense;
   like `std::vector<bool>::iterator`, `operator*` returns a proxy
-  (`std::pair<Key, const T&>` — the key **by value**, decoded on demand), so it
-  does not model the C++20 `std::bidirectional_iterator` concept. Range-`for`,
-  `std::reverse_iterator`, and the classic algorithms (`std::distance`,
-  `std::find_if`, `std::prev`, …) all work.
+  (`std::pair<Key, const T&>` — the key is not stored as an object, it is
+  **decoded on demand** from the path bytes), so it does not model the C++20
+  `std::bidirectional_iterator` concept. Range-`for` and the classic algorithms
+  (`std::distance`, `std::find_if`, `std::prev`, …) work.
+- **What an iterator hands out lives as long as the iterator stays put.** An
+  owning key (`std::string`, an integer, a struct) is a copy and is yours. A
+  `std::string_view` key — from `*it`, `it->first`, `it.key()` or
+  `it.key_bytes()` — views the iterator's key buffer, and a reference to a small
+  *inline* value ([below](#element-access-and-inline-values)) refers to the
+  copy the iterator holds: both are valid **until that iterator is advanced or
+  destroyed**. Copy the key (`std::string(it.key())`) to keep it longer.
+- `rbegin()` / `rend()` return the container's own `const_reverse_iterator`
+  (`reverse_iterator` is an alias), for `map` and for `set`. It holds the
+  iterator positioned **on** the element, so the rule above applies to it
+  unchanged: `*r`, `r->`, `r.key()`, `r.key_bytes()` and `r.value()` are valid
+  until `r` is advanced or destroyed. It is bidirectional, works with the
+  classic algorithms, and `r.base()` has the standard meaning (the iterator one
+  past the element; `rbegin().base() == end()`). Do **not** wrap the iterators
+  in `std::reverse_iterator` yourself: that adaptor dereferences a temporary
+  copy, so a `string_view` key or an inline value obtained through it dangles.
 - `it.key()` returns the decoded `Key`; `it.key_bytes()` returns the raw encoded
   bytes (zero-copy when the leaf stores the whole key); `it.value()` returns
-  `const T&`.
+  `const T&`. The lifetime rule above applies to all three.
 - Key materialization is **adaptive**: until `key()`/`key_bytes()` is first
   read, `++`/`--` do no key bookkeeping at all (value-only scans pay nothing).
   The first read primes the path; from then on the key is maintained
@@ -712,7 +731,7 @@ cmake -B build -DARTPP_BENCHMARKS=ON && cmake --build build -j
 |---|---|
 | `artpp_smoke` | API basics across all modes, allocator routing (counting, PMR, wide-handle, pool), typed keys, `std::map` API-conformance battery, randomized cross-checks |
 | `artpp_conformance` | STL-grade contracts: key-length limit, move/swap branches incl. pool image adoption and structural clone, exactly-once construction, move-only values, compile-time constraints, string_view key parameters, `erase(iterator)`, structural equality incl. shape-divergent trees, iterator edge cases, degenerate shapes, mixed-op differential fuzz vs `std::map` (all modes) |
-| `artpp_reverse_iter` | Bidirectional iteration fuzz vs `std::map`: churn, full walks both directions, `--end()`, random `lower_bound` + backward steps, `++`/`--` ping-pong |
+| `artpp_reverse_iter` | Bidirectional iteration fuzz vs `std::map` and `std::set`: churn, full walks both directions, `--end()`, random `lower_bound` + backward steps, `++`/`--` ping-pong; the reverse iterators of map and set dereferenced directly (`string_view` keys, inline values), `base()`, std algorithms over the reverse range |
 | `artpp_exception_safety` | Exception safety under systematic fault injection, in every mode and for `artpp::set`: the allocator failing at every allocation point, and value constructors throwing at every construction, of random operation sequences (insert, assign, emplace, `operator[]`, erase, clear, cross-allocator move) and of targeted scenarios (leaf and prefix splits, router widening, bucket overflow, bucket repacking on erase, leaf-to-bucket collapse, structural clone); contents checked against a `std::map` oracle after every failure, with leak and double-destroy counters. `ARTPP_EH_SEEDS` / `ARTPP_EH_OPS` lengthen the run |
 | `artpp_regression` | Deterministic guards for fixed bugs: fuzzer-found shapes, and the pre-release audit's (erase cascades past the path window, no restructuring on assignment to a present key, over-aligned values, deep trees on a small stack in every mode, blocks the handle cannot address, `bool` keys, values without a default constructor) |
 | `artpp_wide_stems` | `setlist_u16` (wide-stem) cross-checks and depth/latency demonstration |
